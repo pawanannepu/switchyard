@@ -1,0 +1,39 @@
+[package]
+name = "sy-daemon"
+description = "switchyardd, the switchyard engine daemon: composition root and socket server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "switchyardd"
+path = "src/main.rs"
+
+[features]
+# Dev and test only `dev.*` methods. Release bundles are built without it.
+devtools = []
+
+# Rule (spec 0001): anything in the workspace except tauri.
+[dependencies]
+sy-protocol.workspace = true
+sy-client.workspace = true
+sy-core.workspace = true
+sy-infra.workspace = true
+sy-adapter-api.workspace = true
+sy-adapter-claude.workspace = true
+anyhow.workspace = true
+base64.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-appender.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,501 @@
+{
+  "$defs": {
+    "ClientKind": {
+      "description": "Which kind of client is connecting.",
+      "enum": [
+        "desktop",
+        "cli",
+        "test"
+      ],
+      "type": "string"
+    },
+    "Empty": {
+      "additionalProperties": false,
+      "description": "Params with no fields. Accepts `{}` or an absent `params`.",
+      "type": "object"
+    },
+    "EngineInfo": {
+      "description": "`engine.info` result.",
+      "properties": {
+        "engine_version": {
+          "type": "string"
+        },
+        "pid": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "protocol": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "running_agents": {
+          "description": "Agents (runs) currently running in this engine.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "engine_version",
+        "pid",
+        "protocol",
+        "running_agents"
+      ],
+      "type": "object"
+    },
+    "HelloParams": {
+      "description": "`session.hello` params. Always the first call on a connection.",
+      "properties": {
+        "client": {
+          "$ref": "#/$defs/ClientKind"
+        },
+        "client_version": {
+          "type": "string"
+        },
+        "protocol": {
+          "$ref": "#/$defs/ProtocolVersion"
+        }
+      },
+      "required": [
+        "client",
+        "client_version",
+        "protocol"
+      ],
+      "type": "object"
+    },
+    "HelloResult": {
+      "description": "`session.hello` result.",
+      "properties": {
+        "engine_version": {
+          "type": "string"
+        },
+        "pid": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "protocol": {
+          "$ref": "#/$defs/ProtocolVersion"
+        }
+      },
+      "required": [
+        "engine_version",
+        "pid",
+        "protocol"
+      ],
+      "type": "object"
+    },
+    "HostConnection": {
+      "description": "`host.connection` notification, sent by the app host (or dev bridge) to the UI\nwhenever the engine connection changes, and once on subscribe.",
+      "properties": {
+        "hello": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HelloResult"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The engine's `session.hello` reply, when connected (or incompatible)."
+        },
+        "logs_dir": {
+          "description": "Where the engine logs live, so the UI can point at them.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message": {
+          "description": "A human readable reason, for the failed and stopped states.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "$ref": "#/$defs/HostConnectionState"
+        }
+      },
+      "required": [
+        "state"
+      ],
+      "type": "object"
+    },
+    "HostConnectionState": {
+      "description": "State of the host's engine connection.",
+      "oneOf": [
+        {
+          "const": "connecting",
+          "description": "Looking for the engine, or starting it.",
+          "type": "string"
+        },
+        {
+          "const": "connected",
+          "description": "Connected and `session.hello` succeeded.",
+          "type": "string"
+        },
+        {
+          "const": "stopped",
+          "description": "The engine connection dropped (the engine exited or crashed).",
+          "type": "string"
+        },
+        {
+          "const": "failed",
+          "description": "The engine did not start within the timeout.",
+          "type": "string"
+        },
+        {
+          "const": "incompatible",
+          "description": "The engine answered, but speaks an incompatible protocol major.",
+          "type": "string"
+        }
+      ]
+    },
+    "ProtocolVersion": {
+      "description": "Protocol version. Compatible when the majors match.",
+      "properties": {
+        "major": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "minor": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "major",
+        "minor"
+      ],
+      "type": "object"
+    },
+    "RpcError": {
+      "description": "A JSON-RPC error object.",
+      "properties": {
+        "code": {
+          "format": "int32",
+          "type": "integer"
+        },
+        "data": true,
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "type": "object"
+    },
+    "RunAttachParams": {
+      "description": "`run.attach` params.",
+      "properties": {
+        "run_id": {
+          "$ref": "#/$defs/RunId"
+        }
+      },
+      "required": [
+        "run_id"
+      ],
+      "type": "object"
+    },
+    "RunAttachResult": {
+      "description": "`run.attach` result: the replay of the run's ring buffer.",
+      "properties": {
+        "end_offset": {
+          "description": "Total bytes the run has produced at the end of the replay. Drop any live byte below this.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "replay_b64": {
+          "description": "The latest output, up to 2 MiB, base64.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "replay_b64",
+        "end_offset"
+      ],
+      "type": "object"
+    },
+    "RunId": {
+      "description": "Identifies one run (one agent process and its terminal).",
+      "type": "string"
+    },
+    "RunInputParams": {
+      "description": "`run.input` params. The decoded payload is capped at 64 KiB.",
+      "properties": {
+        "data_b64": {
+          "type": "string"
+        },
+        "run_id": {
+          "$ref": "#/$defs/RunId"
+        }
+      },
+      "required": [
+        "run_id",
+        "data_b64"
+      ],
+      "type": "object"
+    },
+    "RunOutput": {
+      "description": "`run.output` notification: one batch of live terminal bytes.",
+      "properties": {
+        "data_b64": {
+          "type": "string"
+        },
+        "offset": {
+          "description": "Byte position of this chunk's first byte in the run's whole output.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "run_id": {
+          "$ref": "#/$defs/RunId"
+        }
+      },
+      "required": [
+        "run_id",
+        "offset",
+        "data_b64"
+      ],
+      "type": "object"
+    },
+    "RunResizeParams": {
+      "description": "`run.resize` params.",
+      "properties": {
+        "cols": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rows": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "run_id": {
+          "$ref": "#/$defs/RunId"
+        }
+      },
+      "required": [
+        "run_id",
+        "cols",
+        "rows"
+      ],
+      "type": "object"
+    },
+    "RunResyncNeeded": {
+      "description": "`run.resync_needed` notification: this client fell behind; attach again.",
+      "properties": {
+        "run_id": {
+          "$ref": "#/$defs/RunId"
+        }
+      },
+      "required": [
+        "run_id"
+      ],
+      "type": "object"
+    },
+    "StopRunsResult": {
+      "description": "`dev.stop_runs` result.",
+      "properties": {
+        "stopped": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "stopped"
+      ],
+      "type": "object"
+    },
+    "SyntheticRunParams": {
+      "description": "`dev.synthetic_run` params: fake runs that stream output.",
+      "properties": {
+        "bytes_per_sec": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "count": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "echo": {
+          "description": "Write every `run.input` straight back as output.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "count",
+        "bytes_per_sec",
+        "echo"
+      ],
+      "type": "object"
+    },
+    "SyntheticRunResult": {
+      "description": "`dev.synthetic_run` result.",
+      "properties": {
+        "run_ids": {
+          "items": {
+            "$ref": "#/$defs/RunId"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "run_ids"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://switchyard.dev/protocol.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "JSON-RPC 2.0, one UTF-8 message per line, over a user only local socket. Generated from crates/sy-protocol; do not edit.",
+  "title": "switchyard engine protocol",
+  "x-error-codes": {
+    "EngineDraining": -32010,
+    "EngineShuttingDown": -32011,
+    "EngineUnavailable": -32090,
+    "HelloRequired": -32000,
+    "IncompatibleProtocol": -32001,
+    "InputBusy": -32042,
+    "InputTooLarge": -32041,
+    "InternalError": -32603,
+    "InvalidParams": -32602,
+    "InvalidRequest": -32600,
+    "MethodNotFound": -32601,
+    "ParseError": -32700,
+    "RequestAbandoned": -32091,
+    "RunNotFound": -32040
+  },
+  "x-limits": {
+    "client_queue_bytes": 8388608,
+    "max_input_bytes": 65536,
+    "max_line_bytes": 1048576,
+    "max_replay_bytes": 2097152
+  },
+  "x-methods": [
+    {
+      "dev_only": false,
+      "direction": "client_to_engine",
+      "kind": "request",
+      "name": "session.hello",
+      "params": "HelloParams",
+      "result": "HelloResult",
+      "stable": true
+    },
+    {
+      "dev_only": false,
+      "direction": "client_to_engine",
+      "kind": "request",
+      "name": "engine.info",
+      "params": "Empty",
+      "result": "EngineInfo",
+      "stable": true
+    },
+    {
+      "dev_only": false,
+      "direction": "client_to_engine",
+      "kind": "request",
+      "name": "engine.drain",
+      "params": "Empty",
+      "result": "Empty",
+      "stable": true
+    },
+    {
+      "dev_only": false,
+      "direction": "client_to_engine",
+      "kind": "request",
+      "name": "engine.shutdown",
+      "params": "Empty",
+      "result": "Empty",
+      "stable": true
+    },
+    {
+      "dev_only": false,
+      "direction": "client_to_engine",
+      "kind": "request",
+      "name": "run.attach",
+      "params": "RunAttachParams",
+      "result": "RunAttachResult",
+      "stable": false
+    },
+    {
+      "dev_only": false,
+      "direction": "client_to_engine",
+      "kind": "request",
+      "name": "run.input",
+      "params": "RunInputParams",
+      "result": "Empty",
+      "stable": false
+    },
+    {
+      "dev_only": false,
+      "direction": "client_to_engine",
+      "kind": "request",
+      "name": "run.resize",
+      "params": "RunResizeParams",
+      "result": "Empty",
+      "stable": false
+    },
+    {
+      "dev_only": false,
+      "direction": "engine_to_client",
+      "kind": "notification",
+      "name": "run.output",
+      "params": "RunOutput",
+      "result": null,
+      "stable": false
+    },
+    {
+      "dev_only": false,
+      "direction": "engine_to_client",
+      "kind": "notification",
+      "name": "run.resync_needed",
+      "params": "RunResyncNeeded",
+      "result": null,
+      "stable": false
+    },
+    {
+      "dev_only": true,
+      "direction": "client_to_engine",
+      "kind": "request",
+      "name": "dev.synthetic_run",
+      "params": "SyntheticRunParams",
+      "result": "SyntheticRunResult",
+      "stable": false
+    },
+    {
+      "dev_only": true,
+      "direction": "client_to_engine",
+      "kind": "request",
+      "name": "dev.stop_runs",
+      "params": "Empty",
+      "result": "StopRunsResult",
+      "stable": false
+    },
+    {
+      "dev_only": false,
+      "direction": "host_to_client",
+      "kind": "notification",
+      "name": "host.connection",
+      "params": "HostConnection",
+      "result": null,
+      "stable": false
+    }
+  ],
+  "x-protocol": {
+    "major": 1,
+    "minor": 0
+  }
+}

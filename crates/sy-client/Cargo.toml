@@ -1,0 +1,29 @@
+[package]
+name = "sy-client"
+description = "switchyard engine paths, socket transport, client connection and UI relay"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Rule (spec 0001): sy-protocol, tokio, serde_json, dirs (plus small utility crates).
+# Never sy-core, sy-infra, any adapter, or tauri.
+[dependencies]
+sy-protocol.workspace = true
+dirs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+futures-util.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

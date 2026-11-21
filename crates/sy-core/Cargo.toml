@@ -1,0 +1,18 @@
+[package]
+name = "sy-core"
+description = "switchyard domain and orchestration. Defines the ports; knows no OS, no agent, no storage library"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Rule (spec 0001): sy-adapter-api, serde, tokio, thiserror, tracing.
+# Never sy-infra, an adapter, tauri, rusqlite, portable-pty, keyring. No cfg(target_os) code.
+[dependencies]
+sy-adapter-api.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

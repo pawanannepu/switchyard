@@ -1,0 +1,23 @@
+{
+  "name": "switchyard",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "packageManager": "pnpm@10.28.2",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "pnpm --filter @switchyard/desktop build",
+    "dev": "pnpm --filter @switchyard/desktop tauri dev",
+    "tauri": "pnpm --filter @switchyard/desktop tauri",
+    "app:build": "pnpm --filter @switchyard/desktop tauri build --target universal-apple-darwin",
+    "app:build:devtools": "SWITCHYARD_DEVTOOLS=1 pnpm app:build",
+    "engine:build": "node scripts/build-engine.mjs",
+    "devbridge": "cargo run -q -p sy-devbridge --",
+    "protocol:gen": "pnpm --filter @switchyard/protocol generate",
+    "protocol:check": "pnpm --filter @switchyard/protocol check",
+    "boundaries:check": "node scripts/check-boundaries.mjs",
+    "release:check": "node scripts/release-check.mjs"
+  }
+}

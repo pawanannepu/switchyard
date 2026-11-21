@@ -1,0 +1,63 @@
+# switchyard Cargo workspace. Layout and dependency rules: docs/specs/0001-stack-architecture/index.md
+[workspace]
+resolver = "3"
+members = [
+  "crates/sy-protocol",
+  "crates/sy-client",
+  "crates/sy-adapter-api",
+  "crates/sy-core",
+  "crates/sy-infra",
+  "crates/sy-adapters/claude",
+  "crates/sy-daemon",
+  "crates/sy-devbridge",
+  "apps/desktop/src-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+publish = false
+
+[workspace.dependencies]
+# Workspace crates
+sy-protocol = { path = "crates/sy-protocol" }
+sy-client = { path = "crates/sy-client" }
+sy-adapter-api = { path = "crates/sy-adapter-api" }
+sy-core = { path = "crates/sy-core" }
+sy-infra = { path = "crates/sy-infra" }
+sy-adapter-claude = { path = "crates/sy-adapters/claude" }
+
+# Third party
+anyhow = "1.0.104"
+base64 = "0.23.1"
+dirs = "7.0.0"
+futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
+getrandom = "0.4.3"
+rustix = { version = "1.1.6", features = ["process", "net"] }
+schemars = "1.2.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tempfile = "3.27.0"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
+tokio-tungstenite = "0.30.0"
+tokio-util = { version = "0.7.20", features = ["codec"] }
+tracing = "0.1.44"
+tracing-appender = "0.2.5"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+
+# From the Tauri template: https://tauri.app/concept/size/#cargo-configuration
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true

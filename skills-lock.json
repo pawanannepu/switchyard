@@ -1,0 +1,138 @@
+{
+  "version": 2,
+  "skills": {
+    "distributing-tauri-for-macos": {
+      "source": "dchuk/claude-code-tauri-skills",
+      "commit": "855352dfbc2527f5a7e4ed307782d2a487bffd66",
+      "sourceType": "github",
+      "skillPath": "tauri/tauri-macos-distribution/SKILL.md",
+      "computedHash": "cc04aec366b1a7f57bccd1c1cdb8adb3dbf159f6e4ee55df21b79b857eee3d28"
+    },
+    "macos-packaging-notarization": {
+      "source": "robinebers/skills",
+      "commit": "a44e57de2cfb1a26145d9e9b854621ac8bcda23d",
+      "sourceType": "github",
+      "skillPath": "skills/macos-packaging-notarization/SKILL.md",
+      "computedHash": "cb9686992ba47a7109b459a7984ce5d7758294f95de7f071a227aa22234e04bf"
+    },
+    "pnpm": {
+      "source": "antfu/skills",
+      "commit": "4a6bb39e7b45e26402eb215393c51ccf5df1ca4c",
+      "sourceType": "github",
+      "skillPath": "skills/pnpm/SKILL.md",
+      "computedHash": "fb4c2b0f98b1e651fb217f2070e3782f2fa58fd7d9fb2745e9fefaf945b8c60e"
+    },
+    "rust-async-internals": {
+      "source": "po4yka/rust-skills",
+      "commit": "d9ab525a6566b687980d3b4c05b97a197802876a",
+      "sourceType": "github",
+      "skillPath": "skills/rust-async-internals/SKILL.md",
+      "computedHash": "9fdf8d1a0e9409000175636c7f9f966cc5c7d4d184802f69162fb1560850505d"
+    },
+    "rust-best-practices": {
+      "source": "apollographql/skills",
+      "commit": "9dda1397730370aeb8df4ff8f2015c34c86b5003",
+      "sourceType": "github",
+      "skillPath": "skills/rust-best-practices/SKILL.md",
+      "computedHash": "7e12e68aa50152eb7ba9ea1f88ca5380c846ea0175f8ab6788bb79b7faf12ca0"
+    },
+    "rust-database": {
+      "source": "po4yka/rust-skills",
+      "commit": "d9ab525a6566b687980d3b4c05b97a197802876a",
+      "sourceType": "github",
+      "skillPath": "skills/rust-database/SKILL.md",
+      "computedHash": "aa22a2c5682f792367ffaabcccb4b7387494e634138e2f41865c12b848348567"
+    },
+    "rust-error-handling": {
+      "source": "po4yka/rust-skills",
+      "commit": "d9ab525a6566b687980d3b4c05b97a197802876a",
+      "sourceType": "github",
+      "skillPath": "skills/rust-error-handling/SKILL.md",
+      "computedHash": "dbb6a55a14a75de774216e3758d2f5428ce01737f436b6328054c3d514de8e3d"
+    },
+    "rust-performance": {
+      "source": "po4yka/rust-skills",
+      "commit": "d9ab525a6566b687980d3b4c05b97a197802876a",
+      "sourceType": "github",
+      "skillPath": "skills/rust-performance/SKILL.md",
+      "computedHash": "ae003a7d2c1091cfa0da0bf387acd8ac7d1f9db4b6d80cffc0ceabab64596718"
+    },
+    "tanstack-router": {
+      "source": "tanstack-skills/tanstack-skills",
+      "commit": "6f5521ecbdfbfa3d54d335eba6c8b4df0b804c03",
+      "sourceType": "github",
+      "skillPath": "plugins/tanstack-router/skills/tanstack-router/SKILL.md",
+      "computedHash": "0dc04f63713e7f4eb62add3aa2188abc5c5e2652b246e3e839197fa27a196dbb"
+    },
+    "tauri": {
+      "source": "full-stack-skills/tauri-skills",
+      "commit": "77b57c4913873a0f8cab7db45116038dc18a27f0",
+      "sourceType": "github",
+      "skillPath": "skills/tauri/SKILL.md",
+      "computedHash": "2644087ad938580bfcd837b35ce15ed8007e3d8826f8b3dc2e70bbdbd608e8b9"
+    },
+    "tauri-build": {
+      "source": "full-stack-skills/tauri-skills",
+      "commit": "77b57c4913873a0f8cab7db45116038dc18a27f0",
+      "sourceType": "github",
+      "skillPath": "skills/tauri-build/SKILL.md",
+      "computedHash": "7625f3f4370d6c21c919c3e0a7e261d76e558b511a7cc079d205dcbdb7483b32"
+    },
+    "tauri-ipc": {
+      "source": "full-stack-skills/tauri-skills",
+      "commit": "77b57c4913873a0f8cab7db45116038dc18a27f0",
+      "sourceType": "github",
+      "skillPath": "skills/tauri-ipc/SKILL.md",
+      "computedHash": "9a9c2d5003bbb4a0149d192719e5abad9703ee43681f79279459672683fdc307"
+    },
+    "tauri-security": {
+      "source": "full-stack-skills/tauri-skills",
+      "commit": "77b57c4913873a0f8cab7db45116038dc18a27f0",
+      "sourceType": "github",
+      "skillPath": "skills/tauri-security/SKILL.md",
+      "computedHash": "f283f4baf9447b7d56ea73176a1a8cad36d688ea0ed5130b47a6837c2719cf9c"
+    },
+    "tauri-v2": {
+      "source": "pedronauck/skills",
+      "commit": "71a96003910d1e222c49f9bfa3830127f46b240f",
+      "sourceType": "github",
+      "skillPath": "skills/curated/tauri-v2/SKILL.md",
+      "computedHash": "313e4199a3e8e7117a68603843da393ea45c281f88aad5cbad0cad98732c1770"
+    },
+    "tokio-patterns": {
+      "source": "geoffjay/claude-plugins",
+      "commit": "0ab5ae1b22bf5b9f9c1a1c458304cb7b1bb1034a",
+      "sourceType": "github",
+      "skillPath": "plugins/rust-tokio-expert/skills/tokio-patterns/SKILL.md",
+      "computedHash": "9f9d49c5e55f3a6180b91c5f53757dcf970c6136b2c695ee8dbac138e5506755"
+    },
+    "typescript-pro": {
+      "source": "jeffallan/claude-skills",
+      "commit": "4b94d98605baf742b751bb82832ace5caf942271",
+      "sourceType": "github",
+      "skillPath": "skills/typescript-pro/SKILL.md",
+      "computedHash": "fe899357ff4715b37942c73cc54a0789ee701ff25d8c7fbca9d58a13d38eed81"
+    },
+    "vercel-react-best-practices": {
+      "source": "vercel-labs/agent-skills",
+      "commit": "5a37a6329fbad3666c3207392a6a7c0110e92efb",
+      "sourceType": "github",
+      "skillPath": "skills/react-best-practices/SKILL.md",
+      "computedHash": "7991ed4fbecdac23f47c1a40c243e00a212a9e7f3604db93959b3ae11dffe299"
+    },
+    "vite": {
+      "source": "antfu/skills",
+      "commit": "4a6bb39e7b45e26402eb215393c51ccf5df1ca4c",
+      "sourceType": "github",
+      "skillPath": "skills/vite/SKILL.md",
+      "computedHash": "db9eea82d8bf6ce0f60a4a1d94a626c718df7d97160b5f1d5b150647e0c401b3"
+    },
+    "zustand": {
+      "source": "pedronauck/skills",
+      "commit": "71a96003910d1e222c49f9bfa3830127f46b240f",
+      "sourceType": "github",
+      "skillPath": "skills/curated/zustand/SKILL.md",
+      "computedHash": "36518bcaf006f570df64dd70e2db38bca786b992dfeb474ebc648e083d353c3b"
+    }
+  }
+}

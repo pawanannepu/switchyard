@@ -1,0 +1,15 @@
+[package]
+name = "sy-infra"
+description = "switchyard infrastructure: the operating system specific implementations of sy-core's ports"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Rule (spec 0001): may use sy-core (to implement its ports), rusqlite, portable-pty, keyring.
+# Never sy-daemon, tauri, or an adapter. Those libraries arrive with the features that need them.
+[dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true

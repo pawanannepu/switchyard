@@ -1,0 +1,13 @@
+[package]
+name = "sy-adapter-api"
+description = "The interface every switchyard agent adapter implements"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Rule (spec 0001): serde, tokio, thiserror only. Never sy-core, sy-infra or an adapter.
+[dependencies]
+
+[lints]
+workspace = true

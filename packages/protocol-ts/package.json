@@ -1,0 +1,19 @@
+{
+  "name": "@switchyard/protocol",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Generated TypeScript types and a typed JSON-RPC client for the switchyard engine protocol",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "generate": "node scripts/generate.mjs",
+    "check": "node scripts/generate.mjs --check",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "json-schema-to-typescript": "16.0.0",
+    "typescript": "6.0.3"
+  }
+}

@@ -35,7 +35,14 @@ pub struct PeerRejected {
 
 /// Only the engine's own user may connect.
 pub fn check_peer(peer_uid: u32, own_uid: u32) -> Result<(), PeerRejected> {
-    if peer_uid == own_uid { Ok(()) } else { Err(PeerRejected { peer: peer_uid, own: own_uid }) }
+    if peer_uid == own_uid {
+        Ok(())
+    } else {
+        Err(PeerRejected {
+            peer: peer_uid,
+            own: own_uid,
+        })
+    }
 }
 
 /// The connecting process's user id (from the kernel, `getpeereid` on macOS).
@@ -70,7 +77,13 @@ mod tests {
 
     #[test]
     fn check_peer_should_reject_a_different_uid() {
-        assert_eq!(check_peer(502, 501), Err(PeerRejected { peer: 502, own: 501 }));
+        assert_eq!(
+            check_peer(502, 501),
+            Err(PeerRejected {
+                peer: 502,
+                own: 501
+            })
+        );
     }
 
     #[test]

@@ -1,0 +1,1 @@
+{"root":["./src/main.tsx","./src/router.tsx","./src/strings.ts","./src/vite-env.d.ts","./src/engine/client.ts","./src/engine/store.ts","./src/engine/tauritransport.ts","./src/screens/home.tsx","./src/screens/loadcheck.tsx","./src/terminal/runterminal.ts","./src/terminal/registry.ts"],"version":"6.0.3"}

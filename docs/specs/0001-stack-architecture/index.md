@@ -1,7 +1,7 @@
 # 0001. Tauri shell with a Rust engine daemon
 
 **Date**: 2026-11-21
-**Status**: Proposed
+**Status**: Accepted
 
 ## Summary
 

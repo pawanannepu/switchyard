@@ -63,7 +63,9 @@ pub struct EngineInfo {
 // ---- run ----
 
 /// Identifies one run (one agent process and its terminal).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(transparent)]
 pub struct RunId(pub String);
 

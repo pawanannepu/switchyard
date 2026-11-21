@@ -1,3 +1,9 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test helpers panic on setup failure"
+)]
+
 //! Drives the real `switchyardd` binary over its socket, each test with its own
 //! short `/tmp/sy-<random>` data dir.
 
@@ -19,12 +25,18 @@ struct Engine {
 }
 
 fn data_dir() -> tempfile::TempDir {
-    tempfile::Builder::new().prefix("sy-").tempdir_in("/tmp").unwrap()
+    tempfile::Builder::new()
+        .prefix("sy-")
+        .tempdir_in("/tmp")
+        .unwrap()
 }
 
 fn spawn_in(dir: &Path, env: &[(&str, &str)]) -> Child {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_switchyardd"));
-    cmd.env("SWITCHYARD_DATA_DIR", dir).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    cmd.env("SWITCHYARD_DATA_DIR", dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -40,7 +52,11 @@ impl Engine {
         let dir = data_dir();
         let paths = EnginePaths::for_data_dir(dir.path().to_path_buf());
         let child = spawn_in(dir.path(), env);
-        let engine = Self { _dir: dir, paths, child };
+        let engine = Self {
+            _dir: dir,
+            paths,
+            child,
+        };
         engine.wait_for_socket().await;
         engine
     }
@@ -53,7 +69,10 @@ impl Engine {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        panic!("engine socket never came up at {}", self.paths.socket.display());
+        panic!(
+            "engine socket never came up at {}",
+            self.paths.socket.display()
+        );
     }
 
     async fn client(&self) -> Connection {
@@ -99,13 +118,19 @@ struct Raw {
 impl Raw {
     async fn connect(socket: &Path) -> Self {
         let (read, writer) = UnixStream::connect(socket).await.unwrap().into_split();
-        Self { reader: BufReader::new(read), writer, next_id: 1 }
+        Self {
+            reader: BufReader::new(read),
+            writer,
+            next_id: 1,
+        }
     }
 
     async fn send(&mut self, method: &str, params: Value) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
-        let line = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }).to_string() + "\n";
+        let line = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
+            .to_string()
+            + "\n";
         self.writer.write_all(line.as_bytes()).await.unwrap();
         id
     }
@@ -113,13 +138,19 @@ impl Raw {
     /// Next message, or `None` on EOF.
     async fn next(&mut self) -> Option<Value> {
         let mut line = String::new();
-        let n = tokio::time::timeout(Duration::from_secs(10), self.reader.read_line(&mut line)).await.ok()?.ok()?;
+        let n = tokio::time::timeout(Duration::from_secs(10), self.reader.read_line(&mut line))
+            .await
+            .ok()?
+            .ok()?;
         (n > 0).then(|| serde_json::from_str(&line).unwrap())
     }
 
     async fn response(&mut self, id: u64) -> Value {
         loop {
-            let msg = self.next().await.expect("connection closed before the response");
+            let msg = self
+                .next()
+                .await
+                .expect("connection closed before the response");
             if msg["id"] == json!(id) {
                 return msg;
             }
@@ -177,7 +208,10 @@ async fn second_engine_should_exit_zero_and_leave_the_socket_untouched() {
 
     let info: EngineInfo = conn.call(methods::ENGINE_INFO, &json!({})).await.unwrap();
     assert!(status.success(), "second engine exit: {status}");
-    assert_eq!((inode(&engine.paths.socket), info.pid), (before, engine.child.id()));
+    assert_eq!(
+        (inode(&engine.paths.socket), info.pid),
+        (before, engine.child.id())
+    );
     assert!(engine.log().contains("already running"));
 }
 
@@ -187,11 +221,19 @@ async fn engine_after_kill_9_should_take_the_lock_and_replace_the_stale_socket()
     let first_pid = engine.child.id();
     engine.child.kill().unwrap(); // SIGKILL
     engine.child.wait().unwrap();
-    assert!(engine.paths.socket.exists(), "a killed engine leaves its socket behind");
+    assert!(
+        engine.paths.socket.exists(),
+        "a killed engine leaves its socket behind"
+    );
 
     engine.child = spawn_in(&engine.paths.data_dir, &[]);
     engine.wait_for_socket().await;
-    let info: EngineInfo = engine.client().await.call(methods::ENGINE_INFO, &json!({})).await.unwrap();
+    let info: EngineInfo = engine
+        .client()
+        .await
+        .call(methods::ENGINE_INFO, &json!({}))
+        .await
+        .unwrap();
     assert_ne!(info.pid, first_pid);
 }
 
@@ -204,7 +246,11 @@ async fn line_over_1_mib_should_close_only_that_connection() {
     raw.writer.write_all(&huge).await.unwrap();
     let _ = raw.writer.write_all(b"\n").await;
 
-    assert_eq!(raw.next().await, None, "oversized line should close the connection");
+    assert_eq!(
+        raw.next().await,
+        None,
+        "oversized line should close the connection"
+    );
     let info: Result<EngineInfo, _> = survivor.call(methods::ENGINE_INFO, &json!({})).await;
     assert!(info.is_ok());
 }
@@ -213,8 +259,13 @@ async fn line_over_1_mib_should_close_only_that_connection() {
 async fn non_stable_method_before_hello_should_need_hello() {
     let engine = Engine::start().await;
     let mut raw = engine.raw().await;
-    let reply = raw.call(methods::RUN_ATTACH, json!({ "run_id": "run-1" })).await;
-    assert_eq!(reply["error"]["code"], json!(ErrorCode::HelloRequired.code()));
+    let reply = raw
+        .call(methods::RUN_ATTACH, json!({ "run_id": "run-1" }))
+        .await;
+    assert_eq!(
+        reply["error"]["code"],
+        json!(ErrorCode::HelloRequired.code())
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -223,17 +274,30 @@ async fn incompatible_hello_should_keep_stable_methods_working() {
     let mut raw = engine.raw().await;
     raw.hello(PROTOCOL.major + 1).await;
     let info = raw.call(methods::ENGINE_INFO, json!({})).await;
-    let attach = raw.call(methods::RUN_ATTACH, json!({ "run_id": "run-1" })).await;
+    let attach = raw
+        .call(methods::RUN_ATTACH, json!({ "run_id": "run-1" }))
+        .await;
     assert_eq!(
-        (info["result"]["pid"].clone(), attach["error"]["code"].clone()),
-        (json!(engine.child.id()), json!(ErrorCode::IncompatibleProtocol.code()))
+        (
+            info["result"]["pid"].clone(),
+            attach["error"]["code"].clone()
+        ),
+        (
+            json!(engine.child.id()),
+            json!(ErrorCode::IncompatibleProtocol.code())
+        )
     );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn unknown_method_should_be_method_not_found() {
     let engine = Engine::start().await;
-    let err = engine.client().await.call_value("nope.nothing", Value::Null).await.unwrap_err();
+    let err = engine
+        .client()
+        .await
+        .call_value("nope.nothing", Value::Null)
+        .await
+        .unwrap_err();
     assert_eq!(rpc_code(&err), ErrorCode::MethodNotFound.code());
 }
 
@@ -266,7 +330,13 @@ async fn release_engine_should_not_answer_dev_methods() {
     let engine = Engine::start().await;
     let conn = engine.client().await;
     for method in [methods::DEV_SYNTHETIC_RUN, methods::DEV_STOP_RUNS] {
-        let err = conn.call_value(method, json!({ "count": 1, "bytes_per_sec": 0, "echo": false })).await.unwrap_err();
+        let err = conn
+            .call_value(
+                method,
+                json!({ "count": 1, "bytes_per_sec": 0, "echo": false }),
+            )
+            .await
+            .unwrap_err();
         assert_eq!(rpc_code(&err), ErrorCode::MethodNotFound.code(), "{method}");
     }
 }
@@ -282,11 +352,18 @@ mod devtools {
     }
 
     fn unb64(text: &Value) -> Vec<u8> {
-        base64::engine::general_purpose::STANDARD.decode(text.as_str().unwrap()).unwrap()
+        base64::engine::general_purpose::STANDARD
+            .decode(text.as_str().unwrap())
+            .unwrap()
     }
 
     async fn synthetic(raw: &mut Raw, count: u32, bytes_per_sec: u64, echo: bool) -> Vec<String> {
-        let reply = raw.call(methods::DEV_SYNTHETIC_RUN, json!({ "count": count, "bytes_per_sec": bytes_per_sec, "echo": echo })).await;
+        let reply = raw
+            .call(
+                methods::DEV_SYNTHETIC_RUN,
+                json!({ "count": count, "bytes_per_sec": bytes_per_sec, "echo": echo }),
+            )
+            .await;
         let result: SyntheticRunResult = serde_json::from_value(reply["result"].clone()).unwrap();
         result.run_ids.into_iter().map(|id| id.0).collect()
     }
@@ -298,21 +375,27 @@ mod devtools {
         raw.hello(PROTOCOL.major).await;
         let run = synthetic(&mut raw, 1, 200_000, false).await.remove(0);
         tokio::time::sleep(Duration::from_millis(200)).await;
-        let id = raw.send(methods::RUN_ATTACH, json!({ "run_id": run })).await;
+        let id = raw
+            .send(methods::RUN_ATTACH, json!({ "run_id": run }))
+            .await;
 
         let mut cursor = None;
         let mut live_bytes = 0_usize;
         while live_bytes < 100_000 {
             let msg = raw.next().await.unwrap();
             if msg["id"] == json!(id) {
-                let attach: RunAttachResult = serde_json::from_value(msg["result"].clone()).unwrap();
+                let attach: RunAttachResult =
+                    serde_json::from_value(msg["result"].clone()).unwrap();
                 cursor = Some(attach.end_offset);
             } else if msg["method"] == json!(methods::RUN_OUTPUT) {
                 let Some(at) = cursor else { continue };
                 let offset = msg["params"]["offset"].as_u64().unwrap();
                 let data = unb64(&msg["params"]["data_b64"]);
                 let end = offset + data.len() as u64;
-                assert!(offset <= at, "gap: chunk starts at {offset}, expected at most {at}");
+                assert!(
+                    offset <= at,
+                    "gap: chunk starts at {offset}, expected at most {at}"
+                );
                 if end > at {
                     live_bytes += (end - at) as usize;
                     cursor = Some(end);
@@ -327,11 +410,18 @@ mod devtools {
         let mut raw = engine.raw().await;
         raw.hello(PROTOCOL.major).await;
         let run = synthetic(&mut raw, 1, 0, true).await.remove(0);
-        raw.call(methods::RUN_ATTACH, json!({ "run_id": run })).await;
-        raw.call(methods::RUN_INPUT, json!({ "run_id": run, "data_b64": b64(b"ping-42") })).await;
+        raw.call(methods::RUN_ATTACH, json!({ "run_id": run }))
+            .await;
+        raw.call(
+            methods::RUN_INPUT,
+            json!({ "run_id": run, "data_b64": b64(b"ping-42") }),
+        )
+        .await;
         loop {
             let msg = raw.next().await.unwrap();
-            if msg["method"] == json!(methods::RUN_OUTPUT) && unb64(&msg["params"]["data_b64"]).ends_with(b"ping-42") {
+            if msg["method"] == json!(methods::RUN_OUTPUT)
+                && unb64(&msg["params"]["data_b64"]).ends_with(b"ping-42")
+            {
                 break;
             }
         }
@@ -344,8 +434,16 @@ mod devtools {
         raw.hello(PROTOCOL.major).await;
         let run = synthetic(&mut raw, 1, 0, true).await.remove(0);
         let big = vec![b'x'; sy_protocol::MAX_INPUT_BYTES + 1];
-        let reply = raw.call(methods::RUN_INPUT, json!({ "run_id": run, "data_b64": b64(&big) })).await;
-        assert_eq!(reply["error"]["code"], json!(ErrorCode::InputTooLarge.code()));
+        let reply = raw
+            .call(
+                methods::RUN_INPUT,
+                json!({ "run_id": run, "data_b64": b64(&big) }),
+            )
+            .await;
+        assert_eq!(
+            reply["error"]["code"],
+            json!(ErrorCode::InputTooLarge.code())
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -353,29 +451,44 @@ mod devtools {
         let engine = Engine::start().await;
         let mut slow = engine.raw().await;
         slow.hello(PROTOCOL.major).await;
-        let run = synthetic(&mut slow, 1, 8 * 1024 * 1024, false).await.remove(0);
-        slow.call(methods::RUN_ATTACH, json!({ "run_id": run })).await;
+        let run = synthetic(&mut slow, 1, 8 * 1024 * 1024, false)
+            .await
+            .remove(0);
+        slow.call(methods::RUN_ATTACH, json!({ "run_id": run }))
+            .await;
         // Stop reading `slow` and let its queue pass the 8 MiB cap.
         tokio::time::sleep(Duration::from_millis(2500)).await;
 
         let mut fast = engine.raw().await;
         fast.hello(PROTOCOL.major).await;
-        fast.call(methods::RUN_ATTACH, json!({ "run_id": run })).await;
+        fast.call(methods::RUN_ATTACH, json!({ "run_id": run }))
+            .await;
         let started = Instant::now();
         let mut fast_bytes = 0_usize;
         while started.elapsed() < Duration::from_secs(1) {
             let msg = fast.next().await.unwrap();
-            assert_ne!(msg["method"], json!(methods::RUN_RESYNC_NEEDED), "the fast client fell behind too");
+            assert_ne!(
+                msg["method"],
+                json!(methods::RUN_RESYNC_NEEDED),
+                "the fast client fell behind too"
+            );
             if msg["method"] == json!(methods::RUN_OUTPUT) {
                 fast_bytes += msg["params"]["data_b64"].as_str().unwrap().len();
             }
         }
-        assert!(fast_bytes > 4 * 1024 * 1024, "fast client only got {fast_bytes} base64 bytes in 1 s");
+        assert!(
+            fast_bytes > 4 * 1024 * 1024,
+            "fast client only got {fast_bytes} base64 bytes in 1 s"
+        );
 
         let mut seen = std::collections::BTreeMap::<String, usize>::new();
         loop {
-            let Some(msg) = slow.next().await else { panic!("slow client never saw run.resync_needed; saw {seen:?}") };
-            *seen.entry(msg["method"].as_str().unwrap_or("response").to_owned()).or_default() += 1;
+            let Some(msg) = slow.next().await else {
+                panic!("slow client never saw run.resync_needed; saw {seen:?}")
+            };
+            *seen
+                .entry(msg["method"].as_str().unwrap_or("response").to_owned())
+                .or_default() += 1;
             if msg["method"] == json!(methods::RUN_RESYNC_NEEDED) {
                 assert_eq!(msg["params"]["run_id"], json!(run));
                 break;
@@ -390,12 +503,27 @@ mod devtools {
         raw.hello(PROTOCOL.major).await;
         synthetic(&mut raw, 2, 1000, false).await;
         raw.call(methods::ENGINE_DRAIN, json!({})).await;
-        let refused = raw.call(methods::DEV_SYNTHETIC_RUN, json!({ "count": 1, "bytes_per_sec": 0, "echo": false })).await;
-        assert_eq!(refused["error"]["code"], json!(ErrorCode::EngineDraining.code()));
-        assert!(engine.wait_exit(Duration::from_millis(500)).is_none(), "exited while runs were active");
+        let refused = raw
+            .call(
+                methods::DEV_SYNTHETIC_RUN,
+                json!({ "count": 1, "bytes_per_sec": 0, "echo": false }),
+            )
+            .await;
+        assert_eq!(
+            refused["error"]["code"],
+            json!(ErrorCode::EngineDraining.code())
+        );
+        assert!(
+            engine.wait_exit(Duration::from_millis(500)).is_none(),
+            "exited while runs were active"
+        );
 
         raw.call(methods::DEV_STOP_RUNS, json!({})).await;
-        assert!(engine.wait_exit(Duration::from_secs(5)).is_some_and(|s| s.success()));
+        assert!(
+            engine
+                .wait_exit(Duration::from_secs(5))
+                .is_some_and(|s| s.success())
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

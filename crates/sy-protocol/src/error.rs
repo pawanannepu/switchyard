@@ -79,13 +79,19 @@ mod tests {
     fn app_codes_should_sit_in_the_reserved_server_range() {
         let is_standard = |code: i32| code == -32700 || (-32603..=-32600).contains(&code);
         let is_app = |code: i32| (-32099..=-32000).contains(&code);
-        let out_of_range: Vec<_> =
-            ErrorCode::ALL.iter().filter(|c| !is_standard(c.code()) && !is_app(c.code())).collect();
+        let out_of_range: Vec<_> = ErrorCode::ALL
+            .iter()
+            .filter(|c| !is_standard(c.code()) && !is_app(c.code()))
+            .collect();
         assert!(out_of_range.is_empty(), "{out_of_range:?}");
     }
 
     #[test]
     fn from_code_should_invert_code() {
-        assert!(ErrorCode::ALL.iter().all(|c| ErrorCode::from_code(c.code()) == Some(*c)));
+        assert!(
+            ErrorCode::ALL
+                .iter()
+                .all(|c| ErrorCode::from_code(c.code()) == Some(*c))
+        );
     }
 }

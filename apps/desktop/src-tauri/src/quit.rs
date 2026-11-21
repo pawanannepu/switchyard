@@ -32,7 +32,11 @@ pub fn request(app: &AppHandle) {
             quit_now(&app);
             return;
         }
-        let agents = if running == 1 { "1 agent is".to_owned() } else { format!("{running} agents are") };
+        let agents = if running == 1 {
+            "1 agent is".to_owned()
+        } else {
+            format!("{running} agents are")
+        };
         let app2 = app.clone();
         app.dialog()
             .message(format!(

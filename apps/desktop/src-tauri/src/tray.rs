@@ -16,7 +16,10 @@ pub fn create(app: &mut App) -> tauri::Result<()> {
     let status = MenuItem::with_id(app, "status", "Engine: starting…", false, None::<&str>)?;
     let open = MenuItem::with_id(app, OPEN, "Open switchyard", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, QUIT, "Quit switchyard", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&status, &PredefinedMenuItem::separator(app)?, &open, &quit])?;
+    let menu = Menu::with_items(
+        app,
+        &[&status, &PredefinedMenuItem::separator(app)?, &open, &quit],
+    )?;
 
     let mut builder = TrayIconBuilder::with_id(TRAY_ID)
         .tooltip("switchyard")

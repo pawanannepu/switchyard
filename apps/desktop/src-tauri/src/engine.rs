@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 use sy_client::relay::{FrontendSlot, Relay};
 use sy_client::{Connection, EnginePaths, HelloError};
-use sy_protocol::{ClientKind, EngineInfo, ErrorCode, HostConnection, HostConnectionState, methods};
+use sy_protocol::{
+    ClientKind, EngineInfo, ErrorCode, HostConnection, HostConnectionState, methods,
+};
 use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::{AppHandle, State};
 
@@ -43,7 +45,10 @@ impl EngineLink {
         Self {
             paths,
             slot: FrontendSlot::new(),
-            state: Mutex::new(LinkState { relay: None, status }),
+            state: Mutex::new(LinkState {
+                relay: None,
+                status,
+            }),
             connecting: AtomicBool::new(false),
             running_agents: AtomicU32::new(0),
         }
@@ -68,9 +73,13 @@ impl EngineLink {
     /// Ask the engine for the current count (falls back to the last one seen).
     pub async fn refresh_running_agents(&self) -> u32 {
         if let Some(relay) = self.relay()
-            && let Ok(info) = relay.connection().call::<_, EngineInfo>(methods::ENGINE_INFO, &json!({})).await
+            && let Ok(info) = relay
+                .connection()
+                .call::<_, EngineInfo>(methods::ENGINE_INFO, &json!({}))
+                .await
         {
-            self.running_agents.store(info.running_agents, Ordering::Relaxed);
+            self.running_agents
+                .store(info.running_agents, Ordering::Relaxed);
         }
         self.running_agents()
     }
@@ -80,11 +89,16 @@ impl EngineLink {
             let mut s = self.lock();
             s.status = HostConnection {
                 state,
-                hello: s.relay.as_ref().map(|r| r.hello().clone()).or_else(|| s.status.hello.clone()),
+                hello: s
+                    .relay
+                    .as_ref()
+                    .map(|r| r.hello().clone())
+                    .or_else(|| s.status.hello.clone()),
                 message,
                 logs_dir: Some(self.paths.logs_dir.display().to_string()),
             };
-            if state != HostConnectionState::Connected && state != HostConnectionState::Incompatible {
+            if state != HostConnectionState::Connected && state != HostConnectionState::Incompatible
+            {
                 s.status.hello = None;
             }
             s.status.clone()
@@ -133,11 +147,19 @@ impl EngineLink {
                     if !spawned {
                         spawned = true;
                         if let Err(spawn_err) = launcher::spawn(&self.paths) {
-                            self.set_status(app, HostConnectionState::Failed, Some(format!("Could not start the engine: {spawn_err}")));
+                            self.set_status(
+                                app,
+                                HostConnectionState::Failed,
+                                Some(format!("Could not start the engine: {spawn_err}")),
+                            );
                             return;
                         }
                     } else if started.elapsed() >= START_TIMEOUT {
-                        self.set_status(app, HostConnectionState::Failed, Some(format!("The engine didn't start: {err}")));
+                        self.set_status(
+                            app,
+                            HostConnectionState::Failed,
+                            Some(format!("The engine didn't start: {err}")),
+                        );
                         return;
                     }
                     tokio::time::sleep(delay).await;
@@ -151,7 +173,9 @@ impl EngineLink {
         let (conn, notifications) = Connection::connect(&self.paths.socket)
             .await
             .map_err(|_| HelloError::Call(sy_client::CallError::Closed))?;
-        let hello = conn.hello(ClientKind::Desktop, env!("CARGO_PKG_VERSION")).await?;
+        let hello = conn
+            .hello(ClientKind::Desktop, env!("CARGO_PKG_VERSION"))
+            .await?;
         let relay = Relay::start(conn, hello, notifications, Arc::clone(&self.slot));
         self.lock().relay = Some(relay);
         Ok(())
@@ -164,11 +188,17 @@ impl EngineLink {
         let (this, app2, conn) = (Arc::clone(self), app.clone(), relay.connection().clone());
         tauri::async_runtime::spawn(async move {
             conn.closed().await;
-            let still_current = this.relay().is_some_and(|r| r.hello().pid == relay.hello().pid);
+            let still_current = this
+                .relay()
+                .is_some_and(|r| r.hello().pid == relay.hello().pid);
             if still_current {
                 this.lock().relay = None;
                 this.running_agents.store(0, Ordering::Relaxed);
-                this.set_status(&app2, HostConnectionState::Stopped, Some("The engine stopped.".into()));
+                this.set_status(
+                    &app2,
+                    HostConnectionState::Stopped,
+                    Some("The engine stopped.".into()),
+                );
             }
         });
 
@@ -189,7 +219,10 @@ impl EngineLink {
 
 /// The webview subscribes once per page load; a reload replaces the old channel.
 #[tauri::command]
-pub async fn engine_subscribe(link: State<'_, Arc<EngineLink>>, on_message: Channel) -> Result<(), String> {
+pub async fn engine_subscribe(
+    link: State<'_, Arc<EngineLink>>,
+    on_message: Channel,
+) -> Result<(), String> {
     link.slot.attach(Arc::new(move |frame: String| {
         let _ = on_message.send(InvokeResponseBody::Json(frame));
     }));
@@ -203,14 +236,22 @@ pub async fn engine_send(link: State<'_, Arc<EngineLink>>, frame: String) -> Res
     let generation = link.slot.generation();
     match link.relay() {
         Some(relay) => relay.handle_frame(generation, &frame),
-        None => link.slot.reject(generation, &frame, ErrorCode::EngineUnavailable, "The engine is not connected."),
+        None => link.slot.reject(
+            generation,
+            &frame,
+            ErrorCode::EngineUnavailable,
+            "The engine is not connected.",
+        ),
     }
     Ok(())
 }
 
 /// Start (or reconnect to) the engine after it stopped or failed to start.
 #[tauri::command]
-pub async fn engine_restart(app: AppHandle, link: State<'_, Arc<EngineLink>>) -> Result<(), String> {
+pub async fn engine_restart(
+    app: AppHandle,
+    link: State<'_, Arc<EngineLink>>,
+) -> Result<(), String> {
     if link.relay().is_none() {
         link.inner().connect(app);
     }

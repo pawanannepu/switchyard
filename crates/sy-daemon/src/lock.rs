@@ -14,7 +14,12 @@ pub enum Outcome {
 }
 
 pub fn acquire(path: &Path) -> io::Result<Outcome> {
-    let file = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(path)?;
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)?;
     match file.try_lock() {
         Ok(()) => Ok(Outcome::Acquired(file)),
         Err(TryLockError::WouldBlock) => Ok(Outcome::AlreadyRunning),

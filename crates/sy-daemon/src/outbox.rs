@@ -29,7 +29,11 @@ pub struct Outbox {
 
 impl Outbox {
     pub fn new(cap: usize) -> Self {
-        Self { state: Mutex::default(), notify: Notify::new(), cap }
+        Self {
+            state: Mutex::default(),
+            notify: Notify::new(),
+            cap,
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {

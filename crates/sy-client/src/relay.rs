@@ -12,8 +12,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use serde_json::Value;
 use sy_protocol::{
-    ErrorCode, HelloResult, HostConnection, Message, RpcError, envelope::ParseFailure, methods, notification_line,
-    response_line,
+    ErrorCode, HelloResult, HostConnection, Message, RpcError, envelope::ParseFailure, methods,
+    notification_line, response_line,
 };
 
 use crate::connection::{CallError, Connection, Notifications};
@@ -55,7 +55,10 @@ impl FrontendSlot {
         };
         if let Some(old) = old_sink {
             for id in abandoned {
-                old(frame(&response_line(&id, &Err(abandoned_error("the page reloaded")))));
+                old(frame(&response_line(
+                    &id,
+                    &Err(abandoned_error("the page reloaded")),
+                )));
             }
         }
         self.lock().generation
@@ -107,7 +110,10 @@ impl FrontendSlot {
             return;
         }
         match Message::parse(text) {
-            Ok(Message::Request { id, .. }) => self.send(frame(&response_line(&id, &Err(RpcError::new(code, message))))),
+            Ok(Message::Request { id, .. }) => self.send(frame(&response_line(
+                &id,
+                &Err(RpcError::new(code, message)),
+            ))),
             Ok(_) => {}
             Err(failure) => self.send(parse_failure_frame(failure)),
         }
@@ -119,13 +125,18 @@ fn frame(line: &str) -> String {
 }
 
 fn abandoned_error(why: &str) -> RpcError {
-    RpcError::new(ErrorCode::RequestAbandoned, format!("request abandoned: {why}"))
+    RpcError::new(
+        ErrorCode::RequestAbandoned,
+        format!("request abandoned: {why}"),
+    )
 }
 
 fn parse_failure_frame(failure: ParseFailure) -> String {
     let (id, err) = match failure {
         ParseFailure::Json(msg) => (Value::Null, RpcError::new(ErrorCode::ParseError, msg)),
-        ParseFailure::Shape { id, reason } => (id, RpcError::new(ErrorCode::InvalidRequest, reason)),
+        ParseFailure::Shape { id, reason } => {
+            (id, RpcError::new(ErrorCode::InvalidRequest, reason))
+        }
     };
     frame(&response_line(&id, &Err(err)))
 }
@@ -140,7 +151,12 @@ pub struct Relay {
 
 impl Relay {
     /// Start relaying: engine notifications flow to the slot from now on.
-    pub fn start(conn: Connection, hello: HelloResult, mut notifications: Notifications, slot: Arc<FrontendSlot>) -> Self {
+    pub fn start(
+        conn: Connection,
+        hello: HelloResult,
+        mut notifications: Notifications,
+        slot: Arc<FrontendSlot>,
+    ) -> Self {
         let forward_slot = Arc::clone(&slot);
         tokio::spawn(async move {
             while let Some(line) = notifications.recv().await {
@@ -169,15 +185,21 @@ impl Relay {
                     self.slot.send(frame(&response_line(&id, &Ok(hello))));
                     return;
                 }
-                let Some(key) = self.slot.begin(generation, id) else { return };
+                let Some(key) = self.slot.begin(generation, id) else {
+                    return;
+                };
                 let conn = self.conn.clone();
                 let slot = Arc::clone(&self.slot);
                 tokio::spawn(async move {
                     let outcome = match conn.call_value(&method, params).await {
                         Ok(value) => Ok(value),
                         Err(CallError::Rpc(err)) => Err(err),
-                        Err(CallError::Closed) => Err(abandoned_error("the engine connection closed")),
-                        Err(CallError::Decode(err)) => Err(RpcError::new(ErrorCode::InternalError, err.to_string())),
+                        Err(CallError::Closed) => {
+                            Err(abandoned_error("the engine connection closed"))
+                        }
+                        Err(CallError::Decode(err)) => {
+                            Err(RpcError::new(ErrorCode::InternalError, err.to_string()))
+                        }
                     };
                     slot.finish(key, outcome);
                 });
@@ -212,7 +234,10 @@ mod tests {
         let (new, _) = collecting_sink();
         slot.attach(new);
         let frames = old_seen.lock().unwrap().clone();
-        assert!(frames.len() == 1 && frames[0].contains("-32091") && frames[0].contains("42"), "{frames:?}");
+        assert!(
+            frames.len() == 1 && frames[0].contains("-32091") && frames[0].contains("42"),
+            "{frames:?}"
+        );
     }
 
     #[test]

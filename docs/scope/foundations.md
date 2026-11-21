@@ -5,9 +5,9 @@ The ground every slice stands on. Back to the [index](index.md).
 ### 1. Stack & architecture
 Decide the desktop app stack, how the UI talks to the orchestration core, and how the core stays independent of any one agent, then scaffold a runnable app.
 **Done when:** the stack and module boundaries are recorded in a spec (core, adapters, UI kept separate so a new agent never touches the core), and the empty app opens a window on macOS and passes build, with nothing in the core tied to one OS.
-spec [0001](../specs/0001-stack-architecture/index.md)
+spec [0001](../specs/0001-stack-architecture/index.md) · code in `crates/`, `apps/desktop/`, `packages/protocol-ts/`, `scripts/`
 - [x] Decide the stack (spec): `/architect stack & architecture`
-- [ ] Scaffold from the decision: `/develop stack & architecture`
+- [x] Scaffold from the decision: `/develop stack & architecture`
 
 ### 2. Coding standards & tooling
 Capture conventions from the real scaffolded project, then install lint, format, type checks, pre commit hooks and CI, so every later feature follows them.

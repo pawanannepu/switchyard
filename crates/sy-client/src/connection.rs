@@ -11,7 +11,8 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use sy_protocol::{
-    ClientKind, HelloParams, HelloResult, Message, PROTOCOL, RpcError, methods, notification_line, request_line,
+    ClientKind, HelloParams, HelloResult, Message, PROTOCOL, RpcError, methods, notification_line,
+    request_line,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -68,7 +69,12 @@ impl Connection {
         let (notif_tx, notif_rx) = mpsc::channel(NOTIFICATION_QUEUE);
         let (closed_tx, closed_rx) = watch::channel(false);
 
-        let inner = Arc::new(Inner { out: out_tx, pending: Mutex::new(HashMap::new()), next_id: AtomicU64::new(1), closed: closed_rx });
+        let inner = Arc::new(Inner {
+            out: out_tx,
+            pending: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(1),
+            closed: closed_rx,
+        });
 
         tokio::spawn(async move {
             while let Some(line) = out_rx.recv().await {
@@ -84,7 +90,9 @@ impl Connection {
             while let Some(Ok(line)) = lines.next().await {
                 match Message::parse(&line) {
                     Ok(Message::Response { id, outcome }) => {
-                        let waiter = id.as_u64().and_then(|id| reader_inner.pending_lock().remove(&id));
+                        let waiter = id
+                            .as_u64()
+                            .and_then(|id| reader_inner.pending_lock().remove(&id));
                         if let Some(waiter) = waiter {
                             let _ = waiter.send(outcome);
                         }
@@ -94,7 +102,9 @@ impl Connection {
                             // Nobody listens for notifications; keep serving responses.
                         }
                     }
-                    Ok(Message::Request { method, .. }) => tracing::debug!(%method, "ignoring request from engine"),
+                    Ok(Message::Request { method, .. }) => {
+                        tracing::debug!(%method, "ignoring request from engine")
+                    }
                     Err(err) => tracing::warn!(?err, "unparseable line from engine"),
                 }
             }
@@ -107,8 +117,16 @@ impl Connection {
     }
 
     /// `session.hello`, failing if the protocol majors differ.
-    pub async fn hello(&self, client: ClientKind, client_version: &str) -> Result<HelloResult, HelloError> {
-        let params = HelloParams { client, client_version: client_version.to_owned(), protocol: PROTOCOL };
+    pub async fn hello(
+        &self,
+        client: ClientKind,
+        client_version: &str,
+    ) -> Result<HelloResult, HelloError> {
+        let params = HelloParams {
+            client,
+            client_version: client_version.to_owned(),
+            protocol: PROTOCOL,
+        };
         let hello: HelloResult = self.call(methods::SESSION_HELLO, &params).await?;
         if hello.protocol.is_compatible_with(PROTOCOL) {
             Ok(hello)
@@ -118,7 +136,11 @@ impl Connection {
     }
 
     /// A typed request.
-    pub async fn call<P: Serialize, R: DeserializeOwned>(&self, method: &str, params: &P) -> Result<R, CallError> {
+    pub async fn call<P: Serialize, R: DeserializeOwned>(
+        &self,
+        method: &str,
+        params: &P,
+    ) -> Result<R, CallError> {
         let params = serde_json::to_value(params)?;
         let result = self.call_value(method, params).await?;
         Ok(serde_json::from_value(result)?)
@@ -132,7 +154,12 @@ impl Connection {
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.inner.pending_lock().insert(id, tx);
-        if self.inner.out.send(request_line(&Value::from(id), method, &params)).is_err() {
+        if self
+            .inner
+            .out
+            .send(request_line(&Value::from(id), method, &params))
+            .is_err()
+        {
             self.inner.pending_lock().remove(&id);
             return Err(CallError::Closed);
         }
@@ -145,7 +172,10 @@ impl Connection {
 
     /// Send a notification (no response expected).
     pub fn notify(&self, method: &str, params: &Value) -> Result<(), CallError> {
-        self.inner.out.send(notification_line(method, params)).map_err(|_| CallError::Closed)
+        self.inner
+            .out
+            .send(notification_line(method, params))
+            .map_err(|_| CallError::Closed)
     }
 
     pub fn is_closed(&self) -> bool {
@@ -160,7 +190,9 @@ impl Connection {
 }
 
 impl Inner {
-    fn pending_lock(&self) -> std::sync::MutexGuard<'_, HashMap<u64, oneshot::Sender<Result<Value, RpcError>>>> {
+    fn pending_lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<u64, oneshot::Sender<Result<Value, RpcError>>>> {
         // A panic while holding this lock cannot leave the map inconsistent.
         self.pending.lock().unwrap_or_else(PoisonError::into_inner)
     }

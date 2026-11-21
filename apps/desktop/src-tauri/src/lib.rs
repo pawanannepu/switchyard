@@ -54,7 +54,11 @@ pub fn run() -> Result<(), RunError> {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(Arc::clone(&link))
-        .invoke_handler(tauri::generate_handler![engine::engine_subscribe, engine::engine_send, engine::engine_restart])
+        .invoke_handler(tauri::generate_handler![
+            engine::engine_subscribe,
+            engine::engine_send,
+            engine::engine_restart
+        ])
         .setup(move |app| {
             tray::create(app)?;
             link.connect(app.handle().clone());

@@ -43,7 +43,9 @@ fn run() -> anyhow::Result<ExitCode> {
     paths.ensure_dirs()?;
     let _log_guard = logging::init(&paths.logs_dir)?;
 
-    let lock = match lock::acquire(&paths.lock).with_context(|| format!("opening {}", paths.lock.display()))? {
+    let lock = match lock::acquire(&paths.lock)
+        .with_context(|| format!("opening {}", paths.lock.display()))?
+    {
         lock::Outcome::Acquired(file) => file,
         lock::Outcome::AlreadyRunning => {
             // Another engine holds the lock. Leave its socket alone and exit cleanly.
@@ -57,7 +59,9 @@ fn run() -> anyhow::Result<ExitCode> {
     adapters.register(sy_adapter_claude::ClaudeAdapter);
 
     let config = config::Config::from_env();
-    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
     runtime.block_on(server::run(paths, config, adapters))?;
     drop(runtime);
     // Released last, after the socket is gone, so the next engine starts clean.

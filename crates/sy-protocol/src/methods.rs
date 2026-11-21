@@ -63,15 +63,29 @@ const fn req(name: &'static str, params: &'static str, result: &'static str) -> 
 }
 
 const fn stable(spec: MethodSpec) -> MethodSpec {
-    MethodSpec { stable: true, ..spec }
+    MethodSpec {
+        stable: true,
+        ..spec
+    }
 }
 
 const fn dev(spec: MethodSpec) -> MethodSpec {
-    MethodSpec { dev_only: true, ..spec }
+    MethodSpec {
+        dev_only: true,
+        ..spec
+    }
 }
 
 const fn event(name: &'static str, params: &'static str, direction: Direction) -> MethodSpec {
-    MethodSpec { name, kind: Kind::Notification, direction, params, result: None, stable: false, dev_only: false }
+    MethodSpec {
+        name,
+        kind: Kind::Notification,
+        direction,
+        params,
+        result: None,
+        stable: false,
+        dev_only: false,
+    }
 }
 
 /// Every method and notification in the protocol.
@@ -84,8 +98,16 @@ pub const ALL: &[MethodSpec] = &[
     req(RUN_INPUT, "RunInputParams", "Empty"),
     req(RUN_RESIZE, "RunResizeParams", "Empty"),
     event(RUN_OUTPUT, "RunOutput", Direction::EngineToClient),
-    event(RUN_RESYNC_NEEDED, "RunResyncNeeded", Direction::EngineToClient),
-    dev(req(DEV_SYNTHETIC_RUN, "SyntheticRunParams", "SyntheticRunResult")),
+    event(
+        RUN_RESYNC_NEEDED,
+        "RunResyncNeeded",
+        Direction::EngineToClient,
+    ),
+    dev(req(
+        DEV_SYNTHETIC_RUN,
+        "SyntheticRunParams",
+        "SyntheticRunResult",
+    )),
     dev(req(DEV_STOP_RUNS, "Empty", "StopRunsResult")),
     event(HOST_CONNECTION, "HostConnection", Direction::HostToClient),
 ];

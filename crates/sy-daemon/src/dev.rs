@@ -17,14 +17,24 @@ const MAX_RUNS: u32 = 64;
 const MAX_BYTES_PER_SEC: u64 = 64 * 1024 * 1024;
 const TICK: Duration = Duration::from_millis(16);
 
-const FILLER: &str = "the quick brown fox jumps over the lazy dog while switchyard keeps every agent in its lane ";
+const FILLER: &str =
+    "the quick brown fox jumps over the lazy dog while switchyard keeps every agent in its lane ";
 
-pub fn synthetic_run(hub: &Arc<RunHub>, p: &SyntheticRunParams) -> Result<SyntheticRunResult, RpcError> {
+pub fn synthetic_run(
+    hub: &Arc<RunHub>,
+    p: &SyntheticRunParams,
+) -> Result<SyntheticRunResult, RpcError> {
     if p.count == 0 || p.count > MAX_RUNS {
-        return Err(RpcError::new(ErrorCode::InvalidParams, format!("count must be 1 to {MAX_RUNS}")));
+        return Err(RpcError::new(
+            ErrorCode::InvalidParams,
+            format!("count must be 1 to {MAX_RUNS}"),
+        ));
     }
     if p.bytes_per_sec > MAX_BYTES_PER_SEC {
-        return Err(RpcError::new(ErrorCode::InvalidParams, format!("bytes_per_sec must be at most {MAX_BYTES_PER_SEC}")));
+        return Err(RpcError::new(
+            ErrorCode::InvalidParams,
+            format!("bytes_per_sec must be at most {MAX_BYTES_PER_SEC}"),
+        ));
     }
     let run_ids = (0..p.count)
         .map(|_| {
@@ -34,18 +44,34 @@ pub fn synthetic_run(hub: &Arc<RunHub>, p: &SyntheticRunParams) -> Result<Synthe
             id
         })
         .collect();
-    tracing::info!(count = p.count, bytes_per_sec = p.bytes_per_sec, echo = p.echo, "synthetic runs started");
+    tracing::info!(
+        count = p.count,
+        bytes_per_sec = p.bytes_per_sec,
+        echo = p.echo,
+        "synthetic runs started"
+    );
     Ok(SyntheticRunResult { run_ids })
 }
 
-async fn produce(writer: RunWriter, mut control: mpsc::Receiver<RunControl>, bytes_per_sec: u64, echo: bool) {
+async fn produce(
+    writer: RunWriter,
+    mut control: mpsc::Receiver<RunControl>,
+    bytes_per_sec: u64,
+    echo: bool,
+) {
     let started = Instant::now();
     let mut last = started;
     let mut budget = 0.0_f64;
     let mut line_no = 0_u64;
     let mut tick = tokio::time::interval(TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    writer.write(format!("\x1b[1msynthetic run {}\x1b[0m ({bytes_per_sec} B/s, echo {echo})\r\n", writer.id()).as_bytes());
+    writer.write(
+        format!(
+            "\x1b[1msynthetic run {}\x1b[0m ({bytes_per_sec} B/s, echo {echo})\r\n",
+            writer.id()
+        )
+        .as_bytes(),
+    );
 
     loop {
         tokio::select! {

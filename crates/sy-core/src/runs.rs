@@ -119,7 +119,9 @@ impl RunEntry {
             .map(|(id, _)| *id)
             .collect();
         if !dropped.is_empty() {
-            lock(&self.state).subscribers.retain(|(id, _)| !dropped.contains(id));
+            lock(&self.state)
+                .subscribers
+                .retain(|(id, _)| !dropped.contains(id));
         }
     }
 }
@@ -153,7 +155,11 @@ pub struct RunHub {
 
 impl RunHub {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self { runs: Mutex::new(HashMap::new()), next: AtomicU64::new(1), count: watch::Sender::new(0) })
+        Arc::new(Self {
+            runs: Mutex::new(HashMap::new()),
+            next: AtomicU64::new(1),
+            count: watch::Sender::new(0),
+        })
     }
 
     /// Create a run. The producer writes through the [`RunWriter`] and reads
@@ -161,7 +167,11 @@ impl RunHub {
     pub fn create_run(&self) -> (RunWriter, mpsc::Receiver<RunControl>) {
         let id = RunId(format!("run-{}", self.next.fetch_add(1, Ordering::Relaxed)));
         let (tx, rx) = mpsc::channel(CONTROL_QUEUE);
-        let entry = Arc::new(RunEntry { id: id.clone(), state: Mutex::default(), control: Mutex::new(Some(tx)) });
+        let entry = Arc::new(RunEntry {
+            id: id.clone(),
+            state: Mutex::default(),
+            control: Mutex::new(Some(tx)),
+        });
         let len = {
             let mut runs = lock(&self.runs);
             runs.insert(id, Arc::clone(&entry));
@@ -177,7 +187,12 @@ impl RunHub {
 
     /// Subscribe `sink` to a run. Returns the replay and `end_offset`.
     /// Attaching again with the same subscriber replaces the old subscription.
-    pub fn attach(&self, run: &RunId, subscriber: SubscriberId, sink: Arc<dyn RunSink>) -> Result<(Vec<u8>, u64), RunError> {
+    pub fn attach(
+        &self,
+        run: &RunId,
+        subscriber: SubscriberId,
+        sink: Arc<dyn RunSink>,
+    ) -> Result<(Vec<u8>, u64), RunError> {
         let entry = self.entry(run)?;
         let mut s = lock(&entry.state);
         s.subscribers.retain(|(id, _)| *id != subscriber);
@@ -190,7 +205,9 @@ impl RunHub {
     pub fn detach_all(&self, subscriber: SubscriberId) {
         let entries: Vec<_> = lock(&self.runs).values().cloned().collect();
         for entry in entries {
-            lock(&entry.state).subscribers.retain(|(id, _)| *id != subscriber);
+            lock(&entry.state)
+                .subscribers
+                .retain(|(id, _)| *id != subscriber);
         }
     }
 
@@ -317,15 +334,24 @@ mod tests {
         let (writer, _rx) = hub.create_run();
         writer.write(&vec![b'a'; REPLAY_BYTES]);
         writer.write(b"tail");
-        let (replay, end) = hub.attach(writer.id(), 1, Arc::new(Collect::default())).unwrap();
-        assert!(replay.len() == REPLAY_BYTES && replay.ends_with(b"tail") && end == REPLAY_BYTES as u64 + 4);
+        let (replay, end) = hub
+            .attach(writer.id(), 1, Arc::new(Collect::default()))
+            .unwrap();
+        assert!(
+            replay.len() == REPLAY_BYTES
+                && replay.ends_with(b"tail")
+                && end == REPLAY_BYTES as u64 + 4
+        );
     }
 
     #[test]
     fn dropped_sink_should_be_unsubscribed() {
         let hub = RunHub::new();
         let (writer, _rx) = hub.create_run();
-        let slow = Arc::new(Collect { refuse: true, ..Default::default() });
+        let slow = Arc::new(Collect {
+            refuse: true,
+            ..Default::default()
+        });
         hub.attach(writer.id(), 1, slow).unwrap();
         writer.write(b"x");
         hub.flush();

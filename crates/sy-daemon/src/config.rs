@@ -21,6 +21,9 @@ impl Config {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .map_or(DEFAULT_IDLE_EXIT, Duration::from_secs);
-        Self { idle_exit, flush_grace: Duration::from_secs(2) }
+        Self {
+            idle_exit,
+            flush_grace: Duration::from_secs(2),
+        }
     }
 }

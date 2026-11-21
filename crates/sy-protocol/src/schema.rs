@@ -104,6 +104,10 @@ mod tests {
     #[test]
     fn committed_schema_should_match_the_rust_types() {
         let committed = include_str!("../protocol.schema.json");
-        assert_eq!(committed, generate_pretty(), "run `pnpm protocol:gen` and commit the result");
+        assert_eq!(
+            committed,
+            generate_pretty(),
+            "run `pnpm protocol:gen` and commit the result"
+        );
     }
 }

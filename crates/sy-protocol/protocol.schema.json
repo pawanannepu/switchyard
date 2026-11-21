@@ -172,8 +172,8 @@
       ],
       "type": "object"
     },
-    "RpcError": {
-      "description": "A JSON-RPC error object.",
+    "RpcErrorObject": {
+      "description": "A JSON-RPC error object. Named `RpcErrorObject` in the schema so the TS\n`RpcError` class can keep the short name.",
       "properties": {
         "code": {
           "format": "int32",

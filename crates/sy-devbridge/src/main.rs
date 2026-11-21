@@ -22,7 +22,9 @@ use tokio_tungstenite::tungstenite::http::StatusCode;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt().with_writer(std::io::stderr).init();
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .init();
     let paths = EnginePaths::resolve()?;
     let token = random_token()?;
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
@@ -56,11 +58,23 @@ fn token_matches(request: &Request, token: &str) -> bool {
         .into_iter()
         .flat_map(|q| q.split('&'))
         .filter_map(|pair| pair.strip_prefix("token="))
-        .any(|given| given.len() == token.len() && given.bytes().zip(token.bytes()).fold(0, |acc, (a, b)| acc | (a ^ b)) == 0)
+        .any(|given| {
+            given.len() == token.len()
+                && given
+                    .bytes()
+                    .zip(token.bytes())
+                    .fold(0, |acc, (a, b)| acc | (a ^ b))
+                    == 0
+        })
 }
 
 fn connection_state(state: HostConnectionState, paths: &EnginePaths) -> HostConnection {
-    HostConnection { state, hello: None, message: None, logs_dir: Some(paths.logs_dir.display().to_string()) }
+    HostConnection {
+        state,
+        hello: None,
+        message: None,
+        logs_dir: Some(paths.logs_dir.display().to_string()),
+    }
 }
 
 // tungstenite's handshake callback returns its large `ErrorResponse` by value.
@@ -96,7 +110,12 @@ async fn serve(tcp: TcpStream, paths: &EnginePaths, token: &str) -> anyhow::Resu
         match message? {
             Message::Text(text) => match &relay {
                 Some(relay) => relay.handle_frame(generation, &text),
-                None => slot.reject(generation, &text, ErrorCode::EngineUnavailable, "the engine is not running"),
+                None => slot.reject(
+                    generation,
+                    &text,
+                    ErrorCode::EngineUnavailable,
+                    "the engine is not running",
+                ),
             },
             Message::Close(_) => break,
             _ => {}
@@ -108,7 +127,9 @@ async fn serve(tcp: TcpStream, paths: &EnginePaths, token: &str) -> anyhow::Resu
 async fn connect(socket: &Path, slot: &Arc<FrontendSlot>, paths: &EnginePaths) -> Option<Relay> {
     let attempt = async {
         let (conn, notifications) = Connection::connect(socket).await?;
-        let hello = conn.hello(ClientKind::Test, env!("CARGO_PKG_VERSION")).await?;
+        let hello = conn
+            .hello(ClientKind::Test, env!("CARGO_PKG_VERSION"))
+            .await?;
         anyhow::Ok((conn, hello, notifications))
     };
     match attempt.await {
@@ -128,7 +149,10 @@ async fn connect(socket: &Path, slot: &Arc<FrontendSlot>, paths: &EnginePaths) -
         }
         Err(err) => {
             slot.send_connection(&HostConnection {
-                message: Some(format!("cannot reach the engine at {}: {err}", socket.display())),
+                message: Some(format!(
+                    "cannot reach the engine at {}: {err}",
+                    socket.display()
+                )),
                 ..connection_state(HostConnectionState::Stopped, paths)
             });
             None

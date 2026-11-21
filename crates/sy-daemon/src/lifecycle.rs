@@ -23,7 +23,11 @@ pub struct Lifecycle {
 
 impl Lifecycle {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self { clients: watch::Sender::new(0), draining: AtomicBool::new(false), exit: watch::Sender::new(None) })
+        Arc::new(Self {
+            clients: watch::Sender::new(0),
+            draining: AtomicBool::new(false),
+            exit: watch::Sender::new(None),
+        })
     }
 
     pub fn client_connected(&self) {
@@ -34,7 +38,13 @@ impl Lifecycle {
         self.clients.send_modify(|n| *n = n.saturating_sub(1));
     }
 
-    #[cfg_attr(not(feature = "devtools"), expect(dead_code, reason = "only dev.synthetic_run starts runs until feature 8"))]
+    #[cfg_attr(
+        not(feature = "devtools"),
+        expect(
+            dead_code,
+            reason = "only dev.synthetic_run starts runs until feature 8"
+        )
+    )]
     pub fn is_draining(&self) -> bool {
         self.draining.load(Ordering::Relaxed)
     }

@@ -67,7 +67,13 @@ impl EnginePaths {
             (fallback_socket_dir().join("engine.sock"), true)
         };
         let lock = data_dir.join("engine.lock");
-        Self { data_dir, logs_dir, socket, lock, socket_in_fallback_dir }
+        Self {
+            data_dir,
+            logs_dir,
+            socket,
+            lock,
+            socket_in_fallback_dir,
+        }
     }
 
     /// Create the data dir, logs dir and (if used) the fallback socket dir, all `0700`.
@@ -89,7 +95,10 @@ fn path_len(path: &Path) -> usize {
 
 #[cfg(target_os = "macos")]
 fn default_logs_dir(_data_dir: &Path) -> Result<PathBuf, PathError> {
-    Ok(dirs::home_dir().ok_or(PathError::NoHome)?.join("Library/Logs").join(BUNDLE_ID))
+    Ok(dirs::home_dir()
+        .ok_or(PathError::NoHome)?
+        .join("Library/Logs")
+        .join(BUNDLE_ID))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -99,7 +108,10 @@ fn default_logs_dir(data_dir: &Path) -> Result<PathBuf, PathError> {
 
 #[cfg(unix)]
 fn fallback_socket_dir() -> PathBuf {
-    PathBuf::from(format!("/tmp/switchyard-{}", crate::transport::current_uid()))
+    PathBuf::from(format!(
+        "/tmp/switchyard-{}",
+        crate::transport::current_uid()
+    ))
 }
 
 #[cfg(not(unix))]
@@ -111,11 +123,16 @@ fn fallback_socket_dir() -> PathBuf {
 #[cfg(unix)]
 pub fn ensure_private_dir(path: &Path) -> Result<(), PathError> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    let io_err = |source| PathError::Io { path: path.to_path_buf(), source };
+    let io_err = |source| PathError::Io {
+        path: path.to_path_buf(),
+        source,
+    };
     std::fs::create_dir_all(path).map_err(io_err)?;
     let meta = std::fs::symlink_metadata(path).map_err(io_err)?;
     if !meta.is_dir() || meta.uid() != crate::transport::current_uid() {
-        return Err(PathError::NotPrivate { path: path.to_path_buf() });
+        return Err(PathError::NotPrivate {
+            path: path.to_path_buf(),
+        });
     }
     if meta.mode() & 0o777 != 0o700 {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(io_err)?;
@@ -125,7 +142,10 @@ pub fn ensure_private_dir(path: &Path) -> Result<(), PathError> {
 
 #[cfg(not(unix))]
 pub fn ensure_private_dir(path: &Path) -> Result<(), PathError> {
-    std::fs::create_dir_all(path).map_err(|source| PathError::Io { path: path.to_path_buf(), source })
+    std::fs::create_dir_all(path).map_err(|source| PathError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 #[cfg(test)]
@@ -142,7 +162,13 @@ mod tests {
     fn long_data_dir_should_fall_back_to_tmp_socket() {
         let long = PathBuf::from(format!("/tmp/{}", "x".repeat(120)));
         let paths = EnginePaths::for_data_dir(long);
-        assert!(paths.socket_in_fallback_dir && paths.socket.to_string_lossy().starts_with("/tmp/switchyard-"));
+        assert!(
+            paths.socket_in_fallback_dir
+                && paths
+                    .socket
+                    .to_string_lossy()
+                    .starts_with("/tmp/switchyard-")
+        );
     }
 
     #[test]

@@ -10,8 +10,10 @@ use serde_json::{Map, Value};
 
 use crate::ErrorCode;
 
-/// A JSON-RPC error object.
+/// A JSON-RPC error object. Named `RpcErrorObject` in the schema so the TS
+/// `RpcError` class can keep the short name.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[schemars(rename = "RpcErrorObject")]
 pub struct RpcError {
     pub code: i32,
     pub message: String,
@@ -21,7 +23,11 @@ pub struct RpcError {
 
 impl RpcError {
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
-        Self { code: code.code(), message: message.into(), data: None }
+        Self {
+            code: code.code(),
+            message: message.into(),
+            data: None,
+        }
     }
 }
 
@@ -36,9 +42,19 @@ impl std::error::Error for RpcError {}
 /// One parsed incoming line.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Message {
-    Request { id: Value, method: String, params: Value },
-    Notification { method: String, params: Value },
-    Response { id: Value, outcome: Result<Value, RpcError> },
+    Request {
+        id: Value,
+        method: String,
+        params: Value,
+    },
+    Notification {
+        method: String,
+        params: Value,
+    },
+    Response {
+        id: Value,
+        outcome: Result<Value, RpcError>,
+    },
 }
 
 /// Why a line is not a valid JSON-RPC message.
@@ -52,17 +68,24 @@ pub enum ParseFailure {
 
 impl Message {
     pub fn parse(line: &str) -> Result<Self, ParseFailure> {
-        let value: Value = serde_json::from_str(line).map_err(|e| ParseFailure::Json(e.to_string()))?;
+        let value: Value =
+            serde_json::from_str(line).map_err(|e| ParseFailure::Json(e.to_string()))?;
         Self::from_value(value)
     }
 
     pub fn from_value(value: Value) -> Result<Self, ParseFailure> {
         let Value::Object(mut obj) = value else {
-            return Err(ParseFailure::Shape { id: Value::Null, reason: "message must be an object" });
+            return Err(ParseFailure::Shape {
+                id: Value::Null,
+                reason: "message must be an object",
+            });
         };
         let id = obj.remove("id");
         if obj.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
-            return Err(ParseFailure::Shape { id: id.unwrap_or(Value::Null), reason: "jsonrpc must be \"2.0\"" });
+            return Err(ParseFailure::Shape {
+                id: id.unwrap_or(Value::Null),
+                reason: "jsonrpc must be \"2.0\"",
+            });
         }
         match obj.remove("method") {
             Some(Value::String(method)) => {
@@ -72,14 +95,24 @@ impl Message {
                     None => Message::Notification { method, params },
                 })
             }
-            Some(_) => Err(ParseFailure::Shape { id: id.unwrap_or(Value::Null), reason: "method must be a string" }),
+            Some(_) => Err(ParseFailure::Shape {
+                id: id.unwrap_or(Value::Null),
+                reason: "method must be a string",
+            }),
             None => {
-                let id = id.ok_or(ParseFailure::Shape { id: Value::Null, reason: "response without id" })?;
+                let id = id.ok_or(ParseFailure::Shape {
+                    id: Value::Null,
+                    reason: "response without id",
+                })?;
                 let outcome = match obj.remove("error") {
-                    Some(err) => Err(serde_json::from_value(err).map_err(|_| ParseFailure::Shape {
-                        id: id.clone(),
-                        reason: "malformed error object",
-                    })?),
+                    Some(err) => {
+                        Err(
+                            serde_json::from_value(err).map_err(|_| ParseFailure::Shape {
+                                id: id.clone(),
+                                reason: "malformed error object",
+                            })?,
+                        )
+                    }
                     None => Ok(obj.remove("result").unwrap_or(Value::Null)),
                 };
                 Ok(Message::Response { id, outcome })
@@ -116,7 +149,10 @@ pub fn request_line(id: &Value, method: &str, params: &Value) -> String {
 pub fn notification_line(method: &str, params: &impl Serialize) -> String {
     let mut m = envelope();
     m.insert("method".into(), Value::from(method));
-    m.insert("params".into(), serde_json::to_value(params).unwrap_or(Value::Null));
+    m.insert(
+        "params".into(),
+        serde_json::to_value(params).unwrap_or(Value::Null),
+    );
     finish(m)
 }
 
@@ -126,7 +162,10 @@ pub fn response_line(id: &Value, outcome: &Result<Value, RpcError>) -> String {
     m.insert("id".into(), id.clone());
     match outcome {
         Ok(result) => m.insert("result".into(), result.clone()),
-        Err(err) => m.insert("error".into(), serde_json::to_value(err).unwrap_or(Value::Null)),
+        Err(err) => m.insert(
+            "error".into(),
+            serde_json::to_value(err).unwrap_or(Value::Null),
+        ),
     };
     finish(m)
 }
@@ -139,13 +178,25 @@ mod tests {
     #[test]
     fn parse_should_read_null_result_as_success() {
         let msg = Message::parse(r#"{"jsonrpc":"2.0","id":1,"result":null}"#);
-        assert_eq!(msg, Ok(Message::Response { id: json!(1), outcome: Ok(Value::Null) }));
+        assert_eq!(
+            msg,
+            Ok(Message::Response {
+                id: json!(1),
+                outcome: Ok(Value::Null)
+            })
+        );
     }
 
     #[test]
     fn parse_should_classify_missing_id_as_notification() {
         let msg = Message::parse(r#"{"jsonrpc":"2.0","method":"run.output","params":{}}"#);
-        assert_eq!(msg, Ok(Message::Notification { method: "run.output".into(), params: json!({}) }));
+        assert_eq!(
+            msg,
+            Ok(Message::Notification {
+                method: "run.output".into(),
+                params: json!({})
+            })
+        );
     }
 
     #[test]
@@ -156,8 +207,13 @@ mod tests {
 
     #[test]
     fn response_line_should_round_trip() {
-        let line = response_line(&json!("a"), &Err(RpcError::new(ErrorCode::MethodNotFound, "nope")));
+        let line = response_line(
+            &json!("a"),
+            &Err(RpcError::new(ErrorCode::MethodNotFound, "nope")),
+        );
         let parsed = Message::parse(line.trim_end());
-        assert!(matches!(parsed, Ok(Message::Response { outcome: Err(e), .. }) if e.code == -32601));
+        assert!(
+            matches!(parsed, Ok(Message::Response { outcome: Err(e), .. }) if e.code == -32601)
+        );
     }
 }

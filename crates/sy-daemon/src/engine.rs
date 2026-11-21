@@ -78,11 +78,19 @@ pub struct ClientSink {
 
 impl ClientSink {
     pub fn new(outbox: Arc<Outbox>) -> Arc<Self> {
-        Arc::new(Self { outbox, resync: Mutex::new(HashMap::new()) })
+        Arc::new(Self {
+            outbox,
+            resync: Mutex::new(HashMap::new()),
+        })
     }
 
     fn resync_line(run: &RunId) -> String {
-        notification_line(methods::RUN_RESYNC_NEEDED, &RunResyncNeeded { run_id: protocol_run_id(run) })
+        notification_line(
+            methods::RUN_RESYNC_NEEDED,
+            &RunResyncNeeded {
+                run_id: protocol_run_id(run),
+            },
+        )
     }
 
     /// Tell the client to attach again, at most once per [`RESYNC_THROTTLE`] per run.
@@ -137,7 +145,11 @@ impl RunSink for ClientSinkHandle {
             offset,
             data_b64: base64::engine::general_purpose::STANDARD.encode(data),
         };
-        if self.0.outbox.try_push(notification_line(methods::RUN_OUTPUT, &output)) {
+        if self
+            .0
+            .outbox
+            .try_push(notification_line(methods::RUN_OUTPUT, &output))
+        {
             Delivery::Accepted
         } else {
             tracing::debug!(%run, "client fell behind, dropping its live stream");

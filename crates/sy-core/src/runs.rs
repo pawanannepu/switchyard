@@ -27,6 +27,7 @@ pub const FLUSH_INTERVAL: Duration = Duration::from_millis(16);
 /// Control messages a run's producer can be sent.
 const CONTROL_QUEUE: usize = 256;
 
+/// Identifies one run (one agent process and its terminal).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RunId(pub String);
 
@@ -39,6 +40,7 @@ impl std::fmt::Display for RunId {
 /// What a sink did with a chunk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Delivery {
+    /// The sink took the chunk.
     Accepted,
     /// The sink fell behind (or went away); unsubscribe it from this run.
     Dropped,
@@ -46,6 +48,7 @@ pub enum Delivery {
 
 /// Receives live output. Must not block.
 pub trait RunSink: Send + Sync {
+    /// Hand over `data`, which starts at byte `offset` of `run`'s whole output.
     fn deliver(&self, run: &RunId, offset: u64, data: &[u8]) -> Delivery;
 }
 
@@ -55,12 +58,21 @@ pub type SubscriberId = u64;
 /// Sent to a run's producer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunControl {
+    /// Bytes to write to the run's terminal.
     Input(Vec<u8>),
-    Resize { cols: u16, rows: u16 },
+    /// A new terminal size.
+    Resize {
+        /// Width, in character cells.
+        cols: u16,
+        /// Height, in character cells.
+        rows: u16,
+    },
 }
 
+/// Why an operation on a run failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum RunError {
+    /// No run has that id.
     #[error("run not found")]
     NotFound,
     /// The producer's control queue is full.
@@ -132,10 +144,12 @@ pub struct RunWriter {
 }
 
 impl RunWriter {
+    /// The run this writer belongs to.
     pub fn id(&self) -> &RunId {
         &self.entry.id
     }
 
+    /// Append output. Never waits on a client.
     pub fn write(&self, data: &[u8]) {
         self.entry.write(data);
     }
@@ -154,6 +168,7 @@ pub struct RunHub {
 }
 
 impl RunHub {
+    /// An empty hub.
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             runs: Mutex::new(HashMap::new()),
@@ -241,10 +256,12 @@ impl RunHub {
         ids.iter().filter(|id| self.remove(id)).count()
     }
 
+    /// How many runs are live.
     pub fn len(&self) -> usize {
         lock(&self.runs).len()
     }
 
+    /// True when no run is live.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

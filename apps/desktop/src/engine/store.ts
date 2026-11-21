@@ -25,7 +25,10 @@ async function refreshInfo(): Promise<void> {
 }
 
 engine.on("host.connection", (connection) => {
-  useEngineStore.setState({ connection, info: connection.state === "connected" ? useEngineStore.getState().info : null });
+  useEngineStore.setState({
+    connection,
+    info: connection.state === "connected" ? useEngineStore.getState().info : null,
+  });
   clearInterval(poll);
   if (connection.state === "connected") {
     void refreshInfo();

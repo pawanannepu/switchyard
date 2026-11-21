@@ -18,6 +18,26 @@
     "protocol:gen": "pnpm --filter @switchyard/protocol generate",
     "protocol:check": "pnpm --filter @switchyard/protocol check",
     "boundaries:check": "node scripts/check-boundaries.mjs",
-    "release:check": "node scripts/release-check.mjs"
+    "release:check": "node scripts/release-check.mjs",
+    "typecheck": "pnpm -r typecheck",
+    "lint": "eslint --max-warnings 0 .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "pnpm -r test",
+    "test:e2e": "pnpm --filter @switchyard/desktop test:e2e",
+    "prepare": "lefthook install"
+  },
+  "devDependencies": {
+    "@eslint/js": "9.39.5",
+    "@types/node": "22.20.5",
+    "eslint": "9.39.5",
+    "eslint-config-prettier": "10.1.8",
+    "eslint-plugin-jsx-a11y": "6.10.2",
+    "eslint-plugin-react-hooks": "7.1.1",
+    "globals": "17.14.0",
+    "lefthook": "2.2.2",
+    "prettier": "3.10.1",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.73.0"
   }
 }

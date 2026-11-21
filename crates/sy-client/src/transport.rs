@@ -15,6 +15,7 @@ pub use tokio::net::{UnixListener as Listener, UnixStream as Stream};
 /// Reads newline delimited messages, closing on any line over 1 MiB.
 pub type LineReader<R> = FramedRead<R, LinesCodec>;
 
+/// Wraps `read` in a [`LineReader`].
 pub fn line_reader<R: tokio::io::AsyncRead>(read: R) -> LineReader<R> {
     FramedRead::new(read, LinesCodec::new_with_max_length(MAX_LINE_BYTES))
 }
@@ -29,7 +30,9 @@ pub fn current_uid() -> u32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("peer uid {peer} is not the engine's uid {own}")]
 pub struct PeerRejected {
+    /// The connecting process's user id.
     pub peer: u32,
+    /// The engine's user id.
     pub own: u32,
 }
 
@@ -61,6 +64,7 @@ pub fn bind(path: &Path) -> io::Result<Listener> {
     Ok(listener)
 }
 
+/// Connect to the engine socket at `path`.
 #[cfg(unix)]
 pub async fn connect(path: &Path) -> io::Result<Stream> {
     Stream::connect(path).await

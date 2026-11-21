@@ -15,13 +15,17 @@ use crate::ErrorCode;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[schemars(rename = "RpcErrorObject")]
 pub struct RpcError {
+    /// A JSON-RPC error code; app codes are listed in [`ErrorCode`].
     pub code: i32,
+    /// A short, human readable description.
     pub message: String,
+    /// Optional extra detail for the caller.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
 }
 
 impl RpcError {
+    /// An error with `code` and `message` and no extra data.
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
         Self {
             code: code.code(),
@@ -42,17 +46,27 @@ impl std::error::Error for RpcError {}
 /// One parsed incoming line.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Message {
+    /// A call that expects a response.
     Request {
+        /// Correlates the response; any JSON value the caller chose.
         id: Value,
+        /// Method name, such as `run.attach`.
         method: String,
+        /// Params, or `Value::Null` when absent.
         params: Value,
     },
+    /// A one way message with no `id`.
     Notification {
+        /// Notification name, such as `run.output`.
         method: String,
+        /// Params, or `Value::Null` when absent.
         params: Value,
     },
+    /// The answer to an earlier request.
     Response {
+        /// The `id` of the request this answers.
         id: Value,
+        /// The `result` on success, or the `error` object.
         outcome: Result<Value, RpcError>,
     },
 }
@@ -63,16 +77,23 @@ pub enum ParseFailure {
     /// Not JSON at all.
     Json(String),
     /// JSON, but not a JSON-RPC 2.0 message. Carries the id when one was readable.
-    Shape { id: Value, reason: &'static str },
+    Shape {
+        /// The message's `id`, or `Value::Null` when none was readable.
+        id: Value,
+        /// What was wrong with it.
+        reason: &'static str,
+    },
 }
 
 impl Message {
+    /// Parses one line (without its newline).
     pub fn parse(line: &str) -> Result<Self, ParseFailure> {
         let value: Value =
             serde_json::from_str(line).map_err(|e| ParseFailure::Json(e.to_string()))?;
         Self::from_value(value)
     }
 
+    /// Classifies an already parsed JSON value.
     pub fn from_value(value: Value) -> Result<Self, ParseFailure> {
         let Value::Object(mut obj) = value else {
             return Err(ParseFailure::Shape {

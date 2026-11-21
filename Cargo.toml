@@ -49,10 +49,13 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
+# Doc comments on every `pub` item (AGENTS.md). CI turns warnings into errors.
+missing_docs = "warn"
 
 [workspace.lints.clippy]
-unwrap_used = "warn"
-expect_used = "warn"
+# Denied outside tests; clippy.toml allows them in tests.
+unwrap_used = "deny"
+expect_used = "deny"
 
 # From the Tauri template: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]

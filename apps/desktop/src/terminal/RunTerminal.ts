@@ -50,13 +50,17 @@ export class RunTerminal {
     this.term.open(host);
     try {
       const webgl = new WebglAddon();
-      webgl.onContextLoss(() => webgl.dispose());
+      webgl.onContextLoss(() => {
+        webgl.dispose();
+      });
       this.term.loadAddon(webgl);
     } catch {
       // The DOM renderer is the fallback.
     }
     this.fit.fit();
-    this.term.onData((data) => this.sendInput(data));
+    this.term.onData((data) => {
+      this.sendInput(data);
+    });
     this.term.onResize(({ cols, rows }) => {
       void this.client.call("run.resize", { run_id: this.runId, cols, rows }).catch(() => {});
     });
@@ -134,7 +138,7 @@ export class RunTerminal {
 
   /** Send a unique marker as input; with an echo run, `onProbe` reports when it is drawn. */
   probe(sequence: number): void {
-    const token = `[[p${sequence}]]`;
+    const token = `[[p${String(sequence)}]]`;
     this.probes.set(token, performance.now());
     this.sendInput(`${token}\r\n`);
   }

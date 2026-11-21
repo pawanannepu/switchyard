@@ -16,11 +16,15 @@ use std::sync::Arc;
 use sy_client::EnginePaths;
 use tauri::{Manager, RunEvent, WindowEvent};
 
+/// The label of the app's one window.
 pub const MAIN_WINDOW: &str = "main";
 
+/// Why the app could not start.
 #[derive(Debug)]
 pub enum RunError {
+    /// The engine paths could not be resolved or created.
     Paths(sy_client::paths::PathError),
+    /// Tauri failed to build or run the app.
     Tauri(tauri::Error),
 }
 
@@ -44,6 +48,7 @@ pub fn show_main_window(app: &tauri::AppHandle) {
     }
 }
 
+/// Start the app and block until it quits.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() -> Result<(), RunError> {
     let paths = EnginePaths::resolve().map_err(RunError::Paths)?;

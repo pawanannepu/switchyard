@@ -44,11 +44,15 @@ const methodsTs = [
   banner,
   'import type * as T from "./types.ts";',
   "",
+  "/** The protocol version this build speaks. Majors must match; minors only add things. */",
   `export const PROTOCOL = ${JSON.stringify(schema["x-protocol"])} as const;`,
   "",
+  "/** Size limits the engine enforces, in bytes. */",
   `export const LIMITS = ${JSON.stringify(schema["x-limits"], null, 2)} as const;`,
   "",
+  "/** Every JSON-RPC error code the protocol uses, by name. */",
   `export const ErrorCode = ${JSON.stringify(schema["x-error-codes"], null, 2)} as const;`,
+  "/** The name of an error code, such as `RunNotFound`. */",
   "export type ErrorCodeName = keyof typeof ErrorCode;",
   "",
   "/** Every request: its params and result types. */",
@@ -62,10 +66,16 @@ const methodsTs = [
   "}",
   "",
   "/** Work before `session.hello` and after an incompatible one. */",
-  `export const STABLE_METHODS = [${requests.filter((m) => m.stable).map((m) => q(m.name)).join(", ")}] as const;`,
+  `export const STABLE_METHODS = [${requests
+    .filter((m) => m.stable)
+    .map((m) => q(m.name))
+    .join(", ")}] as const;`,
   "",
   "/** Answered only by engines built with the `devtools` feature. */",
-  `export const DEV_METHODS = [${requests.filter((m) => m.dev_only).map((m) => q(m.name)).join(", ")}] as const;`,
+  `export const DEV_METHODS = [${requests
+    .filter((m) => m.dev_only)
+    .map((m) => q(m.name))
+    .join(", ")}] as const;`,
   "",
 ].join("\n");
 

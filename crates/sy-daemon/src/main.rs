@@ -21,6 +21,7 @@ use anyhow::Context;
 use sy_client::EnginePaths;
 use sy_core::adapters::AdapterRegistry;
 
+/// This engine's version, reported in `session.hello` and `engine.info`.
 pub const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() -> ExitCode {

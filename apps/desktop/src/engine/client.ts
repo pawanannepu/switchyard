@@ -13,7 +13,9 @@ function pickTransport(): Transport {
   const port = query.get("bridge");
   const token = query.get("token");
   if (!port || !token) {
-    throw new Error("Not running inside switchyard. Open this page with ?bridge=<port>&token=<token> from sy-devbridge.");
+    throw new Error(
+      "Not running inside switchyard. Open this page with ?bridge=<port>&token=<token> from sy-devbridge.",
+    );
   }
   return webSocketTransport(`ws://127.0.0.1:${port}/?token=${encodeURIComponent(token)}`);
 }

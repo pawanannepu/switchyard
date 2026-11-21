@@ -2,8 +2,10 @@
 
 import type * as T from "./types.ts";
 
+/** The protocol version this build speaks. Majors must match; minors only add things. */
 export const PROTOCOL = {"major":1,"minor":0} as const;
 
+/** Size limits the engine enforces, in bytes. */
 export const LIMITS = {
   "client_queue_bytes": 8388608,
   "max_input_bytes": 65536,
@@ -11,6 +13,7 @@ export const LIMITS = {
   "max_replay_bytes": 2097152
 } as const;
 
+/** Every JSON-RPC error code the protocol uses, by name. */
 export const ErrorCode = {
   "EngineDraining": -32010,
   "EngineShuttingDown": -32011,
@@ -27,6 +30,7 @@ export const ErrorCode = {
   "RequestAbandoned": -32091,
   "RunNotFound": -32040
 } as const;
+/** The name of an error code, such as `RunNotFound`. */
 export type ErrorCodeName = keyof typeof ErrorCode;
 
 /** Every request: its params and result types. */

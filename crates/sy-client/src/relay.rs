@@ -37,6 +37,7 @@ pub struct FrontendSlot {
 }
 
 impl FrontendSlot {
+    /// An empty slot, with no page attached yet.
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
     }
@@ -64,6 +65,7 @@ impl FrontendSlot {
         self.lock().generation
     }
 
+    /// The generation of the page attached now.
     pub fn generation(&self) -> u64 {
         self.lock().generation
     }
@@ -166,10 +168,12 @@ impl Relay {
         Self { conn, hello, slot }
     }
 
+    /// The engine connection this relay forwards to.
     pub fn connection(&self) -> &Connection {
         &self.conn
     }
 
+    /// The engine's `session.hello` reply for this connection.
     pub fn hello(&self) -> &HelloResult {
         &self.hello
     }

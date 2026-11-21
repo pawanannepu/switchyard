@@ -24,22 +24,32 @@ use crate::transport;
 /// asks us to resync, instead of this process buffering without limit.
 const NOTIFICATION_QUEUE: usize = 1024;
 
+/// Why a call to the engine failed.
 #[derive(Debug, thiserror::Error)]
 pub enum CallError {
+    /// The engine answered with a JSON-RPC error.
     #[error("engine error: {0}")]
     Rpc(RpcError),
+    /// The connection closed before the answer arrived.
     #[error("engine connection closed")]
     Closed,
+    /// The answer did not match the expected result type.
     #[error("unexpected response shape: {0}")]
     Decode(#[from] serde_json::Error),
 }
 
+/// Why `session.hello` failed.
 #[derive(Debug, thiserror::Error)]
 pub enum HelloError {
+    /// The call itself failed.
     #[error(transparent)]
     Call(#[from] CallError),
+    /// The engine answered, but speaks a different protocol major.
     #[error("engine speaks protocol {}.{}, this client speaks {}.{}", .engine.protocol.major, .engine.protocol.minor, PROTOCOL.major, PROTOCOL.minor)]
-    Incompatible { engine: HelloResult },
+    Incompatible {
+        /// The engine's `session.hello` reply.
+        engine: HelloResult,
+    },
 }
 
 type Pending = Mutex<HashMap<u64, oneshot::Sender<Result<Value, RpcError>>>>;
@@ -178,6 +188,7 @@ impl Connection {
             .map_err(|_| CallError::Closed)
     }
 
+    /// True once the engine side of the connection is gone.
     pub fn is_closed(&self) -> bool {
         *self.inner.closed.borrow()
     }

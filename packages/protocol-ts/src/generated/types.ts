@@ -36,7 +36,13 @@ export interface Empty {}
  * via the `definition` "EngineInfo".
  */
 export interface EngineInfo {
+  /**
+   * The engine's build version.
+   */
   engine_version: string;
+  /**
+   * The engine's process id.
+   */
   pid: number;
   protocol: ProtocolVersion;
   /**
@@ -45,13 +51,16 @@ export interface EngineInfo {
   running_agents: number;
 }
 /**
- * Protocol version. Compatible when the majors match.
- *
- * This interface was referenced by `ProtocolCatalog`'s JSON-Schema
- * via the `definition` "ProtocolVersion".
+ * The protocol version the engine speaks.
  */
 export interface ProtocolVersion {
+  /**
+   * Breaking changes bump this.
+   */
   major: number;
+  /**
+   * Additions only.
+   */
   minor: number;
 }
 /**
@@ -61,9 +70,28 @@ export interface ProtocolVersion {
  * via the `definition` "HelloParams".
  */
 export interface HelloParams {
-  client: ClientKind;
+  /**
+   * Which kind of client this is.
+   */
+  client: "desktop" | "cli" | "test";
+  /**
+   * The client's own version, for logs.
+   */
   client_version: string;
-  protocol: ProtocolVersion;
+  protocol: ProtocolVersion1;
+}
+/**
+ * The protocol version the client speaks.
+ */
+export interface ProtocolVersion1 {
+  /**
+   * Breaking changes bump this.
+   */
+  major: number;
+  /**
+   * Additions only.
+   */
+  minor: number;
 }
 /**
  * `session.hello` result.
@@ -72,9 +100,28 @@ export interface HelloParams {
  * via the `definition` "HelloResult".
  */
 export interface HelloResult {
+  /**
+   * The engine's build version.
+   */
   engine_version: string;
+  /**
+   * The engine's process id.
+   */
   pid: number;
-  protocol: ProtocolVersion;
+  protocol: ProtocolVersion2;
+}
+/**
+ * The protocol version the engine speaks.
+ */
+export interface ProtocolVersion2 {
+  /**
+   * Breaking changes bump this.
+   */
+  major: number;
+  /**
+   * Additions only.
+   */
+  minor: number;
 }
 /**
  * `host.connection` notification, sent by the app host (or dev bridge) to the UI
@@ -96,7 +143,26 @@ export interface HostConnection {
    * A human readable reason, for the failed and stopped states.
    */
   message?: string | null;
-  state: HostConnectionState;
+  /**
+   * Where the connection stands.
+   */
+  state: "connecting" | "connected" | "stopped" | "failed" | "incompatible";
+}
+/**
+ * Protocol version. Compatible when the majors match.
+ *
+ * This interface was referenced by `ProtocolCatalog`'s JSON-Schema
+ * via the `definition` "ProtocolVersion".
+ */
+export interface ProtocolVersion3 {
+  /**
+   * Breaking changes bump this.
+   */
+  major: number;
+  /**
+   * Additions only.
+   */
+  minor: number;
 }
 /**
  * A JSON-RPC error object. Named `RpcErrorObject` in the schema so the TS
@@ -106,8 +172,19 @@ export interface HostConnection {
  * via the `definition` "RpcErrorObject".
  */
 export interface RpcErrorObject {
+  /**
+   * A JSON-RPC error code; app codes are listed in [`ErrorCode`].
+   */
   code: number;
-  data?: unknown;
+  /**
+   * Optional extra detail for the caller.
+   */
+  data?: {
+    [k: string]: unknown | undefined;
+  };
+  /**
+   * A short, human readable description.
+   */
   message: string;
 }
 /**
@@ -117,7 +194,10 @@ export interface RpcErrorObject {
  * via the `definition` "RunAttachParams".
  */
 export interface RunAttachParams {
-  run_id: RunId;
+  /**
+   * The run to attach to.
+   */
+  run_id: string;
 }
 /**
  * `run.attach` result: the replay of the run's ring buffer.
@@ -142,8 +222,14 @@ export interface RunAttachResult {
  * via the `definition` "RunInputParams".
  */
 export interface RunInputParams {
+  /**
+   * The bytes to write to its terminal, base64.
+   */
   data_b64: string;
-  run_id: RunId;
+  /**
+   * The run to type into.
+   */
+  run_id: string;
 }
 /**
  * `run.output` notification: one batch of live terminal bytes.
@@ -152,12 +238,18 @@ export interface RunInputParams {
  * via the `definition` "RunOutput".
  */
 export interface RunOutput {
+  /**
+   * The bytes, base64.
+   */
   data_b64: string;
   /**
    * Byte position of this chunk's first byte in the run's whole output.
    */
   offset: number;
-  run_id: RunId;
+  /**
+   * The run that produced it.
+   */
+  run_id: string;
 }
 /**
  * `run.resize` params.
@@ -166,9 +258,18 @@ export interface RunOutput {
  * via the `definition` "RunResizeParams".
  */
 export interface RunResizeParams {
+  /**
+   * New width, in character cells.
+   */
   cols: number;
+  /**
+   * New height, in character cells.
+   */
   rows: number;
-  run_id: RunId;
+  /**
+   * The run to resize.
+   */
+  run_id: string;
 }
 /**
  * `run.resync_needed` notification: this client fell behind; attach again.
@@ -177,7 +278,10 @@ export interface RunResizeParams {
  * via the `definition` "RunResyncNeeded".
  */
 export interface RunResyncNeeded {
-  run_id: RunId;
+  /**
+   * The run whose output was dropped for this client.
+   */
+  run_id: string;
 }
 /**
  * `dev.stop_runs` result.
@@ -186,6 +290,9 @@ export interface RunResyncNeeded {
  * via the `definition` "StopRunsResult".
  */
 export interface StopRunsResult {
+  /**
+   * How many runs were stopped.
+   */
   stopped: number;
 }
 /**
@@ -195,7 +302,13 @@ export interface StopRunsResult {
  * via the `definition` "SyntheticRunParams".
  */
 export interface SyntheticRunParams {
+  /**
+   * Output rate per run.
+   */
   bytes_per_sec: number;
+  /**
+   * How many runs to start.
+   */
   count: number;
   /**
    * Write every `run.input` straight back as output.
@@ -209,5 +322,8 @@ export interface SyntheticRunParams {
  * via the `definition` "SyntheticRunResult".
  */
 export interface SyntheticRunResult {
+  /**
+   * The new runs, ready for `run.attach`.
+   */
   run_ids: RunId[];
 }

@@ -6,6 +6,12 @@ node_modules/
 dist/
 *.local
 *.log
+*.tsbuildinfo
+
+# Test output
+playwright-report/
+test-results/
+coverage/
 
 # Tauri
 apps/desktop/src-tauri/gen/schemas

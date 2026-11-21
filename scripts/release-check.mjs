@@ -15,7 +15,8 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const args = process.argv.slice(2);
 const requireTeamId = args.includes("--require-team-id");
 const app =
-  args.find((a) => !a.startsWith("--")) ?? join(root, "target/universal-apple-darwin/release/bundle/macos/switchyard.app");
+  args.find((a) => !a.startsWith("--")) ??
+  join(root, "target/universal-apple-darwin/release/bundle/macos/switchyard.app");
 
 let failed = 0;
 const pass = (msg) => console.log(`  ok    ${msg}`);
@@ -24,6 +25,7 @@ const fail = (msg) => {
   console.log(`  FAIL  ${msg}`);
 };
 const warn = (msg) => console.log(`  warn  ${msg}`);
+const check = (ok, passMsg, failMsg) => (ok ? pass(passMsg) : fail(failMsg));
 // stdout and stderr together: codesign reports on stderr.
 const sh = (cmd, cmdArgs) => {
   const result = spawnSync(cmd, cmdArgs, { encoding: "utf8" });
@@ -38,12 +40,16 @@ if (!existsSync(app)) {
 
 const plist = join(app, "Contents/Info.plist");
 const plistValue = (key) => sh("plutil", ["-extract", key, "raw", "-o", "-", plist]).trim();
-plistValue("CFBundleIdentifier") === "dev.switchyard.app"
-  ? pass("bundle id is dev.switchyard.app")
-  : fail(`bundle id is ${plistValue("CFBundleIdentifier")}`);
-plistValue("LSMinimumSystemVersion") === "13.0"
-  ? pass("minimum macOS is 13.0")
-  : fail(`minimum macOS is ${plistValue("LSMinimumSystemVersion")}`);
+check(
+  plistValue("CFBundleIdentifier") === "dev.switchyard.app",
+  "bundle id is dev.switchyard.app",
+  `bundle id is ${plistValue("CFBundleIdentifier")}`,
+);
+check(
+  plistValue("LSMinimumSystemVersion") === "13.0",
+  "minimum macOS is 13.0",
+  `minimum macOS is ${plistValue("LSMinimumSystemVersion")}`,
+);
 
 const mainExe = join(app, "Contents/MacOS", plistValue("CFBundleExecutable"));
 const engine = join(app, "Contents/MacOS/switchyardd");
@@ -56,9 +62,11 @@ for (const [label, bin] of [
     continue;
   }
   const archs = sh("lipo", ["-archs", bin]).trim().split(/\s+/);
-  archs.includes("arm64") && archs.includes("x86_64")
-    ? pass(`${label} is universal (${archs.join(", ")})`)
-    : fail(`${label} archs: ${archs.join(", ")}`);
+  check(
+    archs.includes("arm64") && archs.includes("x86_64"),
+    `${label} is universal (${archs.join(", ")})`,
+    `${label} archs: ${archs.join(", ")}`,
+  );
 }
 
 const signing = (bin) => {
@@ -71,12 +79,15 @@ const signing = (bin) => {
 };
 const appSig = signing(app);
 const engineSig = signing(engine);
-appSig.signed && engineSig.signed ? pass("app and engine are signed") : fail("app or engine is not signed");
-engineSig.runtime ? pass("engine has the hardened runtime") : fail("engine lacks the hardened runtime");
-appSig.runtime ? pass("app has the hardened runtime") : fail("app lacks the hardened runtime");
+check(appSig.signed && engineSig.signed, "app and engine are signed", "app or engine is not signed");
+check(engineSig.runtime, "engine has the hardened runtime", "engine lacks the hardened runtime");
+check(appSig.runtime, "app has the hardened runtime", "app lacks the hardened runtime");
 if (appSig.team !== "not set" && appSig.team === engineSig.team) pass(`app and engine share Team ID ${appSig.team}`);
 else if (requireTeamId) fail(`Team IDs: app ${appSig.team}, engine ${engineSig.team}`);
-else warn(`no Team ID (app ${appSig.team}, engine ${engineSig.team}): ad hoc signed; a Developer ID identity is feature 24's`);
+else
+  warn(
+    `no Team ID (app ${appSig.team}, engine ${engineSig.team}): ad hoc signed; a Developer ID identity is feature 24's`,
+  );
 
 const found = [];
 const walk = (dir) => {
@@ -87,7 +98,7 @@ const walk = (dir) => {
   }
 };
 walk(app);
-found.length === 0 ? pass("no sy-devbridge in the bundle") : fail(`dev bridge in bundle: ${found.join(", ")}`);
+check(found.length === 0, "no sy-devbridge in the bundle", `dev bridge in bundle: ${found.join(", ")}`);
 
 // The bundled engine must not answer any dev.* method.
 const dataDir = mkdtempSync("/tmp/sy-rc-");
@@ -128,7 +139,11 @@ const probe = () =>
 try {
   const replies = await probe();
   const notFound = [2, 3].every((id) => replies.get(id)?.error?.code === -32601);
-  notFound ? pass("bundled engine answers no dev.* method") : fail(`dev.* answered: ${JSON.stringify([replies.get(2), replies.get(3)])}`);
+  check(
+    notFound,
+    "bundled engine answers no dev.* method",
+    `dev.* answered: ${JSON.stringify([replies.get(2), replies.get(3)])}`,
+  );
 } catch (err) {
   fail(`could not probe the bundled engine: ${err.message}`);
 } finally {

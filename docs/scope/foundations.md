@@ -12,8 +12,8 @@ spec [0001](../specs/0001-stack-architecture/index.md) · code in `crates/`, `ap
 ### 2. Coding standards & tooling
 Capture conventions from the real scaffolded project, then install lint, format, type checks, pre commit hooks and CI, so every later feature follows them.
 **Done when:** root `AGENTS.md` reflects the real stack, and lint, format, type checks and CI run clean on the scaffold. (basis: cross cutting tooling comes before the code that must follow it)
-- [ ] Capture conventions + tooling choices: `/audit`
-- [ ] Install the tooling: `/develop tooling`
+- [x] Capture conventions + tooling choices: `/audit`
+- [x] Install the tooling: `/develop tooling`
 
 ### 3. Data model · needs a decision
 The local records everything builds on: projects, workspaces, tasks, runs, agents, output and events, approvals, comparisons, usage.

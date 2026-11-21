@@ -1,0 +1,4 @@
+# rustfmt defaults, pinned to edition 2024 so a bare `rustfmt <file>` (the
+# lefthook pre-commit hook) formats exactly like `cargo fmt`.
+edition = "2024"
+style_edition = "2024"

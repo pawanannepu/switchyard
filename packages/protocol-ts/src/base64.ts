@@ -8,6 +8,7 @@ interface NativeToBase64 {
   toBase64?: () => string;
 }
 
+/** Decodes standard, padded base64 (as sent in `data_b64` fields) to bytes. */
 export function decodeBase64(text: string): Uint8Array {
   const native = (Uint8Array as unknown as NativeBase64).fromBase64;
   if (native) return native(text);
@@ -17,6 +18,7 @@ export function decodeBase64(text: string): Uint8Array {
   return bytes;
 }
 
+/** Encodes bytes as standard, padded base64 (for `run.input`). */
 export function encodeBase64(bytes: Uint8Array): string {
   const native = (bytes as unknown as NativeToBase64).toBase64;
   if (native) return native.call(bytes);

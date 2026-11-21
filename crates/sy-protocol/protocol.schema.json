@@ -2,12 +2,23 @@
   "$defs": {
     "ClientKind": {
       "description": "Which kind of client is connecting.",
-      "enum": [
-        "desktop",
-        "cli",
-        "test"
-      ],
-      "type": "string"
+      "oneOf": [
+        {
+          "const": "desktop",
+          "description": "The desktop app host (or the dev bridge acting for the UI).",
+          "type": "string"
+        },
+        {
+          "const": "cli",
+          "description": "A command line client.",
+          "type": "string"
+        },
+        {
+          "const": "test",
+          "description": "An automated test.",
+          "type": "string"
+        }
+      ]
     },
     "Empty": {
       "additionalProperties": false,
@@ -18,15 +29,18 @@
       "description": "`engine.info` result.",
       "properties": {
         "engine_version": {
+          "description": "The engine's build version.",
           "type": "string"
         },
         "pid": {
+          "description": "The engine's process id.",
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
         },
         "protocol": {
-          "$ref": "#/$defs/ProtocolVersion"
+          "$ref": "#/$defs/ProtocolVersion",
+          "description": "The protocol version the engine speaks."
         },
         "running_agents": {
           "description": "Agents (runs) currently running in this engine.",
@@ -47,13 +61,16 @@
       "description": "`session.hello` params. Always the first call on a connection.",
       "properties": {
         "client": {
-          "$ref": "#/$defs/ClientKind"
+          "$ref": "#/$defs/ClientKind",
+          "description": "Which kind of client this is."
         },
         "client_version": {
+          "description": "The client's own version, for logs.",
           "type": "string"
         },
         "protocol": {
-          "$ref": "#/$defs/ProtocolVersion"
+          "$ref": "#/$defs/ProtocolVersion",
+          "description": "The protocol version the client speaks."
         }
       },
       "required": [
@@ -67,15 +84,18 @@
       "description": "`session.hello` result.",
       "properties": {
         "engine_version": {
+          "description": "The engine's build version.",
           "type": "string"
         },
         "pid": {
+          "description": "The engine's process id.",
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
         },
         "protocol": {
-          "$ref": "#/$defs/ProtocolVersion"
+          "$ref": "#/$defs/ProtocolVersion",
+          "description": "The protocol version the engine speaks."
         }
       },
       "required": [
@@ -114,7 +134,8 @@
           ]
         },
         "state": {
-          "$ref": "#/$defs/HostConnectionState"
+          "$ref": "#/$defs/HostConnectionState",
+          "description": "Where the connection stands."
         }
       },
       "required": [
@@ -156,11 +177,13 @@
       "description": "Protocol version. Compatible when the majors match.",
       "properties": {
         "major": {
+          "description": "Breaking changes bump this.",
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
         },
         "minor": {
+          "description": "Additions only.",
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
@@ -176,11 +199,15 @@
       "description": "A JSON-RPC error object. Named `RpcErrorObject` in the schema so the TS\n`RpcError` class can keep the short name.",
       "properties": {
         "code": {
+          "description": "A JSON-RPC error code; app codes are listed in [`ErrorCode`].",
           "format": "int32",
           "type": "integer"
         },
-        "data": true,
+        "data": {
+          "description": "Optional extra detail for the caller."
+        },
         "message": {
+          "description": "A short, human readable description.",
           "type": "string"
         }
       },
@@ -194,7 +221,8 @@
       "description": "`run.attach` params.",
       "properties": {
         "run_id": {
-          "$ref": "#/$defs/RunId"
+          "$ref": "#/$defs/RunId",
+          "description": "The run to attach to."
         }
       },
       "required": [
@@ -230,10 +258,12 @@
       "description": "`run.input` params. The decoded payload is capped at 64 KiB.",
       "properties": {
         "data_b64": {
+          "description": "The bytes to write to its terminal, base64.",
           "type": "string"
         },
         "run_id": {
-          "$ref": "#/$defs/RunId"
+          "$ref": "#/$defs/RunId",
+          "description": "The run to type into."
         }
       },
       "required": [
@@ -246,6 +276,7 @@
       "description": "`run.output` notification: one batch of live terminal bytes.",
       "properties": {
         "data_b64": {
+          "description": "The bytes, base64.",
           "type": "string"
         },
         "offset": {
@@ -255,7 +286,8 @@
           "type": "integer"
         },
         "run_id": {
-          "$ref": "#/$defs/RunId"
+          "$ref": "#/$defs/RunId",
+          "description": "The run that produced it."
         }
       },
       "required": [
@@ -269,19 +301,22 @@
       "description": "`run.resize` params.",
       "properties": {
         "cols": {
+          "description": "New width, in character cells.",
           "format": "uint16",
           "maximum": 65535,
           "minimum": 0,
           "type": "integer"
         },
         "rows": {
+          "description": "New height, in character cells.",
           "format": "uint16",
           "maximum": 65535,
           "minimum": 0,
           "type": "integer"
         },
         "run_id": {
-          "$ref": "#/$defs/RunId"
+          "$ref": "#/$defs/RunId",
+          "description": "The run to resize."
         }
       },
       "required": [
@@ -295,7 +330,8 @@
       "description": "`run.resync_needed` notification: this client fell behind; attach again.",
       "properties": {
         "run_id": {
-          "$ref": "#/$defs/RunId"
+          "$ref": "#/$defs/RunId",
+          "description": "The run whose output was dropped for this client."
         }
       },
       "required": [
@@ -307,6 +343,7 @@
       "description": "`dev.stop_runs` result.",
       "properties": {
         "stopped": {
+          "description": "How many runs were stopped.",
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
@@ -321,11 +358,13 @@
       "description": "`dev.synthetic_run` params: fake runs that stream output.",
       "properties": {
         "bytes_per_sec": {
+          "description": "Output rate per run.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "count": {
+          "description": "How many runs to start.",
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
@@ -346,6 +385,7 @@
       "description": "`dev.synthetic_run` result.",
       "properties": {
         "run_ids": {
+          "description": "The new runs, ready for `run.attach`.",
           "items": {
             "$ref": "#/$defs/RunId"
           },

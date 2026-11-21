@@ -11,8 +11,11 @@ export interface Transport {
   onMessage(handler: (message: unknown) => void): () => void;
 }
 
+/** A JSON-RPC error answer from the engine (or the host relaying to it). */
 export class RpcError extends Error {
+  /** The error code; compare it against the `ErrorCode` table. */
   readonly code: number;
+  /** Optional extra detail the engine attached. */
   readonly data: unknown;
 
   constructor(code: number, message: string, data?: unknown) {
@@ -23,13 +26,20 @@ export class RpcError extends Error {
   }
 }
 
+/** The name of any request method, such as `run.attach`. */
 export type RequestMethod = keyof Requests;
+/** The name of any notification, such as `run.output`. */
 export type NotificationName = keyof Notifications;
+/** The params type of request `M`. */
 export type ParamsOf<M extends RequestMethod> = Requests[M]["params"];
+/** The result type of request `M`. */
 export type ResultOf<M extends RequestMethod> = Requests[M]["result"];
 
+/** A typed JSON-RPC client for the engine protocol. */
 export interface EngineClient {
+  /** Call `method` and resolve with its result, or reject with an {@link RpcError}. */
   call<M extends RequestMethod>(method: M, params: ParamsOf<M>): Promise<ResultOf<M>>;
+  /** Listen for notification `name`. Returns an unsubscribe function. */
   on<N extends NotificationName>(name: N, handler: (params: Notifications[N]) => void): () => void;
   /** Stop listening and reject everything in flight. */
   close(): void;
@@ -44,6 +54,7 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
+/** Creates a client that speaks the engine protocol over `transport`. */
 export function createEngineClient(transport: Transport): EngineClient {
   let nextId = 1;
   const pending = new Map<number, Pending>();
@@ -84,8 +95,8 @@ export function createEngineClient(transport: Transport): EngineClient {
         set = new Set();
         listeners.set(name, set);
       }
-      set.add(handler as (params: never) => void);
-      return () => set.delete(handler as (params: never) => void);
+      set.add(handler);
+      return () => set.delete(handler);
     },
     close() {
       unsubscribe();

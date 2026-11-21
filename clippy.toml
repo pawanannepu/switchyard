@@ -1,3 +1,4 @@
-# Tests may unwrap; production code may not (see [workspace.lints] in Cargo.toml).
+# The workspace denies `unwrap` and `expect` (Cargo.toml `[workspace.lints]`).
+# Tests may still use them: a panic there is a clear test failure.
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true

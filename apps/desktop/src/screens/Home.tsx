@@ -7,6 +7,9 @@ const s = strings.connection;
 
 function stateLabel(connection: HostConnection | null): string {
   switch (connection?.state) {
+    case undefined:
+    case "connecting":
+      return s.connecting;
     case "connected":
       return s.connected;
     case "stopped":
@@ -15,8 +18,6 @@ function stateLabel(connection: HostConnection | null): string {
       return s.failed;
     case "incompatible":
       return s.incompatible;
-    default:
-      return s.connecting;
   }
 }
 
@@ -56,13 +57,13 @@ export function Home() {
       {canAct &&
         (canRestartEngine ? (
           <button type="button" onClick={() => void restartEngine()}>
-            {connection?.state === "failed" ? s.retry : s.restart}
+            {connection.state === "failed" ? s.retry : s.restart}
           </button>
         ) : (
           <p className="message">{s.restartUnavailable}</p>
         ))}
 
-      {canAct && connection?.logs_dir && (
+      {canAct && connection.logs_dir && (
         <p className="message">
           {s.logs}: <code>{connection.logs_dir}</code> (<code>engine.log</code>, <code>engine.stderr.log</code>)
         </p>

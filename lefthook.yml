@@ -1,0 +1,22 @@
+# Pre-commit: format and lint the staged files only (AGENTS.md "Tooling").
+# Typecheck, clippy and tests run in CI. Installed by `pnpm install` (the
+# `prepare` script). Skip once with `LEFTHOOK=0 git commit ...`.
+
+pre-commit:
+  # In order, so Prettier and ESLint never rewrite the same file at once.
+  piped: true
+  jobs:
+    - name: rustfmt
+      glob: "*.rs"
+      run: rustfmt {staged_files}
+      stage_fixed: true
+
+    - name: prettier
+      glob: "*.{ts,tsx,js,mjs,cjs,json,css,html,yml,yaml}"
+      run: pnpm exec prettier --write --ignore-unknown {staged_files}
+      stage_fixed: true
+
+    - name: eslint
+      glob: "*.{ts,tsx,js,mjs,cjs}"
+      run: pnpm exec eslint --fix --no-warn-ignored --max-warnings 0 {staged_files}
+      stage_fixed: true

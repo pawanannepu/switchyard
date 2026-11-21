@@ -20,16 +20,20 @@ macro_rules! error_codes {
         }
 
         impl ErrorCode {
+            /// Every code, in declaration order.
             pub const ALL: &'static [ErrorCode] = &[$(ErrorCode::$name,)*];
 
+            /// The numeric JSON-RPC error code.
             pub const fn code(self) -> i32 {
                 match self { $(ErrorCode::$name => $code,)* }
             }
 
+            /// The variant name, as used in the generated TS `ErrorCode` object.
             pub const fn name(self) -> &'static str {
                 match self { $(ErrorCode::$name => stringify!($name),)* }
             }
 
+            /// The code for a number, or `None` if the protocol doesn't define it.
             pub fn from_code(code: i32) -> Option<Self> {
                 match code { $($code => Some(ErrorCode::$name),)* _ => None }
             }
@@ -39,10 +43,15 @@ macro_rules! error_codes {
 
 error_codes! {
     // Standard JSON-RPC
+    /// The line was not valid JSON.
     ParseError = -32700,
+    /// The JSON was not a valid JSON-RPC 2.0 message.
     InvalidRequest = -32600,
+    /// No such method (or a `dev.*` method on an engine built without devtools).
     MethodNotFound = -32601,
+    /// The params did not match the method's schema.
     InvalidParams = -32602,
+    /// The engine hit an unexpected error handling the request.
     InternalError = -32603,
 
     // session
@@ -58,6 +67,7 @@ error_codes! {
     EngineShuttingDown = -32011,
 
     // run
+    /// No run has that id.
     RunNotFound = -32040,
     /// `run.input` payload is over 64 KiB after decoding.
     InputTooLarge = -32041,

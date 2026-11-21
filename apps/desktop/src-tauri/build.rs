@@ -1,3 +1,5 @@
+//! Tauri build script: generates the app context and the command ACL.
+
 fn main() {
     // Declaring the app's commands turns on ACL checks for them, so the webview
     // can call only what capabilities/default.json grants: the three relay commands.

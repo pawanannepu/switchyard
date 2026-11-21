@@ -113,7 +113,11 @@ export function LoadCheck() {
     latencies.current = [];
     setStats(null);
     try {
-      const { run_ids } = await engine.call("dev.synthetic_run", { count: RUNS, bytes_per_sec: BYTES_PER_SEC, echo: true });
+      const { run_ids } = await engine.call("dev.synthetic_run", {
+        count: RUNS,
+        bytes_per_sec: BYTES_PER_SEC,
+        echo: true,
+      });
       setRunIds(run_ids);
     } catch (err) {
       const missing = err instanceof RpcError && err.code === ErrorCode.MethodNotFound;
@@ -165,7 +169,9 @@ export function LoadCheck() {
             <dd>{stats.kibPerSec.toFixed(0)} KiB/s</dd>
           </dl>
           {stats.samples > 0 && (
-            <p className={stats.p95 < BUDGET_MS ? "verdict pass" : "verdict fail"}>{stats.p95 < BUDGET_MS ? s.pass : s.fail}</p>
+            <p className={stats.p95 < BUDGET_MS ? "verdict pass" : "verdict fail"}>
+              {stats.p95 < BUDGET_MS ? s.pass : s.fail}
+            </p>
           )}
         </div>
       )}

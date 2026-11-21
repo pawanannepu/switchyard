@@ -12,7 +12,11 @@ import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const meta = JSON.parse(
-  execFileSync("cargo", ["metadata", "--format-version", "1", "--locked"], { cwd: root, encoding: "utf8", maxBuffer: 256 << 20 }),
+  execFileSync("cargo", ["metadata", "--format-version", "1", "--locked"], {
+    cwd: root,
+    encoding: "utf8",
+    maxBuffer: 256 << 20,
+  }),
 );
 
 const isAdapter = (name) => name.startsWith("sy-adapter-") && name !== "sy-adapter-api";
@@ -23,7 +27,10 @@ const rules = {
   "sy-protocol": { allow: ["serde", "schemars", "serde_json"] },
   "sy-client": { forbid: ["sy-core", "sy-infra", "sy-daemon", TAURI, isAdapter] },
   "sy-adapter-api": { allow: ["serde", "tokio", "thiserror"] },
-  "sy-core": { allow: ["sy-adapter-api", "serde", "tokio", "thiserror", "tracing"], forbid: ["sy-infra", "sy-daemon", TAURI, isAdapter, ...STORAGE] },
+  "sy-core": {
+    allow: ["sy-adapter-api", "serde", "tokio", "thiserror", "tracing"],
+    forbid: ["sy-infra", "sy-daemon", TAURI, isAdapter, ...STORAGE],
+  },
   "sy-infra": { forbid: ["sy-daemon", TAURI, isAdapter] },
   "sy-daemon": { forbid: [TAURI] },
   "sy-devbridge": { forbid: ["sy-core", "sy-infra", "sy-daemon", TAURI, isAdapter] },
@@ -59,7 +66,8 @@ for (const id of workspace) {
   if (!rule) continue;
   const direct = normalDeps(id).map((d) => pkgById.get(d));
   if (rule.allow) {
-    for (const dep of direct) if (!rule.allow.includes(dep.name)) failures.push(`${name} may not depend on ${dep.name}`);
+    for (const dep of direct)
+      if (!rule.allow.includes(dep.name)) failures.push(`${name} may not depend on ${dep.name}`);
   }
   if (rule.allowWorkspace) {
     for (const dep of direct.filter((d) => workspace.has(d.id))) {
@@ -67,7 +75,8 @@ for (const id of workspace) {
     }
   }
   for (const dep of closure(id)) {
-    if ((rule.forbid ?? []).some((p) => matches(p, dep))) failures.push(`${name} must never depend on ${dep} (found in its tree)`);
+    if ((rule.forbid ?? []).some((p) => matches(p, dep)))
+      failures.push(`${name} must never depend on ${dep} (found in its tree)`);
   }
 }
 
@@ -84,7 +93,8 @@ function walk(dir) {
       readFileSync(path, "utf8")
         .split("\n")
         .forEach((line, i) => {
-          if (osPattern.test(line)) failures.push(`OS specific code outside sy-infra/sy-client/src-tauri: ${rel}:${i + 1}`);
+          if (osPattern.test(line))
+            failures.push(`OS specific code outside sy-infra/sy-client/src-tauri: ${rel}:${i + 1}`);
         });
     }
   }

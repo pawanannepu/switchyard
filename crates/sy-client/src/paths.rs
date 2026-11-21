@@ -19,22 +19,38 @@ const MAX_SOCKET_PATH_BYTES: usize = 103;
 #[cfg(not(target_os = "macos"))]
 const MAX_SOCKET_PATH_BYTES: usize = 107;
 
+/// Why the engine paths could not be resolved or prepared.
 #[derive(Debug, thiserror::Error)]
 pub enum PathError {
+    /// The OS reported no home or data directory.
     #[error("could not find the home or data directory for this user")]
     NoHome,
+    /// A directory exists but another user owns it, or others can read it.
     #[error("{path} is not a private directory owned by this user")]
-    NotPrivate { path: PathBuf },
+    NotPrivate {
+        /// The directory that failed the check.
+        path: PathBuf,
+    },
+    /// A file system call failed.
     #[error("{path}: {source}")]
-    Io { path: PathBuf, source: io::Error },
+    Io {
+        /// The path being worked on.
+        path: PathBuf,
+        /// The underlying error.
+        source: io::Error,
+    },
 }
 
 /// Every path the engine and its clients agree on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnginePaths {
+    /// The engine's data dir (database, run output).
     pub data_dir: PathBuf,
+    /// Where `engine.log` and `engine.stderr.log` go.
     pub logs_dir: PathBuf,
+    /// The engine socket (`engine.sock`).
     pub socket: PathBuf,
+    /// The single instance lock (`engine.lock`).
     pub lock: PathBuf,
     /// True when the socket lives in the `/tmp/switchyard-<uid>` fallback dir.
     pub socket_in_fallback_dir: bool,

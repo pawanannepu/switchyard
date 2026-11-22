@@ -9,7 +9,19 @@ publish.workspace = true
 # Rule (spec 0001): may use sy-core (to implement its ports), rusqlite, portable-pty, keyring.
 # Never sy-daemon, tauri, or an adapter. Those libraries arrive with the features that need them.
 [dependencies]
+sy-core.workspace = true
+async-trait.workspace = true
+rusqlite.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+sy-core = { workspace = true, features = ["faults"] }
+rustix = { workspace = true, features = ["fs"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
 [lints]
 workspace = true

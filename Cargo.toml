@@ -30,10 +30,12 @@ sy-adapter-claude = { path = "crates/sy-adapters/claude" }
 
 # Third party
 anyhow = "1.0.104"
+async-trait = "0.1.92"
 base64 = "0.23.1"
 dirs = "7.0.0"
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
 getrandom = "0.4.3"
+rusqlite = { version = "0.43.0", features = ["bundled"] }
 rustix = { version = "1.1.6", features = ["process", "net"] }
 schemars = "1.2.3"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -46,6 +48,7 @@ tokio-util = { version = "0.7.20", features = ["codec"] }
 tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+uuid = { version = "1.29.3", features = ["v7"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

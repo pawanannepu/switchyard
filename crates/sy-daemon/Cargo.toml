@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [features]
 # Dev and test only `dev.*` methods. Release bundles are built without it.
-devtools = []
+devtools = ["sy-core/faults"]
 
 # Rule (spec 0001): anything in the workspace except tauri.
 [dependencies]
@@ -33,6 +33,7 @@ tracing-appender.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+rusqlite.workspace = true
 tempfile.workspace = true
 
 [lints]

@@ -20,8 +20,10 @@ Tracer Bullet: prove one real thread through every layer first, then thicken one
 pnpm install                          # install
 pnpm dev                              # devtools engine + tauri dev
 cargo build --workspace && pnpm build # build
-cargo test --workspace                # test (Vitest and Playwright arrive with /develop tooling)
+cargo test --workspace && pnpm test   # test: Rust over the real socket, then Vitest
+pnpm test:e2e                         # Playwright through sy-devbridge (first: playwright install webkit)
 cargo fmt --all && cargo clippy --workspace --all-targets --all-features -- -D warnings
+pnpm typecheck && pnpm lint && pnpm format:check
 pnpm boundaries:check && pnpm protocol:check
 cargo deny --all-features check       # licences, advisories, bans, sources (deny.toml)
 ```

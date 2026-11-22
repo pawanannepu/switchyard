@@ -14,8 +14,18 @@ pub const RUN_ATTACH: &str = "run.attach";
 pub const RUN_INPUT: &str = "run.input";
 /// Resize a run's terminal.
 pub const RUN_RESIZE: &str = "run.resize";
+/// Read a page of a run's saved output from its log file.
+pub const RUN_LOG_READ: &str = "run.log_read";
+/// Journal events after a cursor, for history and reconnect catch up.
+pub const EVENT_SINCE: &str = "event.since";
+/// Set a broken database aside and restore the newest backup or start fresh.
+pub const STORAGE_RECOVER: &str = "storage.recover";
+/// Engine notification: local storage health changed (to every connection after hello).
+pub const STORAGE_STATUS: &str = "storage.status";
 /// Engine notification: a chunk of a run's terminal output.
 pub const RUN_OUTPUT: &str = "run.output";
+/// Engine notification: a run changed status (to every connection after hello).
+pub const RUN_STATUS: &str = "run.status";
 /// Engine notification: output was dropped for a slow client, so attach again.
 pub const RUN_RESYNC_NEEDED: &str = "run.resync_needed";
 /// Dev only: start fake runs that stream output (and optionally echo input).
@@ -120,7 +130,16 @@ pub const ALL: &[MethodSpec] = &[
     req(RUN_ATTACH, "RunAttachParams", "RunAttachResult"),
     req(RUN_INPUT, "RunInputParams", "Empty"),
     req(RUN_RESIZE, "RunResizeParams", "Empty"),
+    req(RUN_LOG_READ, "RunLogReadParams", "RunLogReadResult"),
+    req(EVENT_SINCE, "EventSinceParams", "EventSinceResult"),
+    req(
+        STORAGE_RECOVER,
+        "StorageRecoverParams",
+        "StorageRecoverResult",
+    ),
     event(RUN_OUTPUT, "RunOutput", Direction::EngineToClient),
+    event(RUN_STATUS, "RunStatusChanged", Direction::EngineToClient),
+    event(STORAGE_STATUS, "StorageInfo", Direction::EngineToClient),
     event(
         RUN_RESYNC_NEEDED,
         "RunResyncNeeded",

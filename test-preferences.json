@@ -1,0 +1,9 @@
+{
+  "tool": "cargo test",
+  "gate": null,
+  "additionalTools": [],
+  "e2eTool": "playwright",
+  "testDir": "#[cfg(test)] in file / tests/",
+  "filePattern": "n/a",
+  "packageManager": "pnpm"
+}

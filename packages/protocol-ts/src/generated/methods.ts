@@ -10,11 +10,13 @@ export const LIMITS = {
   "client_queue_bytes": 8388608,
   "max_input_bytes": 65536,
   "max_line_bytes": 1048576,
+  "max_log_read_bytes": 262144,
   "max_replay_bytes": 2097152
 } as const;
 
 /** Every JSON-RPC error code the protocol uses, by name. */
 export const ErrorCode = {
+  "BackupMissing": -32052,
   "EngineDraining": -32010,
   "EngineShuttingDown": -32011,
   "EngineUnavailable": -32090,
@@ -28,7 +30,10 @@ export const ErrorCode = {
   "MethodNotFound": -32601,
   "ParseError": -32700,
   "RequestAbandoned": -32091,
-  "RunNotFound": -32040
+  "RunLogUnavailable": -32043,
+  "RunNotFound": -32040,
+  "StorageRecoverNotNeeded": -32051,
+  "StorageUnavailable": -32050
 } as const;
 /** The name of an error code, such as `RunNotFound`. */
 export type ErrorCodeName = keyof typeof ErrorCode;
@@ -42,6 +47,9 @@ export interface Requests {
   "run.attach": { params: T.RunAttachParams; result: T.RunAttachResult };
   "run.input": { params: T.RunInputParams; result: T.Empty };
   "run.resize": { params: T.RunResizeParams; result: T.Empty };
+  "run.log_read": { params: T.RunLogReadParams; result: T.RunLogReadResult };
+  "event.since": { params: T.EventSinceParams; result: T.EventSinceResult };
+  "storage.recover": { params: T.StorageRecoverParams; result: T.StorageRecoverResult };
   "dev.synthetic_run": { params: T.SyntheticRunParams; result: T.SyntheticRunResult };
   "dev.stop_runs": { params: T.Empty; result: T.StopRunsResult };
 }
@@ -49,6 +57,8 @@ export interface Requests {
 /** Every notification: its params type. */
 export interface Notifications {
   "run.output": T.RunOutput;
+  "run.status": T.RunStatusChanged;
+  "storage.status": T.StorageInfo;
   "run.resync_needed": T.RunResyncNeeded;
   "host.connection": T.HostConnection;
 }

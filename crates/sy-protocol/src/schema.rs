@@ -23,11 +23,33 @@ pub fn generate() -> Value {
     add::<HelloResult>(&mut generator);
     add::<EngineInfo>(&mut generator);
     add::<RunId>(&mut generator);
+    add::<TaskId>(&mut generator);
+    add::<WorkspaceId>(&mut generator);
+    add::<RunStatus>(&mut generator);
+    add::<RunStatusChanged>(&mut generator);
     add::<RunAttachParams>(&mut generator);
     add::<RunAttachResult>(&mut generator);
     add::<RunOutput>(&mut generator);
     add::<RunInputParams>(&mut generator);
     add::<RunResizeParams>(&mut generator);
+    add::<RunLogReadParams>(&mut generator);
+    add::<RunLogReadResult>(&mut generator);
+    add::<StorageStatus>(&mut generator);
+    add::<StorageInfo>(&mut generator);
+    add::<RecoverAction>(&mut generator);
+    add::<StorageRecoverParams>(&mut generator);
+    add::<StorageRecoverResult>(&mut generator);
+    add::<ProjectId>(&mut generator);
+    add::<Actor>(&mut generator);
+    add::<RunKind>(&mut generator);
+    add::<WorkspaceState>(&mut generator);
+    add::<WorkspaceOutcome>(&mut generator);
+    add::<MessageRole>(&mut generator);
+    add::<FileChange>(&mut generator);
+    add::<EventPayload>(&mut generator);
+    add::<Event>(&mut generator);
+    add::<EventSinceParams>(&mut generator);
+    add::<EventSinceResult>(&mut generator);
     add::<RunResyncNeeded>(&mut generator);
     add::<SyntheticRunParams>(&mut generator);
     add::<SyntheticRunResult>(&mut generator);
@@ -70,6 +92,7 @@ pub fn generate() -> Value {
             "max_line_bytes": crate::MAX_LINE_BYTES,
             "max_input_bytes": crate::MAX_INPUT_BYTES,
             "max_replay_bytes": crate::MAX_REPLAY_BYTES,
+            "max_log_read_bytes": crate::MAX_LOG_READ_BYTES,
             "client_queue_bytes": crate::CLIENT_QUEUE_BYTES,
         },
         "x-methods": methods,

@@ -10,15 +10,22 @@ use sy_client::EnginePaths;
 use sy_client::transport::LinesCodecError;
 use sy_client::transport::{self, Stream};
 use sy_core::adapters::AdapterRegistry;
+use sy_core::ports::Clock;
+use sy_core::recovery;
+use sy_infra::clock::SystemClock;
+use sy_infra::storage::{FileRunLog, StoragePaths, sweep_backup_temps};
 use sy_protocol::CLIENT_QUEUE_BYTES;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
 use crate::config::Config;
 use crate::dispatch::{self, ConnectionCtx, Session};
-use crate::engine::{ClientSink, Engine};
+use crate::engine::{self, ClientSink, Engine};
+use crate::faults;
 use crate::lifecycle::ExitReason;
 use crate::outbox::Outbox;
+use crate::storage::Storage;
 
 pub async fn run(
     paths: EnginePaths,
@@ -37,8 +44,59 @@ pub async fn run(
         .with_context(|| format!("binding {}", paths.socket.display()))?;
     let own_uid = transport::current_uid();
 
-    let engine = Engine::new(adapters);
-    let _flusher = engine.hub.spawn_flusher();
+    // Storage opens before the accept loop, so no client is served without it.
+    let storage_paths = StoragePaths::new(&paths.data_dir);
+    storage_paths
+        .ensure_dirs()
+        .with_context(|| format!("preparing {}", paths.data_dir.display()))?;
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    // Taken once: every run a restart turns `lost` ends at this time (AC-6).
+    let started_at = clock.now_ms();
+    match sweep_backup_temps(&storage_paths) {
+        Ok(0) => {}
+        Ok(removed) => tracing::info!(removed, "removed unfinished backups"),
+        Err(err) => tracing::warn!(%err, "could not sweep unfinished backups"),
+    }
+    let (committed_tx, committed_rx) = mpsc::unbounded_channel();
+    let (notices_tx, notices_rx) = mpsc::unbounded_channel();
+    let run_log = faults::run_log(Arc::new(FileRunLog::new(&storage_paths.runs)));
+    // A failed open still serves the stable methods and `storage.recover` (AC-3).
+    let storage = Storage::open(
+        storage_paths,
+        Arc::clone(&clock),
+        Arc::clone(&run_log),
+        committed_tx,
+        notices_tx,
+    );
+    if let Some(store) = storage.store() {
+        // Before any client is served: no one can see a run as live that died with the last engine.
+        let recovered =
+            recovery::recover_at_startup(store.as_ref(), Arc::clone(&run_log), started_at)
+                .await
+                .context("recovering storage after the last engine stopped")?;
+        tracing::info!(
+            lost_runs = recovered.lost,
+            discarded_workspaces = recovered.discarded,
+            deleted_logs = recovered.deleted_logs,
+            removed_files = recovered.removed_files,
+            "startup recovery done"
+        );
+    }
+
+    let engine = Engine::new(
+        adapters,
+        Arc::clone(&storage),
+        run_log,
+        paths.data_dir.clone(),
+    );
+    engine::spawn_broadcaster(&engine, committed_rx, notices_rx);
+    engine::spawn_log_cap(&engine);
+    engine::spawn_write_retry(&engine);
+    engine::spawn_log_failures(&engine);
+    let _flusher = engine
+        .hub
+        .spawn_flusher()
+        .context("starting the run flusher")?;
     engine
         .lifecycle
         .spawn_idle_monitor(&engine.hub, config.idle_exit);
@@ -84,18 +142,22 @@ pub async fn run(
     tracing::info!(?reason, "engine stopping");
     drop(listener);
     // Feature 5 replaces this with SIGHUP to each agent's process group, a 5 s wait, then SIGKILL.
-    let stopped = engine.hub.remove_all();
-    engine.close_all_connections();
+    let stopped = engine.remove_all_runs().await;
+    // Each connection sees the exit, finishes the request it is handling (a
+    // store commit may still be in flight), closes its own outbox and drains
+    // it. Only a connection still busy after the grace period is cut off.
     let _ = tokio::time::timeout(config.flush_grace, async {
         while connections.join_next().await.is_some() {}
     })
     .await;
+    engine.close_all_connections();
     connections.abort_all();
     if let Err(err) = std::fs::remove_file(&paths.socket)
         && err.kind() != ErrorKind::NotFound
     {
         tracing::warn!(%err, "could not remove socket");
     }
+    storage.checkpoint().await;
     tracing::info!(stopped_runs = stopped, "engine stopped");
     Ok(())
 }
@@ -134,7 +196,7 @@ async fn serve(engine: Arc<Engine>, stream: Stream) {
         };
         match next {
             Some(Ok(text)) => {
-                if let Some(response) = dispatch::line(&engine, &mut ctx, &text) {
+                if let Some(response) = dispatch::line(&engine, &mut ctx, &text).await {
                     outbox.push(response);
                 }
             }

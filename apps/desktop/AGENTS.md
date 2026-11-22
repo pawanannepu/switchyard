@@ -28,6 +28,8 @@ The switchyard app: a Tauri 2 window whose Rust host (`src-tauri/`) owns the win
 pnpm dev                                    # builds the devtools engine, then tauri dev
 pnpm --filter @switchyard/desktop dev       # Vite only (use the dev bridge)
 pnpm --filter @switchyard/desktop typecheck
+pnpm --filter @switchyard/desktop test      # Vitest units in jsdom (src/**/*.test.tsx)
+pnpm --filter @switchyard/desktop test:e2e  # Playwright in WebKit; e2e/global-setup.ts starts the engine and bridge
 pnpm app:build                              # universal signed .app
 ```
 
@@ -46,6 +48,8 @@ pnpm app:build                              # universal signed .app
 - Notifications and the menu bar only behave correctly in the built, signed `.app`, never in `tauri dev`.
 - Tauri WebDriver doesn't work on macOS; Playwright drives the Vite build through `sy-devbridge` instead.
 - A webview reload fails every in flight request; the UI must attach again rather than assume the stream continued.
+- `tsconfig.json` is a files-less solution over `tsconfig.app.json` (the UI) and `tsconfig.node.json` (configs, e2e). Both keep `noEmit`, so neither can be `composite` or referenced from a project that has its own files.
+- In WebKit on macOS (so in the app and in Playwright), plain Tab skips links; Option+Tab reaches them. Keep this in mind for keyboard first navigation and e2e tests.
 - Vite loads `vite.config.js` before `vite.config.ts`, so a stray compiled copy silently replaces the real config. `tsconfig.node.json` sets `noEmit` so `tsc -b` never writes one; keep it that way.
 
 ## Agent skills

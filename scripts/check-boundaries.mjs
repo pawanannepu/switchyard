@@ -28,7 +28,8 @@ const rules = {
   "sy-client": { forbid: ["sy-core", "sy-infra", "sy-daemon", TAURI, isAdapter] },
   "sy-adapter-api": { allow: ["serde", "tokio", "thiserror"] },
   "sy-core": {
-    allow: ["sy-adapter-api", "serde", "tokio", "thiserror", "tracing"],
+    // spec 0002 adds uuid (typed ids) and async-trait (the `Store` port as `Arc<dyn Store>`)
+    allow: ["sy-adapter-api", "serde", "tokio", "thiserror", "tracing", "uuid", "async-trait"],
     forbid: ["sy-infra", "sy-daemon", TAURI, isAdapter, ...STORAGE],
   },
   "sy-infra": { forbid: ["sy-daemon", TAURI, isAdapter] },

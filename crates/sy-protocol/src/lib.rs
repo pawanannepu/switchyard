@@ -27,5 +27,8 @@ pub const MAX_INPUT_BYTES: usize = 64 * 1024;
 /// Most output a `run.attach` replays, in bytes (the per run ring buffer size).
 pub const MAX_REPLAY_BYTES: usize = 2 * 1024 * 1024;
 
+/// Most bytes one `run.log_read` returns (also its default page).
+pub const MAX_LOG_READ_BYTES: usize = 256 * 1024;
+
 /// Per client outgoing queue cap in the engine, in bytes.
 pub const CLIENT_QUEUE_BYTES: usize = 8 * 1024 * 1024;

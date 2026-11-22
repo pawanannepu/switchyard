@@ -15,10 +15,20 @@ Capture conventions from the real scaffolded project, then install lint, format,
 - [x] Capture conventions + tooling choices: `/audit`
 - [x] Install the tooling: `/develop tooling`
 
-### 3. Data model · needs a decision
+### 3. Data model · in-progress
 The local records everything builds on: projects, workspaces, tasks, runs, agents, output and events, approvals, comparisons, usage.
 **Done when:** the entities support every planned slice (compare, approvals, cost, history, resume) without a breaking migration, everything is stored locally, and work is saved continuously so a hard kill of the app loses nothing already shown. (basis: the data model is the costliest thing to redo)
-- [ ] Design it (spec): `/architect data model`
+spec [0002](../specs/0002-data-model/index.md) · code in `crates/sy-core/`, `crates/sy-infra/`, `crates/sy-daemon/`
+- [x] Design it (spec): `/architect data model`
+- [x] Build it: `/develop data model`
+  - [x] Persisted thread end to end: domain types, ports, spine migration, run log, hub saves before it broadcasts, dev run through the store (AC-1, AC-5, AC-7, AC-8, AC-14, AC-15, AC-16, AC-18)
+  - [x] Recovery and reads: startup reconcile, `event.since`, `run.log_read` (AC-6, AC-11, AC-12)
+  - [x] Complete spine store: settings, archive and permanent delete, invariants, log cap trimming (AC-7, AC-9, AC-10)
+  - [x] Storage failure handling: crash safe backups, degraded open and `storage.recover`, disk full handling, logging checks (AC-2, AC-3, AC-4, AC-13, AC-17)
+- [x] Verify it: `/check verify data model`
+- [x] Test it: `/test data model`
+- [x] Review it (fresh model): `/check review data model`
+- [x] Document it: `/document data model`
 
 ### 4. Agent adapter contract & fake agent · needs a decision
 The one interface every agent plugs into: detect, launch through its official CLI, stream output, report status, relay approvals, stop. Plus a fake agent that tests drive.

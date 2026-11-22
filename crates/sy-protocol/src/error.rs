@@ -8,7 +8,8 @@
 //! | -32020 .. -32029 | project  |
 //! | -32030 .. -32039 | task     |
 //! | -32040 .. -32049 | run      |
-//! | -32050 .. -32089 | reserved |
+//! | -32050 .. -32059 | storage  |
+//! | -32060 .. -32089 | reserved |
 //! | -32090 .. -32099 | host (app host and dev bridge, never the engine) |
 
 macro_rules! error_codes {
@@ -73,6 +74,17 @@ error_codes! {
     InputTooLarge = -32041,
     /// The run is not accepting input right now (its input queue is full).
     InputBusy = -32042,
+    /// The run's log was trimmed or deleted, or its file vanished.
+    RunLogUnavailable = -32043,
+
+    // storage
+    /// Storage is in a failed open state (newer schema, corrupt or unavailable);
+    /// only stable methods and `storage.recover` work.
+    StorageUnavailable = -32050,
+    /// `storage.recover` was called while storage is `ok` or `degraded_writes`.
+    StorageRecoverNotNeeded = -32051,
+    /// `storage.recover` with `restore_backup`, but no backup passes its check.
+    BackupMissing = -32052,
 
     // host
     /// The app host (or dev bridge) has no engine connection right now.

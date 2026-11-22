@@ -25,6 +25,7 @@ Generated TypeScript types and a typed JSON-RPC client for the engine protocol, 
 pnpm protocol:gen                       # regenerate from the Rust schema
 pnpm protocol:check                     # fails if generated files drift
 pnpm --filter @switchyard/protocol typecheck
+pnpm --filter @switchyard/protocol test # Vitest, node environment
 ```
 
 ## Conventions

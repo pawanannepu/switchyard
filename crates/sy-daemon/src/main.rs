@@ -9,11 +9,14 @@ mod config;
 mod dev;
 mod dispatch;
 mod engine;
+mod faults;
 mod lifecycle;
 mod lock;
 mod logging;
 mod outbox;
 mod server;
+mod storage;
+mod wire;
 
 use std::process::ExitCode;
 

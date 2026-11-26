@@ -8,6 +8,9 @@ members = [
   "crates/sy-core",
   "crates/sy-infra",
   "crates/sy-adapters/claude",
+  "crates/sy-adapters/fake",
+  "crates/sy-fake-agent",
+  "crates/sy-signal",
   "crates/sy-daemon",
   "crates/sy-devbridge",
   "apps/desktop/src-tauri",
@@ -27,6 +30,7 @@ sy-adapter-api = { path = "crates/sy-adapter-api" }
 sy-core = { path = "crates/sy-core" }
 sy-infra = { path = "crates/sy-infra" }
 sy-adapter-claude = { path = "crates/sy-adapters/claude" }
+sy-adapter-fake = { path = "crates/sy-adapters/fake" }
 
 # Third party
 anyhow = "1.0.104"
@@ -35,11 +39,13 @@ base64 = "0.23.1"
 dirs = "7.0.0"
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
 getrandom = "0.4.3"
+portable-pty = "0.9.0"
 rusqlite = { version = "0.43.0", features = ["bundled"] }
 rustix = { version = "1.1.6", features = ["process", "net"] }
 schemars = "1.2.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+signal-hook = "0.4.6"
 tempfile = "3.27.0"
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
@@ -49,6 +55,7 @@ tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uuid = { version = "1.29.3", features = ["v7"] }
+vte = "0.15.0"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

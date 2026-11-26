@@ -4,6 +4,8 @@
 //  - allow: the only direct normal dependencies a crate may have (workspace and external)
 //  - forbid: crates that must never appear anywhere in its dependency tree
 //  - no `cfg(target_os` / `cfg(unix|windows)` outside sy-infra, sy-client and src-tauri
+//  - adapters are pure (spec 0003, AC-2): no source under crates/sy-adapters/*/src or
+//    crates/sy-adapter-api/src names a file, process, network or environment API
 
 import { execFileSync } from "node:child_process";
 import { readdirSync, readFileSync, statSync } from "node:fs";
@@ -26,7 +28,8 @@ const STORAGE = ["rusqlite", "portable-pty", "keyring"];
 const rules = {
   "sy-protocol": { allow: ["serde", "schemars", "serde_json"] },
   "sy-client": { forbid: ["sy-core", "sy-infra", "sy-daemon", TAURI, isAdapter] },
-  "sy-adapter-api": { allow: ["serde", "tokio", "thiserror"] },
+  // spec 0003: serde_json and vte join, tokio leaves
+  "sy-adapter-api": { allow: ["serde", "serde_json", "thiserror", "vte"] },
   "sy-core": {
     // spec 0002 adds uuid (typed ids) and async-trait (the `Store` port as `Arc<dyn Store>`)
     allow: ["sy-adapter-api", "serde", "tokio", "thiserror", "tracing", "uuid", "async-trait"],
@@ -35,6 +38,13 @@ const rules = {
   "sy-infra": { forbid: ["sy-daemon", TAURI, isAdapter] },
   "sy-daemon": { forbid: [TAURI] },
   "sy-devbridge": { forbid: ["sy-core", "sy-infra", "sy-daemon", TAURI, isAdapter] },
+  // spec 0003: the hook helper is a client only binary, like sy-devbridge
+  "sy-signal": {
+    allowWorkspace: ["sy-protocol", "sy-client"],
+    forbid: ["sy-core", "sy-infra", "sy-daemon", TAURI, isAdapter],
+  },
+  // spec 0003: the scripted fake agent depends on no workspace crate at all
+  "sy-fake-agent": { allowWorkspace: [], forbid: ["sy-core", "sy-infra", "sy-daemon", TAURI, isAdapter] },
   switchyard: { forbid: ["sy-core", "sy-infra", "sy-daemon", isAdapter] },
 };
 const adapterRule = { allowWorkspace: ["sy-adapter-api"], forbid: ["sy-core", "sy-infra", "sy-daemon", TAURI] };
@@ -101,6 +111,45 @@ function walk(dir) {
   }
 }
 walk(join(root, "crates"));
+
+// Adapters never do I/O (spec 0003, AC-2): the engine does it for them.
+const forbiddenApi = [
+  /\bstd::(fs|process|net|env|os::unix::net)\b/,
+  /\bstd::\{[^}]*\b(fs|process|net|env|os)\b/,
+  /\btokio::(fs|process|net)\b/,
+  /\btokio::\{[^}]*\b(fs|process|net)\b/,
+  /\bdirs::/,
+  /\b(use|extern crate)\s+dirs\b/,
+];
+const stripComments = (text) => text.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
+function scanPure(dir) {
+  for (const entry of readdirSync(dir)) {
+    const path = join(dir, entry);
+    if (statSync(path).isDirectory()) scanPure(path);
+    else if (path.endsWith(".rs")) {
+      const rel = relative(root, path);
+      stripComments(readFileSync(path, "utf8"))
+        .split("\n")
+        .forEach((line, i) => {
+          if (forbiddenApi.some((p) => p.test(line)))
+            failures.push(`adapter code may not do I/O (spec 0003, AC-2): ${rel}:${i + 1}: ${line.trim()}`);
+        });
+    }
+  }
+}
+const adaptersDir = join(root, "crates", "sy-adapters");
+for (const entry of readdirSync(adaptersDir)) {
+  const src = join(adaptersDir, entry, "src");
+  if (statSync(join(adaptersDir, entry)).isDirectory()) {
+    try {
+      statSync(src);
+    } catch {
+      continue;
+    }
+    scanPure(src);
+  }
+}
+scanPure(join(root, "crates", "sy-adapter-api", "src"));
 
 if (failures.length) {
   console.error("Dependency rule violations:");

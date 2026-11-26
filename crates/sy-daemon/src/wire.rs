@@ -1,10 +1,10 @@
 //! Domain values to protocol DTOs (and the ids back). `sy-core` never sees
 //! `sy-protocol` types, and the protocol never sees core internals.
 
-use sy_core::ids::{ProjectId, RunId, TaskId, WorkspaceId};
+use sy_core::ids::{ApprovalId, ProjectId, RunId, TaskId, WorkspaceId};
 use sy_core::model::{
-    Actor, Event, EventKind, FileChange, JsonValue, MessageRole, RunKind, RunStatus,
-    WorkspaceOutcome, WorkspaceState,
+    Actor, Approval, ApprovalKind, ApprovalStatus, DecidedBy, Event, EventKind, FileChange,
+    JsonValue, MessageRole, RunKind, RunStatus, WorkspaceOutcome, WorkspaceState,
 };
 use sy_core::ports::EventFilter;
 use sy_protocol::{ErrorCode, EventPayload, EventSinceParams, RpcError};
@@ -15,6 +15,119 @@ pub fn run_id(id: &RunId) -> sy_protocol::RunId {
 
 fn workspace_id(id: &WorkspaceId) -> sy_protocol::WorkspaceId {
     sy_protocol::WorkspaceId(id.to_string())
+}
+
+fn status_source(source: sy_adapter_api::StatusSource) -> sy_protocol::StatusSource {
+    match source {
+        sy_adapter_api::StatusSource::Hooks => sy_protocol::StatusSource::Hooks,
+        sy_adapter_api::StatusSource::Patterns => sy_protocol::StatusSource::Patterns,
+        sy_adapter_api::StatusSource::ExitOnly => sy_protocol::StatusSource::ExitOnly,
+    }
+}
+
+fn signed_in(signed_in: sy_adapter_api::SignedIn) -> sy_protocol::SignedIn {
+    match signed_in {
+        sy_adapter_api::SignedIn::Yes => sy_protocol::SignedIn::Yes,
+        sy_adapter_api::SignedIn::No => sy_protocol::SignedIn::No,
+        sy_adapter_api::SignedIn::Unknown => sy_protocol::SignedIn::Unknown,
+    }
+}
+
+/// An adapter and its last detection in their wire shape.
+pub fn agent(a: &sy_core::agents::detect::AgentInfo) -> sy_protocol::AgentInfo {
+    let c = a.capabilities;
+    sy_protocol::AgentInfo {
+        id: a.id.clone(),
+        display_name: a.display_name.clone(),
+        capabilities: sy_protocol::AgentCapabilities {
+            launch: c.launch,
+            approvals: c.approvals,
+            resume: c.resume,
+            events: c.events,
+            status_source: status_source(c.status_source),
+        },
+        detection: a.detection.as_ref().map(|d| sy_protocol::AgentDetection {
+            installed: d.detection.installed,
+            signed_in: signed_in(d.detection.signed_in),
+            version: d.detection.version.clone(),
+            path: d.path.clone(),
+            hint: d.detection.hint.clone(),
+            checked_at: d.checked_at,
+        }),
+    }
+}
+
+/// A login environment capture's state.
+pub fn login_env(snapshot: &sy_core::agents::ports::LoginEnvSnapshot) -> sy_protocol::LoginEnvInfo {
+    sy_protocol::LoginEnvInfo {
+        status: if snapshot.fallback.is_some() {
+            sy_protocol::LoginEnvStatus::Fallback
+        } else {
+            sy_protocol::LoginEnvStatus::Ok
+        },
+        message: snapshot.fallback.clone(),
+    }
+}
+
+pub fn approval_id(id: &ApprovalId) -> sy_protocol::ApprovalId {
+    sy_protocol::ApprovalId(id.to_string())
+}
+
+pub fn approval_kind(kind: ApprovalKind) -> sy_protocol::ApprovalKind {
+    match kind {
+        ApprovalKind::Command => sy_protocol::ApprovalKind::Command,
+        ApprovalKind::FileEdit => sy_protocol::ApprovalKind::FileEdit,
+        ApprovalKind::Fetch => sy_protocol::ApprovalKind::Fetch,
+        ApprovalKind::McpTool => sy_protocol::ApprovalKind::McpTool,
+        ApprovalKind::Other => sy_protocol::ApprovalKind::Other,
+    }
+}
+
+pub fn approval_status(status: ApprovalStatus) -> sy_protocol::ApprovalStatus {
+    match status {
+        ApprovalStatus::Pending => sy_protocol::ApprovalStatus::Pending,
+        ApprovalStatus::Approved => sy_protocol::ApprovalStatus::Approved,
+        ApprovalStatus::Denied => sy_protocol::ApprovalStatus::Denied,
+        ApprovalStatus::Expired => sy_protocol::ApprovalStatus::Expired,
+        ApprovalStatus::Cancelled => sy_protocol::ApprovalStatus::Cancelled,
+    }
+}
+
+/// The wire status as the domain's (for `approval.list`'s filter).
+pub fn core_approval_status(status: sy_protocol::ApprovalStatus) -> ApprovalStatus {
+    match status {
+        sy_protocol::ApprovalStatus::Pending => ApprovalStatus::Pending,
+        sy_protocol::ApprovalStatus::Approved => ApprovalStatus::Approved,
+        sy_protocol::ApprovalStatus::Denied => ApprovalStatus::Denied,
+        sy_protocol::ApprovalStatus::Expired => ApprovalStatus::Expired,
+        sy_protocol::ApprovalStatus::Cancelled => ApprovalStatus::Cancelled,
+    }
+}
+
+fn decided_by(by: DecidedBy) -> sy_protocol::DecidedBy {
+    match by {
+        DecidedBy::User => sy_protocol::DecidedBy::User,
+        DecidedBy::Policy => sy_protocol::DecidedBy::Policy,
+        DecidedBy::Agent => sy_protocol::DecidedBy::Agent,
+    }
+}
+
+/// An approval in its wire shape.
+pub fn approval(a: &Approval) -> sy_protocol::Approval {
+    sy_protocol::Approval {
+        id: approval_id(&a.id),
+        run_id: run_id(&a.run_id),
+        workspace_id: workspace_id(&a.workspace_id),
+        kind: approval_kind(a.kind),
+        summary: a.summary.clone(),
+        detail: a.detail.clone(),
+        status: approval_status(a.status),
+        requested_at: a.requested_at,
+        decided_at: a.decided_at,
+        decided_by: a.decided_by.map(decided_by),
+        decided_by_ref: a.decided_by_ref.clone(),
+        message: a.message.clone(),
+    }
 }
 
 fn task_id(id: &TaskId) -> sy_protocol::TaskId {
@@ -190,6 +303,28 @@ fn payload(kind: &EventKind) -> EventPayload {
             path: path.clone(),
             change: file_change(*change),
             from_path: from_path.clone(),
+        },
+        EventKind::ApprovalRequested {
+            approval_id: id,
+            kind,
+            summary,
+        } => EventPayload::ApprovalRequested {
+            approval_id: approval_id(id),
+            kind: approval_kind(*kind),
+            summary: summary.clone(),
+        },
+        EventKind::ApprovalDecided {
+            approval_id: id,
+            status,
+            decided_by: by,
+            decided_by_ref,
+            message,
+        } => EventPayload::ApprovalDecided {
+            approval_id: approval_id(id),
+            status: approval_status(*status),
+            decided_by: by.map(decided_by),
+            decided_by_ref: decided_by_ref.clone(),
+            message: message.clone(),
         },
     }
 }

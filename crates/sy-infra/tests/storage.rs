@@ -102,6 +102,11 @@ const EXTRA: &[Migration] = &[
 ];
 
 /// The spine plus the first `n` test migrations.
+/// The schema version the real migrations reach.
+fn base() -> i64 {
+    MIGRATIONS.len() as i64
+}
+
 fn upto(n: usize) -> Vec<Migration> {
     [MIGRATIONS, &EXTRA[..n]].concat()
 }
@@ -174,7 +179,16 @@ async fn a_pending_migration_should_first_write_a_checked_0600_backup_with_no_tm
             projects,
             second.schema_version,
         ),
-        (Some("switchyard-v1-2000.db"), 1, 1, true, 0o600, 0, 1, 2)
+        (
+            Some(format!("switchyard-v{}-2000.db", base()).as_str()),
+            1,
+            base(),
+            true,
+            0o600,
+            0,
+            1,
+            base() + 1
+        )
     );
 }
 
@@ -194,7 +208,7 @@ async fn five_backups_should_leave_only_the_three_newest() {
         .collect();
     assert_eq!(
         (versions, KEEP_BACKUPS, tmp_files(&paths)),
-        (vec![5, 4, 3], 3, 0)
+        (vec![base() + 4, base() + 3, base() + 2], 3, 0)
     );
 }
 
@@ -222,7 +236,7 @@ async fn a_failed_migration_should_roll_back_keep_the_version_and_keep_its_backu
     let broken = [
         MIGRATIONS,
         &[Migration {
-            name: "0002_broken.sql",
+            name: "9999_broken.sql",
             sql: "CREATE TABLE half (x INTEGER) STRICT; INSERT INTO nowhere VALUES (1);",
             rebuild: false,
         }],
@@ -233,14 +247,14 @@ async fn a_failed_migration_should_roll_back_keep_the_version_and_keep_its_backu
         .unwrap()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert!(matches!(err, OpenError::Migration { version: 2, .. }));
+    assert!(matches!(err, OpenError::Migration { version, .. } if version == base() + 1));
     assert_eq!(
         (
             version,
             err.schema_version(),
             list_backups(&paths).unwrap().len()
         ),
-        (1, Some(1), 1)
+        (base(), Some(base()), 1)
     );
 }
 
@@ -998,7 +1012,7 @@ async fn queued_run_process_and_session_ref_should_read_back_then_land() {
     let process = RunProcess {
         pid: 4242,
         pgid: 4240,
-        pid_started_at: 1_700_000,
+        pid_started_at: Some(1_700_000),
     };
 
     d.store.set_run_process(&run, process).await.unwrap();
@@ -1133,5 +1147,95 @@ async fn retry_while_ok_should_succeed_at_once_and_announce_nothing() {
             d.real.get_setting(STORAGE_PROBE_KEY).await.unwrap()
         ),
         (true, Vec::new(), None)
+    );
+}
+
+#[tokio::test]
+async fn approvals_while_degraded_should_refuse_creates_queue_decisions_then_land_in_order() {
+    // covers: spec 0003 AC-9 (no row, no approval) and AC-17 (the run end's cancel queues)
+    use sy_core::ids::ApprovalId;
+    use sy_core::model::{
+        ApprovalDecision, ApprovalKind, ApprovalStatus, DECIDED_IN_INBOX, NewApproval,
+    };
+    use sy_core::ports::{ApprovalFilter, ListQuery};
+    let d = Degradable::new();
+    let (run, _ws) = d.running().await;
+    let new = |summary: &str| NewApproval {
+        id: ApprovalId::new(),
+        run_id: run.clone(),
+        kind: ApprovalKind::Command,
+        summary: summary.into(),
+        detail: serde_json::json!({ "command": "ls", "raw": null }),
+    };
+    let first = d
+        .store
+        .create_approval(Actor::Agent, None, new("first"))
+        .await
+        .unwrap()
+        .value;
+    let second = d
+        .store
+        .create_approval(Actor::Agent, None, new("second"))
+        .await
+        .unwrap()
+        .value;
+    d.fill_disk(true);
+    let refused = d
+        .store
+        .create_approval(Actor::Agent, None, new("refused"))
+        .await;
+    let decided = d
+        .store
+        .decide_approval(
+            Actor::User,
+            &first.id,
+            ApprovalDecision::by_user(true, DECIDED_IN_INBOX, None),
+        )
+        .await
+        .unwrap();
+    let cancelled = d
+        .store
+        .cancel_pending_approvals(Actor::Engine, &run, None)
+        .await
+        .unwrap();
+    let pending_now = d
+        .store
+        .list_approvals(
+            ApprovalFilter {
+                status: ApprovalStatus::Pending,
+                run_id: Some(run.clone()),
+            },
+            ListQuery::default(),
+        )
+        .await
+        .unwrap();
+    let real_while_degraded = d.real.get_approval(&first.id).await.unwrap().status;
+    d.fill_disk(false);
+    assert!(d.store.retry().await);
+    assert_eq!(
+        (
+            refused.unwrap_err(),
+            (decided.value.status, decided.events.len()),
+            cancelled
+                .value
+                .iter()
+                .map(|a| (a.id.clone(), a.status))
+                .collect::<Vec<_>>(),
+            cancelled.events.len(),
+            pending_now.items.len(),
+            real_while_degraded,
+            d.real.get_approval(&first.id).await.unwrap().status,
+            d.real.get_approval(&second.id).await.unwrap().status,
+        ),
+        (
+            StoreError::Full,
+            (ApprovalStatus::Approved, 0),
+            vec![(second.id.clone(), ApprovalStatus::Cancelled)],
+            0,
+            0,
+            ApprovalStatus::Pending,
+            ApprovalStatus::Approved,
+            ApprovalStatus::Cancelled,
+        )
     );
 }

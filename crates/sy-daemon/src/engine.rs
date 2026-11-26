@@ -9,13 +9,17 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
-use sy_core::adapters::AdapterRegistry;
+use sy_core::agents::detect::Detector;
+use sy_core::agents::ports::LoginEnv;
+use sy_core::agents::{AgentRuns, ApprovalNotice};
 use sy_core::model::{Event, EventKind, RunStatus};
 use sy_core::ports::{RunLog, Store};
 use sy_core::retention;
 use sy_core::runs::{Delivery, RunHub, RunId, RunSink};
 use sy_core::write_queue::{self, StorageNotice, WriteHealth};
-use sy_protocol::{RunOutput, RunResyncNeeded, RunStatusChanged, methods, notification_line};
+use sy_protocol::{
+    ApprovalNotification, RunOutput, RunResyncNeeded, RunStatusChanged, methods, notification_line,
+};
 use tokio::sync::{Notify, mpsc};
 
 use crate::lifecycle::Lifecycle;
@@ -33,7 +37,12 @@ pub struct Engine {
     /// The run output logs (the hub appends; `run.log_read` reads).
     pub run_log: Arc<dyn RunLog>,
     pub lifecycle: Arc<Lifecycle>,
-    pub adapters: AdapterRegistry,
+    /// Every agent run, and the adapters they launch through (spec 0003).
+    pub agents: Arc<AgentRuns>,
+    /// Which agents are installed (spec 0003, AC-3).
+    pub detector: Arc<Detector>,
+    /// The environment agents and probes run with (AC-16).
+    pub login: Arc<dyn LoginEnv>,
     pub pid: u32,
     /// The data dir (the dev fixture's paths hang off it).
     #[cfg_attr(
@@ -59,17 +68,22 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 impl Engine {
     pub fn new(
-        adapters: AdapterRegistry,
+        hub: Arc<RunHub>,
+        agents: Arc<AgentRuns>,
+        detector: Arc<Detector>,
+        login: Arc<dyn LoginEnv>,
         storage: Arc<Storage>,
         run_log: Arc<dyn RunLog>,
         data_dir: PathBuf,
     ) -> Arc<Self> {
         Arc::new(Self {
-            hub: RunHub::new(Arc::clone(&run_log)),
+            hub,
             storage,
             run_log,
             lifecycle: Lifecycle::new(),
-            adapters,
+            agents,
+            detector,
+            login,
             pid: std::process::id(),
             data_dir,
             log_cap: Arc::new(Notify::new()),
@@ -118,21 +132,6 @@ impl Engine {
         }
     }
 
-    /// Stop every live run: final flush to its log and delivery, on a blocking
-    /// thread. Returns how many there were. Their rows stay live until the
-    /// next start marks them `lost` (feature 5 replaces this with a real stop).
-    pub async fn remove_all_runs(&self) -> usize {
-        let hub = Arc::clone(&self.hub);
-        tokio::task::spawn_blocking(move || {
-            hub.run_ids()
-                .iter()
-                .filter(|id| hub.remove(id).is_some())
-                .count()
-        })
-        .await
-        .unwrap_or(0)
-    }
-
     pub fn unregister_connection(&self, id: u64) {
         lock(&self.connections).remove(&id);
         self.hub.detach_all(id);
@@ -177,6 +176,25 @@ pub fn run_status_line(kind: &EventKind, event_id: Option<i64>) -> Option<String
     ))
 }
 
+/// The `approval.requested` or `approval.decided` notification for a notice.
+pub fn approval_line(notice: &ApprovalNotice) -> String {
+    let (method, approval, event_id) = match notice {
+        ApprovalNotice::Requested { approval, event_id } => {
+            (methods::APPROVAL_REQUESTED, approval, *event_id)
+        }
+        ApprovalNotice::Decided { approval, event_id } => {
+            (methods::APPROVAL_DECIDED, approval, *event_id)
+        }
+    };
+    notification_line(
+        method,
+        &ApprovalNotification {
+            approval: wire::approval(approval),
+            event_id,
+        },
+    )
+}
+
 /// Run status changes already announced unjournaled (`event_id: null`), per
 /// run, in order. When the queue replays one, its commit comes back through
 /// the committed channel; that copy is not announced again.
@@ -210,15 +228,16 @@ impl Announced {
 }
 
 /// Drain the store's ordered channel of committed events and the write
-/// path's notices, sending `run.status` and `storage.status` to every
-/// connection. Committed events come first whenever both are ready: a
-/// notice is always sent after the commits before it, so this keeps
-/// notifications in the order they happened, and committed ones in
-/// `event_id` order.
+/// path's notices and the agent runs' approval notices, sending `run.status`,
+/// `storage.status`, `approval.requested` and `approval.decided` to every
+/// connection. Committed events come first whenever more is ready: a notice
+/// is always sent after the commits before it, so this keeps notifications
+/// in the order they happened, and committed ones in `event_id` order.
 pub fn spawn_broadcaster(
     engine: &Arc<Engine>,
     mut events: mpsc::UnboundedReceiver<Event>,
     mut notices: mpsc::UnboundedReceiver<StorageNotice>,
+    mut approvals: mpsc::UnboundedReceiver<ApprovalNotice>,
 ) {
     let engine = Arc::downgrade(engine);
     tokio::spawn(async move {
@@ -255,6 +274,10 @@ pub fn spawn_broadcaster(
                             engine.broadcast_storage_status();
                         }
                     }
+                }
+                Some(notice) = approvals.recv() => {
+                    let Some(engine) = engine.upgrade() else { break };
+                    engine.broadcast(&approval_line(&notice));
                 }
                 else => break,
             }

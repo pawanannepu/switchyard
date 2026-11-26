@@ -1,0 +1,18 @@
+[package]
+name = "sy-fake-agent"
+description = "A scripted fake coding agent for switchyard's tests and load check. Dev and test only, never bundled"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Rule (spec 0003): no workspace crate dependencies.
+[dependencies]
+base64.workspace = true
+rustix = { workspace = true, features = ["termios", "process", "stdio"] }
+serde.workspace = true
+serde_json.workspace = true
+signal-hook.workspace = true
+
+[lints]
+workspace = true

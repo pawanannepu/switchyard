@@ -19,6 +19,7 @@ mod storage;
 mod wire;
 
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use anyhow::Context;
 use sy_client::EnginePaths;
@@ -58,11 +59,16 @@ fn run() -> anyhow::Result<ExitCode> {
         }
     };
 
+    let config = config::Config::from_env();
+
     // Each adapter registers here: one line per agent, nothing in sy-core.
     let mut adapters = AdapterRegistry::default();
-    adapters.register(sy_adapter_claude::ClaudeAdapter);
+    adapters.register(Arc::new(sy_adapter_claude::ClaudeAdapter));
+    #[cfg(feature = "devtools")]
+    adapters.register(Arc::new(sy_adapter_fake::FakeAdapter::new(
+        config.helper("sy-fake-agent"),
+    )));
 
-    let config = config::Config::from_env();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;

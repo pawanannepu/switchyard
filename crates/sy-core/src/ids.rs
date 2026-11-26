@@ -119,6 +119,11 @@ typed_id!(
     RunId,
     "run"
 );
+typed_id!(
+    /// Identifies an approval (one permission request from a run, spec 0003).
+    ApprovalId,
+    "apr"
+);
 
 #[cfg(test)]
 mod tests {

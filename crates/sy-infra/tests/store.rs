@@ -14,15 +14,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use rusqlite::Connection;
-use sy_core::ids::{ProjectId, RunId, TaskId, WorkspaceId};
+use sy_core::ids::{ApprovalId, ProjectId, RunId, TaskId, WorkspaceId};
 use sy_core::model::{
-    Actor, AdapterEvent, EndReason, Event, EventKind, InitialWorkspaceState,
-    InvalidWorkspaceTransition, JsonValue, LogState, NewProject, NewRun, NewTask, NewWorkspace,
-    NotAComparison, RunEnd, RunKind, RunStatus, RunTransition, STORAGE_PROBE_KEY, Workspace,
-    WorkspaceChange, WorkspaceOutcome, WorkspaceState,
+    Actor, AdapterEvent, Approval, ApprovalDecision, ApprovalKind, ApprovalStatus,
+    DECIDED_IN_INBOX, DECIDED_IN_TERMINAL, DecidedBy, EndReason, Event, EventKind,
+    InitialWorkspaceState, InvalidWorkspaceTransition, JsonValue, LogState, NewApproval,
+    NewProject, NewRun, NewTask, NewWorkspace, NotAComparison, RunEnd, RunKind, RunStatus,
+    RunTransition, STORAGE_PROBE_KEY, Workspace, WorkspaceChange, WorkspaceOutcome, WorkspaceState,
 };
 use sy_core::ports::{
-    Clock, EventFilter, ListQuery, RunFilter, RunLog, RunLogError, RunProcess, Store, StoreError,
+    ApprovalFilter, Clock, EventFilter, Keyset, ListQuery, RunFilter, RunLog, RunLogError,
+    RunProcess, Store, StoreError,
 };
 use sy_core::recovery::{Recovered, recover_at_startup};
 use sy_core::retention::{
@@ -220,6 +222,7 @@ async fn spine_tables_should_exist_and_be_strict() {
     assert_eq!(
         names,
         [
+            "approval",
             "event",
             "project",
             "project_setting",
@@ -1488,7 +1491,7 @@ async fn run_setters_should_write_the_row_and_no_event() {
             RunProcess {
                 pid: 41,
                 pgid: 40,
-                pid_started_at: 7,
+                pid_started_at: Some(7),
             },
         )
         .await
@@ -1896,4 +1899,363 @@ async fn log_cap_setting_should_fall_back_to_the_default_unless_it_is_a_non_nega
             u64::MAX,
         ]
     );
+}
+
+// ---- approvals (spec 0003, migration 2) ----
+
+async fn approval(f: &Fixture, run: &RunId, summary: &str) -> Approval {
+    f.store
+        .create_approval(
+            Actor::Agent,
+            Some("wsp_x".into()),
+            NewApproval {
+                id: ApprovalId::new(),
+                run_id: run.clone(),
+                kind: ApprovalKind::Command,
+                summary: summary.into(),
+                detail: serde_json::json!({ "command": "ls", "raw": { "tool": "Bash" } }),
+            },
+        )
+        .await
+        .unwrap()
+        .value
+}
+
+/// A fixture with one live agent run.
+async fn live_run(f: &Fixture, branch: &str) -> (TaskId, WorkspaceId, RunId) {
+    let p = match f.store.find_project_by_repo_path("/repo").await.unwrap() {
+        Some(p) => p.id,
+        None => f.project("/repo").await,
+    };
+    let (t, w) = f
+        .task(&p, vec![ws(branch, &format!("/w/{branch}"))])
+        .await
+        .unwrap();
+    let run = f.run(&w[0].id, RunKind::Agent).await.unwrap();
+    f.walk(&run, &[RunStatus::Starting, RunStatus::Running])
+        .await;
+    (t, w[0].id.clone(), run)
+}
+
+#[tokio::test]
+async fn create_approval_should_write_a_pending_row_and_its_event_under_every_ancestor() {
+    let mut f = Fixture::new();
+    let (t, w, run) = live_run(&f, "a").await;
+    f.broadcast();
+    let long = "x".repeat(300);
+    let made = approval(&f, &run, &long).await;
+    let events = f.broadcast();
+    let raw = f.raw();
+    let (detail, response): (String, Option<String>) = raw
+        .query_row(
+            "SELECT detail, response FROM approval WHERE id = ?1",
+            [made.id.as_str()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (
+            made.status,
+            made.summary.chars().count(),
+            made.workspace_id.clone(),
+            made.decided_at,
+            serde_json::from_str::<serde_json::Value>(&detail).unwrap(),
+            response,
+        ),
+        (
+            ApprovalStatus::Pending,
+            200,
+            w.clone(),
+            None,
+            serde_json::json!({ "command": "ls", "raw": { "tool": "Bash" } }),
+            None,
+        )
+    );
+    let [event] = events.as_slice() else {
+        panic!("{events:?}")
+    };
+    assert_eq!(
+        (
+            &event.kind,
+            event.actor,
+            event.actor_ref.as_deref(),
+            event.scope.task_id.as_ref(),
+            event.scope.workspace_id.as_ref(),
+            event.scope.run_id.as_ref(),
+        ),
+        (
+            &EventKind::ApprovalRequested {
+                approval_id: made.id.clone(),
+                kind: ApprovalKind::Command,
+                summary: "x".repeat(200),
+            },
+            Actor::Agent,
+            Some("wsp_x"),
+            Some(&t),
+            Some(&w),
+            Some(&run),
+        )
+    );
+    assert_eq!(f.store.get_approval(&made.id).await.unwrap(), made);
+}
+
+#[tokio::test]
+async fn an_approval_should_leave_pending_exactly_once() {
+    let mut f = Fixture::new();
+    let (_, _, run) = live_run(&f, "a").await;
+    let made = approval(&f, &run, "run ls").await;
+    f.broadcast();
+    let first = f
+        .store
+        .decide_approval(
+            Actor::User,
+            &made.id,
+            ApprovalDecision::by_user(false, DECIDED_IN_INBOX, Some("not now".into())),
+        )
+        .await
+        .unwrap();
+    let second = f
+        .store
+        .decide_approval(Actor::Engine, &made.id, ApprovalDecision::expired())
+        .await;
+    let response: Option<String> = f
+        .raw()
+        .query_row(
+            "SELECT response FROM approval WHERE id = ?1",
+            [made.id.as_str()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        (
+            first.value.status,
+            first.value.decided_by,
+            first.value.decided_by_ref.as_deref(),
+            first.value.message.as_deref(),
+            first.value.decided_at.is_some(),
+            response.as_deref(),
+            first.events.len(),
+            f.broadcast().len(),
+        ),
+        (
+            ApprovalStatus::Denied,
+            Some(DecidedBy::User),
+            Some("inbox"),
+            Some("not now"),
+            true,
+            Some(r#"{"message":"not now"}"#),
+            1,
+            1,
+        )
+    );
+    assert_eq!(
+        first.events[0].kind,
+        EventKind::ApprovalDecided {
+            approval_id: made.id.clone(),
+            status: ApprovalStatus::Denied,
+            decided_by: Some(DecidedBy::User),
+            decided_by_ref: Some("inbox".into()),
+            message: Some("not now".into()),
+        }
+    );
+    assert!(
+        matches!(second, Err(StoreError::ApprovalNotPending(ref e)) if e.status == ApprovalStatus::Denied),
+        "{second:?}"
+    );
+    let unknown = f
+        .store
+        .decide_approval(Actor::User, &ApprovalId::new(), ApprovalDecision::expired())
+        .await;
+    assert_eq!(unknown.unwrap_err(), StoreError::NotFound);
+}
+
+#[tokio::test]
+async fn terminal_and_engine_decisions_should_store_who_and_where_as_the_spec_says() {
+    let f = Fixture::new();
+    let (_, _, run) = live_run(&f, "a").await;
+    let decide = |id: ApprovalId, d: ApprovalDecision| {
+        let store = &f.store;
+        async move {
+            store
+                .decide_approval(Actor::User, &id, d)
+                .await
+                .unwrap()
+                .value
+        }
+    };
+    let approved = decide(
+        approval(&f, &run, "a").await.id,
+        ApprovalDecision::by_user(true, DECIDED_IN_TERMINAL, None),
+    )
+    .await;
+    let expired = decide(
+        approval(&f, &run, "b").await.id,
+        ApprovalDecision::expired(),
+    )
+    .await;
+    let raw = f.raw();
+    let response = |id: &ApprovalId| -> Option<String> {
+        raw.query_row(
+            "SELECT response FROM approval WHERE id = ?1",
+            [id.as_str()],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        (
+            (
+                approved.status,
+                approved.decided_by,
+                approved.decided_by_ref.as_deref()
+            ),
+            response(&approved.id).as_deref(),
+            (
+                expired.status,
+                expired.decided_by,
+                expired.decided_by_ref.as_deref()
+            ),
+            response(&expired.id),
+        ),
+        (
+            (
+                ApprovalStatus::Approved,
+                Some(DecidedBy::User),
+                Some("terminal")
+            ),
+            Some("{}"),
+            (ApprovalStatus::Expired, None, None),
+            None,
+        )
+    );
+}
+
+#[tokio::test]
+async fn cancel_should_end_only_that_runs_pending_approvals_and_expire_should_end_all() {
+    let mut f = Fixture::new();
+    let (_, _, one) = live_run(&f, "a").await;
+    let (_, _, two) = live_run(&f, "b").await;
+    let a1 = approval(&f, &one, "a1").await;
+    let a2 = approval(&f, &one, "a2").await;
+    let done = approval(&f, &one, "done").await;
+    let b1 = approval(&f, &two, "b1").await;
+    f.store
+        .decide_approval(
+            Actor::User,
+            &done.id,
+            ApprovalDecision::by_user(true, DECIDED_IN_INBOX, None),
+        )
+        .await
+        .unwrap();
+    f.broadcast();
+    let cancelled = f
+        .store
+        .cancel_pending_approvals(Actor::Engine, &one, Some("run stopped".into()))
+        .await
+        .unwrap();
+    let expired = f.store.expire_pending_approvals().await.unwrap();
+    let again = f.store.expire_pending_approvals().await.unwrap();
+    let ids = |c: &[Approval]| c.iter().map(|a| a.id.clone()).collect::<Vec<_>>();
+    let event_ids = |c: &[Event]| {
+        c.iter()
+            .map(|e| match &e.kind {
+                EventKind::ApprovalDecided { approval_id, .. } => approval_id.clone(),
+                other => panic!("{other:?}"),
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        (
+            ids(&cancelled.value),
+            event_ids(&cancelled.events),
+            cancelled.value[0].message.as_deref(),
+            cancelled.value[0].status,
+            ids(&expired.value),
+            expired.value[0].status,
+            again.value.len(),
+            f.broadcast().len(),
+        ),
+        (
+            vec![a1.id.clone(), a2.id.clone()],
+            vec![a1.id, a2.id],
+            Some("run stopped"),
+            ApprovalStatus::Cancelled,
+            vec![b1.id],
+            ApprovalStatus::Expired,
+            0,
+            3,
+        )
+    );
+}
+
+#[tokio::test]
+async fn list_approvals_should_filter_and_keyset_page_in_request_order() {
+    let f = Fixture::new();
+    let (_, _, one) = live_run(&f, "a").await;
+    let (_, _, two) = live_run(&f, "b").await;
+    let mut made = Vec::new();
+    for i in 0..5 {
+        let run = if i % 2 == 0 { &one } else { &two };
+        made.push(approval(&f, run, &format!("a{i}")).await);
+    }
+    f.store
+        .decide_approval(Actor::Engine, &made[4].id, ApprovalDecision::expired())
+        .await
+        .unwrap();
+    let list = |status, run: Option<&RunId>, after: Option<Keyset>, limit| {
+        let store = &f.store;
+        let filter = ApprovalFilter {
+            status,
+            run_id: run.cloned(),
+        };
+        async move {
+            store
+                .list_approvals(filter, ListQuery { after, limit })
+                .await
+                .unwrap()
+        }
+    };
+    let summaries =
+        |items: &[Approval]| items.iter().map(|a| a.summary.clone()).collect::<Vec<_>>();
+    let first = list(ApprovalStatus::Pending, None, None, 2).await;
+    let second = list(ApprovalStatus::Pending, None, first.next.clone(), 2).await;
+    let of_one = list(ApprovalStatus::Pending, Some(&one), None, 0).await;
+    let expired = list(ApprovalStatus::Expired, None, None, 0).await;
+    let none = list(ApprovalStatus::Denied, None, None, 0).await;
+    assert_eq!(
+        (
+            summaries(&first.items),
+            first.next,
+            summaries(&second.items),
+            second.next,
+            summaries(&of_one.items),
+            summaries(&expired.items),
+            none.items.len(),
+            none.next,
+        ),
+        (
+            vec!["a0".to_owned(), "a1".to_owned()],
+            Some(Keyset {
+                at: made[1].requested_at,
+                id: made[1].id.to_string()
+            }),
+            vec!["a2".to_owned(), "a3".to_owned()],
+            None,
+            vec!["a0".to_owned(), "a2".to_owned()],
+            vec!["a4".to_owned()],
+            0,
+            None,
+        )
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_task_should_take_its_runs_approvals_with_it() {
+    let f = Fixture::new();
+    let (t, _, run) = live_run(&f, "a").await;
+    approval(&f, &run, "a").await;
+    f.walk(&run, &[RunStatus::Stopped]).await;
+    f.store.archive_task(Actor::User, &t).await.unwrap();
+    f.store.delete_task(&t).await.unwrap();
+    assert_eq!(rows(&f.raw(), "approval"), 0);
 }

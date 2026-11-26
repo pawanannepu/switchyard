@@ -30,10 +30,20 @@ spec [0002](../specs/0002-data-model/index.md) · code in `crates/sy-core/`, `cr
 - [x] Review it (fresh model): `/check review data model`
 - [x] Document it: `/document data model`
 
-### 4. Agent adapter contract & fake agent · needs a decision
+### 4. Agent adapter contract & fake agent · in-progress
 The one interface every agent plugs into: detect, launch through its official CLI, stream output, report status, relay approvals, stop. Plus a fake agent that tests drive.
 **Done when:** an adapter covers detection, launch, streaming, the four statuses (running, waiting for input, finished, failed), approval requests and stopping; adding an adapter needs no core change; no adapter ever reads, stores or reuses login tokens; a scriptable fake agent runs orchestration tests fast and deterministically. (basis: your modularity requirement; decide the interface before its first implementation)
-- [ ] Design it (spec): `/architect agent adapter contract & fake agent`
+spec [0003](../specs/0003-agent-adapter-contract-fake-agent/index.md) · code in `crates/sy-adapter-api/`, `crates/sy-core/src/agents/`, `crates/sy-infra/src/agents/`, `crates/sy-adapters/`, `crates/sy-fake-agent/`, `crates/sy-signal/`, `crates/sy-daemon/`
+- [x] Design it (spec): `/architect agent adapter contract & fake agent`
+- [x] Build it: `/develop agent adapter contract & fake agent`
+  - [x] A fake run through a real PTY end to end: contract, ports, launcher, fake agent, `dev.agent_run`, `run.stop` (AC-1, AC-2, AC-4, AC-5, AC-6, AC-12, AC-13, AC-14, AC-17)
+  - [x] The signal side channel: `sy-signal`, `signal.hook`, limits, events and session ref, pattern fallback (AC-6, AC-7, AC-8, AC-17)
+  - [x] Approvals: migration 2, the store, `approval.*`, holds, races and run end order (AC-6, AC-9, AC-10, AC-11, AC-12, AC-17)
+  - [x] Detection, login environment and release gates: `agent.list`/`agent.detect`, `env.refresh`, Claude detection, bundling `sy-signal` (AC-2, AC-3, AC-14, AC-15, AC-16)
+- [x] Verify it: `/check verify agent adapter contract & fake agent`
+- [x] Test it: `/test agent adapter contract & fake agent`
+- [x] Review it (fresh model): `/check review agent adapter contract & fake agent`
+- [x] Document it: `/document agent adapter contract & fake agent`
 
 ### 5. Agent process supervisor · needs a decision
 Runs each agent in its own process with its own terminal, outside the UI, and keeps a crashed, hung or runaway agent from affecting anything else.

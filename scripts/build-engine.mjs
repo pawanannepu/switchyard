@@ -1,5 +1,7 @@
-// Builds switchyardd and places it where Tauri's `externalBin` expects it:
-// apps/desktop/src-tauri/binaries/switchyardd-<target triple>.
+// Builds switchyardd and its hook helper sy-signal (spec 0003) and places them
+// where Tauri's `externalBin` expects them, so the bundle has both in
+// Contents/MacOS, signed with the same identity:
+// apps/desktop/src-tauri/binaries/<name>-<target triple>.
 //
 //   node scripts/build-engine.mjs                       debug, host target
 //   node scripts/build-engine.mjs --release --universal  both macOS archs, plus the lipo'd universal binary
@@ -29,24 +31,32 @@ const targets = universal ? ["aarch64-apple-darwin", "x86_64-apple-darwin"] : [t
 const outDir = join(root, "apps/desktop/src-tauri/binaries");
 mkdirSync(outDir, { recursive: true });
 
+// sy-fake-agent is dev and test only: never built here, never bundled.
+const binaries = [
+  { pkg: "sy-daemon", bin: "switchyardd", features: devtools ? ["--features", "devtools"] : [] },
+  { pkg: "sy-signal", bin: "sy-signal", features: [] },
+];
+
 const built = [];
-for (const target of targets) {
-  const cargoArgs = ["build", "-p", "sy-daemon", "--bin", "switchyardd", "--target", target];
-  if (release) cargoArgs.push("--release");
-  if (devtools) cargoArgs.push("--features", "devtools");
-  run("cargo", cargoArgs);
-  const src = join(root, "target", target, release ? "release" : "debug", "switchyardd");
-  const dest = join(outDir, `switchyardd-${target}`);
-  copyFileSync(src, dest);
-  chmodSync(dest, 0o755);
-  built.push(dest);
+for (const { pkg, bin, features } of binaries) {
+  const perTarget = [];
+  for (const target of targets) {
+    const cargoArgs = ["build", "-p", pkg, "--bin", bin, "--target", target, ...features];
+    if (release) cargoArgs.push("--release");
+    run("cargo", cargoArgs);
+    const src = join(root, "target", target, release ? "release" : "debug", bin);
+    const dest = join(outDir, `${bin}-${target}`);
+    copyFileSync(src, dest);
+    chmodSync(dest, 0o755);
+    perTarget.push(dest);
+  }
+  built.push(...perTarget);
+  if (universal) {
+    const dest = join(outDir, `${bin}-universal-apple-darwin`);
+    run("lipo", ["-create", "-output", dest, ...perTarget]);
+    built.push(dest);
+  }
 }
 
-if (universal) {
-  const dest = join(outDir, "switchyardd-universal-apple-darwin");
-  run("lipo", ["-create", "-output", dest, ...built]);
-  built.push(dest);
-}
-
-console.log(`switchyardd (${release ? "release" : "debug"}${devtools ? ", devtools" : ""}):`);
+console.log(`switchyardd and sy-signal (${release ? "release" : "debug"}${devtools ? ", devtools" : ""}):`);
 for (const path of built) console.log(`  ${path}`);

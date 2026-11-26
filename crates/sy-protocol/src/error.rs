@@ -9,7 +9,9 @@
 //! | -32030 .. -32039 | task     |
 //! | -32040 .. -32049 | run      |
 //! | -32050 .. -32059 | storage  |
-//! | -32060 .. -32089 | reserved |
+//! | -32060 .. -32069 | agent    |
+//! | -32070 .. -32079 | approval |
+//! | -32080 .. -32089 | signal   |
 //! | -32090 .. -32099 | host (app host and dev bridge, never the engine) |
 
 macro_rules! error_codes {
@@ -60,6 +62,10 @@ error_codes! {
     HelloRequired = -32000,
     /// `session.hello` was answered, but the protocol majors differ.
     IncompatibleProtocol = -32001,
+    /// This kind of connection may not call that method (a `signal`
+    /// connection calling anything but `signal.hook` and the stable methods,
+    /// or another client calling `signal.hook`).
+    NotAllowedForClient = -32002,
 
     // engine
     /// The engine is draining and refuses new work.
@@ -76,6 +82,8 @@ error_codes! {
     InputBusy = -32042,
     /// The run's log was trimmed or deleted, or its file vanished.
     RunLogUnavailable = -32043,
+    /// The run already ended, so there is nothing to stop.
+    RunNotLive = -32044,
 
     // storage
     /// Storage is in a failed open state (newer schema, corrupt or unavailable);
@@ -85,6 +93,27 @@ error_codes! {
     StorageRecoverNotNeeded = -32051,
     /// `storage.recover` with `restore_backup`, but no backup passes its check.
     BackupMissing = -32052,
+
+    // agent
+    /// No registered agent adapter has that id.
+    AgentNotFound = -32060,
+    /// The agent's adapter can't launch runs (it does detection only).
+    AgentLaunchUnsupported = -32061,
+
+    // approval
+    /// No approval has that id.
+    ApprovalNotFound = -32070,
+    /// The approval already left `pending` (answered, expired when the
+    /// agent's own hook timed out, or cancelled when its run ended).
+    ApprovalNotPending = -32071,
+
+    // signal
+    /// The signal token names no live run (unknown, or revoked when its run ended).
+    SignalTokenUnknown = -32080,
+    /// A hook payload (stdin plus arguments) over 262144 bytes.
+    SignalPayloadTooLarge = -32081,
+    /// The run's hook calls are over 100 per second (burst 500); its reports were dropped.
+    SignalRateLimited = -32082,
 
     // host
     /// The app host (or dev bridge) has no engine connection right now.

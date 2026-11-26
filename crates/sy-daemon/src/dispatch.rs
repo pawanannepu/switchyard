@@ -6,19 +6,29 @@ use base64::Engine as _;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
+use sy_adapter_api::HookCall;
+use sy_core::agents::{HookError, RespondError, StopError, StoreWrites};
+use sy_core::ids::ApprovalId;
+use sy_core::model::{APPROVAL_MESSAGE_BYTES, ApprovalStatus};
+use sy_core::ports::{ApprovalFilter, Keyset, ListQuery};
 use sy_core::ports::{Store, StoreError};
 use sy_core::run_logs::{LogReadError, read_run_log};
 use sy_core::runs::{RunControl, RunError, RunId};
 use sy_protocol::{
-    Empty, EngineInfo, ErrorCode, EventSinceParams, EventSinceResult, HelloParams, HelloResult,
-    MAX_INPUT_BYTES, MAX_LOG_READ_BYTES, Message, PROTOCOL, RpcError, RunAttachParams,
-    RunAttachResult, RunInputParams, RunLogReadParams, RunLogReadResult, RunResizeParams,
-    StorageRecoverParams, StorageRecoverResult, envelope::ParseFailure, methods, response_line,
+    AgentDetectParams, AgentListResult, ApprovalListParams, ApprovalListResult,
+    ApprovalRespondParams, ApprovalRespondResult, ApprovalVerdict, ClientKind, Empty, EngineInfo,
+    EnvRefreshResult, ErrorCode, EventSinceParams, EventSinceResult, HelloParams, HelloResult,
+    MAX_INPUT_BYTES, MAX_LOG_READ_BYTES, MAX_SIGNAL_PAYLOAD_BYTES, Message, PROTOCOL, RpcError,
+    RunAttachParams, RunAttachResult, RunInputParams, RunLogReadParams, RunLogReadResult,
+    RunResizeParams, RunStopParams, SignalHookParams, SignalHookResult, StorageRecoverParams,
+    StorageRecoverResult, envelope::ParseFailure, methods, response_line,
 };
+use tokio::task::JoinHandle;
 
 use crate::ENGINE_VERSION;
 use crate::engine::{ClientSink, ClientSinkHandle, Engine};
 use crate::lifecycle::ExitReason;
+use crate::outbox::Outbox;
 use crate::storage::RecoverError;
 use crate::wire;
 
@@ -33,7 +43,21 @@ pub enum Session {
 pub struct ConnectionCtx {
     pub id: u64,
     pub session: Session,
+    /// Said hello as a `signal` client (`sy-signal`): only the stable
+    /// methods and `signal.hook`, and no notifications. Sticky.
+    pub signal: bool,
     pub sink: Arc<ClientSink>,
+    /// Where responses answered later (`signal.hook`) are queued.
+    pub outbox: Arc<Outbox>,
+    /// The `signal.hook` call under way, answered by its own task.
+    pub hook: Option<JoinHandle<()>>,
+}
+
+impl ConnectionCtx {
+    /// A `signal.hook` call is still waiting for its answer.
+    pub fn hook_open(&self) -> bool {
+        self.hook.as_ref().is_some_and(|h| !h.is_finished())
+    }
 }
 
 /// Handle one line. Returns the response line, if the message wants one.
@@ -47,6 +71,11 @@ pub async fn line(engine: &Arc<Engine>, ctx: &mut ConnectionCtx, text: &str) -> 
             &id,
             &Err(RpcError::new(ErrorCode::InvalidRequest, reason)),
         )),
+        Ok(Message::Request { id, method, params }) if method == methods::SIGNAL_HOOK => {
+            signal_hook(engine, ctx, &id, params)
+                .err()
+                .map(|err| response_line(&id, &Err(err)))
+        }
         Ok(Message::Request { id, method, params }) => Some(response_line(
             &id,
             &request(engine, ctx, &method, params).await,
@@ -88,8 +117,8 @@ fn storage_unavailable() -> RpcError {
     )
 }
 
-/// A store failure on a read. Feature 8 gives the write side's variants their own codes.
-fn store_error(err: &StoreError) -> RpcError {
+/// A store failure. Feature 8 gives the write side's variants their own codes.
+pub fn store_error(err: &StoreError) -> RpcError {
     match err {
         StoreError::Unavailable => storage_unavailable(),
         other => RpcError::new(ErrorCode::InternalError, other.to_string()),
@@ -188,18 +217,176 @@ async fn event_since(engine: &Arc<Engine>, p: EventSinceParams) -> Result<Value,
     })
 }
 
+/// `approval.list` (AC-11).
+async fn approval_list(engine: &Arc<Engine>, p: ApprovalListParams) -> Result<Value, RpcError> {
+    let invalid = |m: &str| RpcError::new(ErrorCode::InvalidParams, m.to_owned());
+    let after = p
+        .after
+        .map(|cursor| {
+            ApprovalId::parse(&cursor.id.0)
+                .map(|id| Keyset {
+                    at: cursor.requested_at,
+                    id: id.to_string(),
+                })
+                .map_err(|_| invalid("after.id is not an approval id"))
+        })
+        .transpose()?;
+    // A run id that isn't one names no run, so nothing matches.
+    let run_id = match p.run_id {
+        Some(run) => Some(RunId::parse(&run.0).map_err(|_| invalid("run_id is not a run id"))?),
+        None => None,
+    };
+    let filter = ApprovalFilter {
+        status: p
+            .status
+            .map_or(ApprovalStatus::Pending, wire::core_approval_status),
+        run_id,
+    };
+    let page = store(engine)?
+        .list_approvals(
+            filter,
+            ListQuery {
+                after,
+                limit: p.limit.unwrap_or(0),
+            },
+        )
+        .await
+        .map_err(|e| store_error(&e))?;
+    ok(&ApprovalListResult {
+        next: page.items.last().map(|a| sy_protocol::ApprovalCursor {
+            requested_at: a.requested_at,
+            id: wire::approval_id(&a.id),
+        }),
+        has_more: page.next.is_some(),
+        approvals: page.items.iter().map(wire::approval).collect(),
+    })
+}
+
+/// `approval.respond` (AC-10): decided on the run's driver, first change wins.
+async fn approval_respond(
+    engine: &Arc<Engine>,
+    p: ApprovalRespondParams,
+) -> Result<Value, RpcError> {
+    if p.message
+        .as_ref()
+        .is_some_and(|m| m.len() > APPROVAL_MESSAGE_BYTES)
+    {
+        return Err(RpcError::new(
+            ErrorCode::InvalidParams,
+            format!("message is over {APPROVAL_MESSAGE_BYTES} bytes"),
+        ));
+    }
+    let not_found = || {
+        RpcError::new(
+            ErrorCode::ApprovalNotFound,
+            format!("no approval {}", p.approval_id.0),
+        )
+    };
+    let id = ApprovalId::parse(&p.approval_id.0).map_err(|_| not_found())?;
+    let writes = StoreWrites(store(engine)?);
+    let approval = engine
+        .agents
+        .respond(
+            &writes,
+            &id,
+            p.decision == ApprovalVerdict::Approve,
+            p.message.clone(),
+        )
+        .await
+        .map_err(|err| match err {
+            RespondError::NotFound => not_found(),
+            RespondError::NotPending => RpcError::new(
+                ErrorCode::ApprovalNotPending,
+                format!(
+                    "approval {} is no longer pending (answered, expired or cancelled)",
+                    p.approval_id.0
+                ),
+            ),
+            RespondError::Store(e) => store_error(&e),
+        })?;
+    ok(&ApprovalRespondResult {
+        approval: wire::approval(&approval),
+    })
+}
+
 /// A wire run id as a typed id. Text that isn't a run id names no run.
 fn core_run_id(id: &sy_protocol::RunId) -> Result<RunId, RpcError> {
     RunId::parse(&id.0)
         .map_err(|_| RpcError::new(ErrorCode::RunNotFound, format!("no run {}", id.0)))
 }
 
-async fn request(
+fn hook_error(err: HookError) -> RpcError {
+    match err {
+        HookError::TokenUnknown => RpcError::new(
+            ErrorCode::SignalTokenUnknown,
+            "the signal token names no live run",
+        ),
+        HookError::RateLimited => RpcError::new(
+            ErrorCode::SignalRateLimited,
+            "too many hook calls for this run; its reports were dropped",
+        ),
+        HookError::Fallback(message) => RpcError::new(ErrorCode::InternalError, message),
+    }
+}
+
+/// `signal.hook` (AC-7). Checked here, then answered by a task, so the
+/// connection keeps reading while the call is open and notices at once when
+/// the helper goes away (the server then aborts the task). `Ok` means the
+/// answer comes later.
+fn signal_hook(
     engine: &Arc<Engine>,
     ctx: &mut ConnectionCtx,
-    method: &str,
+    id: &Value,
     raw: Value,
-) -> Result<Value, RpcError> {
+) -> Result<(), RpcError> {
+    gate(engine, ctx, methods::SIGNAL_HOOK)?;
+    if !ctx.signal {
+        return Err(RpcError::new(
+            ErrorCode::NotAllowedForClient,
+            "signal.hook is only for signal connections (sy-signal)",
+        ));
+    }
+    if ctx.hook_open() {
+        return Err(RpcError::new(
+            ErrorCode::InvalidRequest,
+            "a signal connection carries one signal.hook at a time",
+        ));
+    }
+    let p: SignalHookParams = params(raw)?;
+    let stdin = base64::engine::general_purpose::STANDARD
+        .decode(p.stdin_b64.as_bytes())
+        .map_err(|e| RpcError::new(ErrorCode::InvalidParams, format!("stdin_b64: {e}")))?;
+    let size = stdin.len() + p.args.iter().map(String::len).sum::<usize>();
+    if size > MAX_SIGNAL_PAYLOAD_BYTES {
+        return Err(RpcError::new(
+            ErrorCode::SignalPayloadTooLarge,
+            format!("a {size} byte hook payload is over the {MAX_SIGNAL_PAYLOAD_BYTES} byte limit"),
+        ));
+    }
+    let agents = Arc::clone(&engine.agents);
+    let outbox = Arc::clone(&ctx.outbox);
+    let id = id.clone();
+    ctx.hook = Some(tokio::spawn(async move {
+        let call = HookCall {
+            hook: p.hook,
+            args: p.args,
+            stdin,
+        };
+        let outcome = match agents.hook(&p.token, call).await {
+            Ok(reply) => ok(&SignalHookResult {
+                stdout_b64: base64::engine::general_purpose::STANDARD.encode(&reply.stdout),
+                exit_code: reply.exit_code,
+            }),
+            Err(err) => Err(hook_error(err)),
+        };
+        outbox.push(response_line(&id, &outcome));
+    }));
+    Ok(())
+}
+
+/// The checks every request passes before its method runs: shutdown, hello,
+/// the client kind, and degraded storage.
+fn gate(engine: &Engine, ctx: &ConnectionCtx, method: &str) -> Result<(), RpcError> {
     if engine.lifecycle.is_exiting() && method != methods::ENGINE_INFO {
         return Err(RpcError::new(
             ErrorCode::EngineShuttingDown,
@@ -222,12 +409,28 @@ async fn request(
                 ));
             }
         }
+        // A signal connection relays hook calls and nothing else (AC-7).
+        if ctx.signal && method != methods::SIGNAL_HOOK {
+            return Err(RpcError::new(
+                ErrorCode::NotAllowedForClient,
+                format!("a signal connection may not call {method}"),
+            ));
+        }
         // Degraded storage mode (AC-3): only the stable methods and the way out.
         if method != methods::STORAGE_RECOVER && engine.storage.is_failed() {
             return Err(storage_unavailable());
         }
     }
+    Ok(())
+}
 
+async fn request(
+    engine: &Arc<Engine>,
+    ctx: &mut ConnectionCtx,
+    method: &str,
+    raw: Value,
+) -> Result<Value, RpcError> {
+    gate(engine, ctx, method)?;
     match method {
         methods::SESSION_HELLO => {
             let hello: HelloParams = params(raw)?;
@@ -237,7 +440,9 @@ async fn request(
             } else {
                 Session::Incompatible
             };
-            engine.set_hello(ctx.id, compatible);
+            ctx.signal |= hello.client == ClientKind::Signal;
+            // A signal connection gets no notifications.
+            engine.set_hello(ctx.id, compatible && !ctx.signal);
             tracing::info!(
                 connection = ctx.id,
                 client = ?hello.client,
@@ -260,11 +465,12 @@ async fn request(
                 protocol: PROTOCOL,
                 running_agents: u32::try_from(engine.hub.len()).unwrap_or(u32::MAX),
                 storage: Some(engine.storage.info()),
+                login_env: engine.login.current().as_deref().map(wire::login_env),
             })
         }
         methods::ENGINE_DRAIN => {
             let _: Empty = params(raw)?;
-            engine.lifecycle.drain(&engine.hub);
+            engine.lifecycle.drain(engine.agents.watch_live());
             ok(&Empty {})
         }
         methods::ENGINE_SHUTDOWN => {
@@ -322,24 +528,74 @@ async fn request(
                 .map_err(|e| run_error(e, &run))?;
             ok(&Empty {})
         }
+        methods::RUN_STOP => {
+            let p: RunStopParams = params(raw)?;
+            let run = core_run_id(&p.run_id)?;
+            let writes = StoreWrites(store(engine)?);
+            engine
+                .agents
+                .stop(&writes, &run)
+                .await
+                .map_err(|err| match err {
+                    StopError::NotFound => {
+                        RpcError::new(ErrorCode::RunNotFound, format!("no run {run}"))
+                    }
+                    StopError::NotLive => {
+                        RpcError::new(ErrorCode::RunNotLive, format!("run {run} already ended"))
+                    }
+                    StopError::Store(e) => store_error(&e),
+                })?;
+            ok(&Empty {})
+        }
         methods::RUN_LOG_READ => log_read(engine, params(raw)?).await,
         methods::EVENT_SINCE => event_since(engine, params(raw)?).await,
+        methods::AGENT_LIST => {
+            let _: Empty = params(raw)?;
+            ok(&AgentListResult {
+                agents: engine.detector.list().iter().map(wire::agent).collect(),
+            })
+        }
+        methods::AGENT_DETECT => {
+            let p: AgentDetectParams = params(raw)?;
+            if let Some(id) = &p.agent_id
+                && engine.agents.adapters().get(id).is_none()
+            {
+                return Err(RpcError::new(
+                    ErrorCode::AgentNotFound,
+                    format!("no agent adapter {id}"),
+                ));
+            }
+            engine.detector.detect().await;
+            ok(&AgentListResult {
+                agents: engine
+                    .detector
+                    .list()
+                    .iter()
+                    .filter(|a| p.agent_id.as_ref().is_none_or(|id| &a.id == id))
+                    .map(wire::agent)
+                    .collect(),
+            })
+        }
+        methods::ENV_REFRESH => {
+            let _: Empty = params(raw)?;
+            let captured = engine.login.refresh().await;
+            engine.detector.spawn();
+            ok(&EnvRefreshResult {
+                login_env: wire::login_env(&captured),
+            })
+        }
+        methods::APPROVAL_LIST => approval_list(engine, params(raw)?).await,
+        methods::APPROVAL_RESPOND => approval_respond(engine, params(raw)?).await,
         methods::STORAGE_RECOVER => storage_recover(engine, params(raw)?).await,
         #[cfg(feature = "devtools")]
-        methods::DEV_SYNTHETIC_RUN => {
+        methods::DEV_AGENT_RUN => {
             if engine.lifecycle.is_draining() {
                 return Err(RpcError::new(
                     ErrorCode::EngineDraining,
                     "the engine is draining and takes no new runs",
                 ));
             }
-            let p: sy_protocol::SyntheticRunParams = params(raw)?;
-            ok(&crate::dev::synthetic_run(engine, &p).await?)
-        }
-        #[cfg(feature = "devtools")]
-        methods::DEV_STOP_RUNS => {
-            let _: Empty = params(raw)?;
-            ok(&crate::dev::stop_runs(engine).await?)
+            ok(&crate::dev::agent_run(engine, params(raw)?).await?)
         }
         other => Err(RpcError::new(
             ErrorCode::MethodNotFound,

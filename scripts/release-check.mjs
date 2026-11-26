@@ -53,9 +53,11 @@ check(
 
 const mainExe = join(app, "Contents/MacOS", plistValue("CFBundleExecutable"));
 const engine = join(app, "Contents/MacOS/switchyardd");
+const signal = join(app, "Contents/MacOS/sy-signal");
 for (const [label, bin] of [
   ["app", mainExe],
   ["switchyardd", engine],
+  ["sy-signal", signal],
 ]) {
   if (!existsSync(bin)) {
     fail(`${label} binary missing at ${bin}`);
@@ -79,7 +81,14 @@ const signing = (bin) => {
 };
 const appSig = signing(app);
 const engineSig = signing(engine);
+const signalSig = existsSync(signal) ? signing(signal) : { signed: false, team: "missing" };
 check(appSig.signed && engineSig.signed, "app and engine are signed", "app or engine is not signed");
+check(signalSig.signed, "sy-signal is signed", "sy-signal is not signed");
+check(
+  signalSig.team === engineSig.team,
+  "sy-signal has the engine's signing identity",
+  `Team IDs: sy-signal ${signalSig.team}, engine ${engineSig.team}`,
+);
 check(engineSig.runtime, "engine has the hardened runtime", "engine lacks the hardened runtime");
 check(appSig.runtime, "app has the hardened runtime", "app lacks the hardened runtime");
 if (appSig.team !== "not set" && appSig.team === engineSig.team) pass(`app and engine share Team ID ${appSig.team}`);
@@ -93,14 +102,18 @@ const found = [];
 const walk = (dir) => {
   for (const entry of readdirSync(dir)) {
     const path = join(dir, entry);
-    if (entry.includes("devbridge")) found.push(path);
+    if (entry.includes("devbridge") || entry.includes("fake-agent")) found.push(path);
     if (statSync(path, { throwIfNoEntry: false })?.isDirectory()) walk(path);
   }
 };
 walk(app);
-check(found.length === 0, "no sy-devbridge in the bundle", `dev bridge in bundle: ${found.join(", ")}`);
+check(
+  found.length === 0,
+  "no sy-devbridge or sy-fake-agent in the bundle",
+  `dev only binaries in bundle: ${found.join(", ")}`,
+);
 
-// The bundled engine must not answer any dev.* method.
+// The bundled engine must not answer any dev.* method, nor list the fake agent.
 const dataDir = mkdtempSync("/tmp/sy-rc-");
 const child = spawn(engine, [], { env: { ...process.env, SWITCHYARD_DATA_DIR: dataDir }, stdio: "ignore" });
 const socket = join(dataDir, "engine.sock");
@@ -115,8 +128,8 @@ const probe = () =>
     const send = (id, method, params) => conn.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
     conn.on("connect", () => {
       send(1, "session.hello", { client: "test", client_version: "release-check", protocol: { major: 1, minor: 0 } });
-      send(2, "dev.synthetic_run", { count: 1, bytes_per_sec: 0, echo: false });
-      send(3, "dev.stop_runs", {});
+      send(2, "dev.agent_run", { agent_id: "fake" });
+      send(3, "agent.list", {});
       send(4, "engine.shutdown", {});
     });
     conn.on("data", (chunk) => {
@@ -138,11 +151,17 @@ const probe = () =>
 
 try {
   const replies = await probe();
-  const notFound = [2, 3].every((id) => replies.get(id)?.error?.code === -32601);
+  const notFound = replies.get(2)?.error?.code === -32601;
   check(
     notFound,
     "bundled engine answers no dev.* method",
-    `dev.* answered: ${JSON.stringify([replies.get(2), replies.get(3)])}`,
+    `dev.agent_run answered: ${JSON.stringify(replies.get(2))}`,
+  );
+  const agents = replies.get(3)?.result?.agents?.map((a) => a.id);
+  check(
+    Array.isArray(agents) && !agents.includes("fake"),
+    `bundled engine lists no fake agent (${agents?.join(", ")})`,
+    `agent.list answered: ${JSON.stringify(replies.get(3))}`,
   );
 } catch (err) {
   fail(`could not probe the bundled engine: ${err.message}`);

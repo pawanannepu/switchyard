@@ -60,14 +60,33 @@ function readBridgeLine(bridge: ChildProcess): Promise<{ port: number; token: st
 }
 
 export default async function globalSetup() {
-  execFileSync("cargo", ["build", "-q", "-p", "sy-daemon", "-p", "sy-devbridge", "--features", "sy-daemon/devtools"], {
-    cwd: root,
-    stdio: "inherit",
-  });
+  // sy-signal and sy-fake-agent sit beside switchyardd, where the devtools engine looks for them.
+  execFileSync(
+    "cargo",
+    [
+      "build",
+      "-q",
+      "-p",
+      "sy-daemon",
+      "-p",
+      "sy-devbridge",
+      "-p",
+      "sy-signal",
+      "-p",
+      "sy-fake-agent",
+      "--features",
+      "sy-daemon/devtools",
+    ],
+    {
+      cwd: root,
+      stdio: "inherit",
+    },
+  );
 
   // Short on purpose: macOS caps socket paths at 104 bytes.
   const dataDir = mkdtempSync("/tmp/sy-");
-  const env = { ...process.env, SWITCHYARD_DATA_DIR: dataDir };
+  // `inherit`: the engine skips your login shell, so the tests don't depend on it.
+  const env = { ...process.env, SWITCHYARD_DATA_DIR: dataDir, SWITCHYARD_LOGIN_ENV: "inherit" };
   let engine: ChildProcess | undefined;
   let bridge: ChildProcess | undefined;
   const teardown = () => {

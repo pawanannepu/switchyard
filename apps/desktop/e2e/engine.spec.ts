@@ -18,7 +18,8 @@ test("shows the engine's hello reply once connected through the bridge", async (
   await openApp(page);
   await expect(page.getByRole("status")).toHaveText(strings.connection.connected);
   await expect(page.getByTestId("engine-version")).toHaveText(/^\d+\.\d+\.\d+/);
-  await expect(page.getByTestId("engine-protocol")).toHaveText("1.0");
+  // `PROTOCOL` in crates/sy-protocol/src/lib.rs (spec 0003 raised the minor).
+  await expect(page.getByTestId("engine-protocol")).toHaveText("1.1");
   await expect(page.getByTestId("engine-pid")).toHaveText(/^\d+$/);
 });
 

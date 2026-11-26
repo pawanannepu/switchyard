@@ -7,7 +7,9 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{ProjectId, RunId, TaskId, WorkspaceId};
+use sy_adapter_api::serde_json;
+
+use crate::ids::{ApprovalId, ProjectId, RunId, TaskId, WorkspaceId};
 
 /// A JSON value: a setting's value, stored in a JSON column and carried in
 /// setting events. `sy-core` takes no JSON library (spec 0001's crate table),
@@ -881,6 +883,31 @@ pub enum EventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         from_path: Option<String>,
     },
+    /// A run asked for your permission (spec 0003).
+    ApprovalRequested {
+        /// The approval.
+        approval_id: ApprovalId,
+        /// What it asks for.
+        kind: ApprovalKind,
+        /// One line for people.
+        summary: String,
+    },
+    /// An approval left `pending` (spec 0003).
+    ApprovalDecided {
+        /// The approval.
+        approval_id: ApprovalId,
+        /// Its end state.
+        status: ApprovalStatus,
+        /// Who decided, for `approved` and `denied`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        decided_by: Option<DecidedBy>,
+        /// Where they decided (`inbox`, `terminal`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        decided_by_ref: Option<String>,
+        /// The decision's message, if any.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
 }
 
 impl EventKind {
@@ -939,6 +966,226 @@ impl From<AdapterEvent> for EventKind {
             },
         }
     }
+}
+
+// ---- approvals (spec 0003) ----
+
+text_enum!(
+    /// What an approval asks for (the `ApprovalDetail` variant).
+    ApprovalKind {
+        /// Run a command.
+        Command = "command",
+        /// Edit a file.
+        FileEdit = "file_edit",
+        /// Fetch a URL.
+        Fetch = "fetch",
+        /// Call an MCP tool.
+        McpTool = "mcp_tool",
+        /// Anything else.
+        Other = "other",
+    }
+);
+
+text_enum!(
+    /// An approval's state. Every state but `pending` is final.
+    ApprovalStatus {
+        /// Waiting for you.
+        Pending = "pending",
+        /// Allowed.
+        Approved = "approved",
+        /// Refused.
+        Denied = "denied",
+        /// The agent stopped waiting (its hook closed), or the engine restarted.
+        Expired = "expired",
+        /// Its run ended or was stopped first.
+        Cancelled = "cancelled",
+    }
+);
+
+text_enum!(
+    /// Who decided an `approved` or `denied` approval.
+    DecidedBy {
+        /// You, in the inbox or the terminal.
+        User = "user",
+        /// An approval policy (feature 12).
+        Policy = "policy",
+        /// The agent itself.
+        Agent = "agent",
+    }
+);
+
+/// Where you decided: in switchyard's inbox (`approval.respond`).
+pub const DECIDED_IN_INBOX: &str = "inbox";
+/// Where you decided: in the agent's own terminal.
+pub const DECIDED_IN_TERMINAL: &str = "terminal";
+
+/// Most characters of an approval's summary that are kept.
+pub const APPROVAL_SUMMARY_CHARS: usize = 200;
+/// Most bytes of an approval's detail (its JSON text) before `raw` is cut.
+pub const APPROVAL_DETAIL_BYTES: usize = 64 * 1024;
+/// Most bytes of a decision's message.
+pub const APPROVAL_MESSAGE_BYTES: usize = 4 * 1024;
+
+/// A permission request from a run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Approval {
+    /// Its id (`apr_`).
+    pub id: ApprovalId,
+    /// The run that asked.
+    pub run_id: RunId,
+    /// That run's workspace (joined from the run).
+    pub workspace_id: WorkspaceId,
+    /// What it asks for.
+    pub kind: ApprovalKind,
+    /// One line for people, at most [`APPROVAL_SUMMARY_CHARS`].
+    pub summary: String,
+    /// The kind's typed fields plus `raw` (and `raw_truncated` when cut).
+    pub detail: serde_json::Value,
+    /// Its state.
+    pub status: ApprovalStatus,
+    /// When it was asked, Unix ms UTC.
+    pub requested_at: i64,
+    /// When it left `pending`.
+    pub decided_at: Option<i64>,
+    /// Who decided (`approved` and `denied` only).
+    pub decided_by: Option<DecidedBy>,
+    /// Where they decided (`approved` and `denied` only).
+    pub decided_by_ref: Option<String>,
+    /// The decision's message (`response.message`).
+    pub message: Option<String>,
+}
+
+/// An approval to create (`pending`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewApproval {
+    /// Its id.
+    pub id: ApprovalId,
+    /// The run that asks.
+    pub run_id: RunId,
+    /// What it asks for.
+    pub kind: ApprovalKind,
+    /// One line for people (cut to [`APPROVAL_SUMMARY_CHARS`] on create).
+    pub summary: String,
+    /// The kind's typed fields plus `raw`, already cut to fit.
+    pub detail: serde_json::Value,
+}
+
+/// How an approval leaves `pending`. Built only by its constructors, so it
+/// always names an end state with the who and where that state allows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalDecision {
+    status: ApprovalStatus,
+    decided_by: Option<DecidedBy>,
+    decided_by_ref: Option<&'static str>,
+    message: Option<String>,
+}
+
+impl ApprovalDecision {
+    /// You approved (or denied) it, `via` [`DECIDED_IN_INBOX`] or [`DECIDED_IN_TERMINAL`].
+    pub fn by_user(approve: bool, via: &'static str, message: Option<String>) -> Self {
+        Self {
+            status: if approve {
+                ApprovalStatus::Approved
+            } else {
+                ApprovalStatus::Denied
+            },
+            decided_by: Some(DecidedBy::User),
+            decided_by_ref: Some(via),
+            message,
+        }
+    }
+
+    /// The agent stopped waiting, or the engine restarted.
+    pub const fn expired() -> Self {
+        Self {
+            status: ApprovalStatus::Expired,
+            decided_by: None,
+            decided_by_ref: None,
+            message: None,
+        }
+    }
+
+    /// Its run ended or was stopped first, or an answer in the terminal
+    /// couldn't be read.
+    pub const fn cancelled(message: Option<String>) -> Self {
+        Self {
+            status: ApprovalStatus::Cancelled,
+            decided_by: None,
+            decided_by_ref: None,
+            message,
+        }
+    }
+
+    /// The end state.
+    pub const fn status(&self) -> ApprovalStatus {
+        self.status
+    }
+
+    /// Who decided.
+    pub const fn decided_by(&self) -> Option<DecidedBy> {
+        self.decided_by
+    }
+
+    /// Where they decided.
+    pub const fn decided_by_ref(&self) -> Option<&'static str> {
+        self.decided_by_ref
+    }
+
+    /// The message.
+    pub fn message(&self) -> Option<&str> {
+        self.message.as_deref()
+    }
+}
+
+/// The approval already left `pending`; end states never change.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("approval {id} is already {status}")]
+pub struct ApprovalNotPending {
+    /// The approval.
+    pub id: ApprovalId,
+    /// Its end state.
+    pub status: ApprovalStatus,
+}
+
+impl Approval {
+    /// The approval after `decision` at `now`, or why not: an approval
+    /// leaves `pending` exactly once (first change wins).
+    pub fn decide(
+        &self,
+        decision: &ApprovalDecision,
+        now: i64,
+    ) -> Result<Self, ApprovalNotPending> {
+        if self.status != ApprovalStatus::Pending {
+            return Err(ApprovalNotPending {
+                id: self.id.clone(),
+                status: self.status,
+            });
+        }
+        Ok(Self {
+            status: decision.status,
+            decided_at: Some(now),
+            decided_by: decision.decided_by,
+            decided_by_ref: decision.decided_by_ref.map(str::to_owned),
+            message: decision.message.clone(),
+            ..self.clone()
+        })
+    }
+
+    /// The `approval_decided` event kind for this (decided) approval.
+    pub fn decided_event(&self) -> EventKind {
+        EventKind::ApprovalDecided {
+            approval_id: self.id.clone(),
+            status: self.status,
+            decided_by: self.decided_by,
+            decided_by_ref: self.decided_by_ref.clone(),
+            message: self.message.clone(),
+        }
+    }
+}
+
+/// `summary` cut to [`APPROVAL_SUMMARY_CHARS`] characters.
+pub fn cut_summary(summary: &str) -> String {
+    summary.chars().take(APPROVAL_SUMMARY_CHARS).collect()
 }
 
 /// An event about to be journaled.

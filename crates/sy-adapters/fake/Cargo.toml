@@ -1,0 +1,16 @@
+[package]
+name = "sy-adapter-fake"
+description = "switchyard's scripted fake agent adapter, for tests and the load check (devtools builds only)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Rule (spec 0001): sy-adapter-api only (plus general utility crates).
+[dependencies]
+sy-adapter-api.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

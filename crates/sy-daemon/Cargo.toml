@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [features]
 # Dev and test only `dev.*` methods. Release bundles are built without it.
-devtools = ["sy-core/faults"]
+devtools = ["sy-core/faults", "dep:sy-adapter-fake"]
 
 # Rule (spec 0001): anything in the workspace except tauri.
 [dependencies]
@@ -22,6 +22,7 @@ sy-core.workspace = true
 sy-infra.workspace = true
 sy-adapter-api.workspace = true
 sy-adapter-claude.workspace = true
+sy-adapter-fake = { workspace = true, optional = true }
 anyhow.workspace = true
 base64.workspace = true
 futures-util.workspace = true

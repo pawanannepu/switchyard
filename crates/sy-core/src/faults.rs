@@ -10,14 +10,15 @@
 
 use std::sync::Arc;
 
-use crate::ids::{ProjectId, RunId, TaskId, WorkspaceId};
+use crate::ids::{ApprovalId, ProjectId, RunId, TaskId, WorkspaceId};
 use crate::model::{
-    Actor, AdapterEvent, JsonValue, LogState, NewProject, NewRun, NewTask, NewWorkspace, Project,
-    ProjectSettings, Run, RunTransition, Task, Workspace, WorkspaceChange, WorkspaceOutcome,
+    Actor, AdapterEvent, Approval, ApprovalDecision, JsonValue, LogState, NewApproval, NewProject,
+    NewRun, NewTask, NewWorkspace, Project, ProjectSettings, Run, RunTransition, Task, Workspace,
+    WorkspaceChange, WorkspaceOutcome,
 };
 use crate::ports::{
-    Committed, EventFilter, EventPage, ListQuery, LogReconcile, Page, RunFilter, RunLog,
-    RunLogError, RunProcess, Store, StoreError, TrimCandidate,
+    ApprovalFilter, Committed, EventFilter, EventPage, ListQuery, LogReconcile, Page, RunFilter,
+    RunLog, RunLogError, RunProcess, Store, StoreError, TrimCandidate,
 };
 
 /// Whether a fault is on now. Checked on every call.
@@ -303,6 +304,49 @@ impl Store for FaultyStore {
     ) -> Result<Committed<()>, StoreError> {
         self.check()?;
         self.inner.append_event(actor, actor_ref, run, event).await
+    }
+    async fn create_approval(
+        &self,
+        actor: Actor,
+        actor_ref: Option<String>,
+        new: NewApproval,
+    ) -> Result<Committed<Approval>, StoreError> {
+        self.check()?;
+        self.inner.create_approval(actor, actor_ref, new).await
+    }
+    async fn decide_approval(
+        &self,
+        actor: Actor,
+        approval: &ApprovalId,
+        decision: ApprovalDecision,
+    ) -> Result<Committed<Approval>, StoreError> {
+        self.check()?;
+        self.inner.decide_approval(actor, approval, decision).await
+    }
+    async fn get_approval(&self, approval: &ApprovalId) -> Result<Approval, StoreError> {
+        self.inner.get_approval(approval).await
+    }
+    async fn list_approvals(
+        &self,
+        filter: ApprovalFilter,
+        query: ListQuery,
+    ) -> Result<Page<Approval>, StoreError> {
+        self.inner.list_approvals(filter, query).await
+    }
+    async fn cancel_pending_approvals(
+        &self,
+        actor: Actor,
+        run: &RunId,
+        message: Option<String>,
+    ) -> Result<Committed<Vec<Approval>>, StoreError> {
+        self.check()?;
+        self.inner
+            .cancel_pending_approvals(actor, run, message)
+            .await
+    }
+    async fn expire_pending_approvals(&self) -> Result<Committed<Vec<Approval>>, StoreError> {
+        self.check()?;
+        self.inner.expire_pending_approvals().await
     }
     async fn log_total_ended(&self) -> Result<u64, StoreError> {
         self.inner.log_total_ended().await

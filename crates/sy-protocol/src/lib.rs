@@ -16,7 +16,7 @@ pub use error::ErrorCode;
 pub use types::*;
 
 /// The protocol version this build speaks. Majors must match; minors only add things.
-pub const PROTOCOL: ProtocolVersion = ProtocolVersion { major: 1, minor: 0 };
+pub const PROTOCOL: ProtocolVersion = ProtocolVersion { major: 1, minor: 1 };
 
 /// Longest accepted line (one message), in bytes, not counting the newline.
 pub const MAX_LINE_BYTES: usize = 1024 * 1024;
@@ -29,6 +29,10 @@ pub const MAX_REPLAY_BYTES: usize = 2 * 1024 * 1024;
 
 /// Most bytes one `run.log_read` returns (also its default page).
 pub const MAX_LOG_READ_BYTES: usize = 256 * 1024;
+
+/// Largest hook payload `signal.hook` takes (its decoded stdin plus its
+/// arguments), in bytes. `sy-signal` caps its stdin at the same size.
+pub const MAX_SIGNAL_PAYLOAD_BYTES: usize = 256 * 1024;
 
 /// Per client outgoing queue cap in the engine, in bytes.
 pub const CLIENT_QUEUE_BYTES: usize = 8 * 1024 * 1024;

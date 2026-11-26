@@ -16,6 +16,8 @@ pub const RUN_INPUT: &str = "run.input";
 pub const RUN_RESIZE: &str = "run.resize";
 /// Read a page of a run's saved output from its log file.
 pub const RUN_LOG_READ: &str = "run.log_read";
+/// Stop a run: its graceful input, then SIGHUP, then SIGKILL.
+pub const RUN_STOP: &str = "run.stop";
 /// Journal events after a cursor, for history and reconnect catch up.
 pub const EVENT_SINCE: &str = "event.since";
 /// Set a broken database aside and restore the newest backup or start fresh.
@@ -28,10 +30,24 @@ pub const RUN_OUTPUT: &str = "run.output";
 pub const RUN_STATUS: &str = "run.status";
 /// Engine notification: output was dropped for a slow client, so attach again.
 pub const RUN_RESYNC_NEEDED: &str = "run.resync_needed";
-/// Dev only: start fake runs that stream output (and optionally echo input).
-pub const DEV_SYNTHETIC_RUN: &str = "dev.synthetic_run";
-/// Dev only: stop every synthetic run.
-pub const DEV_STOP_RUNS: &str = "dev.stop_runs";
+/// Every registered agent adapter, with its capabilities and last detection.
+pub const AGENT_LIST: &str = "agent.list";
+/// Run a detection pass (or join the running one) and answer when it ends.
+pub const AGENT_DETECT: &str = "agent.detect";
+/// Capture the login environment again, then rerun detection in the background.
+pub const ENV_REFRESH: &str = "env.refresh";
+/// Approvals by state and run, keyset paged.
+pub const APPROVAL_LIST: &str = "approval.list";
+/// Answer a pending approval: approve or deny, with an optional message.
+pub const APPROVAL_RESPOND: &str = "approval.respond";
+/// Engine notification: a run asked for your permission (to every connection after hello).
+pub const APPROVAL_REQUESTED: &str = "approval.requested";
+/// Engine notification: an approval left `pending` (to every connection after hello).
+pub const APPROVAL_DECIDED: &str = "approval.decided";
+/// `sy-signal` only: relay one agent hook call to its run, and get the reply.
+pub const SIGNAL_HOOK: &str = "signal.hook";
+/// Dev only: create fixture rows and launch runs of an agent (the fake agent, usually).
+pub const DEV_AGENT_RUN: &str = "dev.agent_run";
 /// Host notification: the state of the app host's (or dev bridge's) engine connection.
 pub const HOST_CONNECTION: &str = "host.connection";
 
@@ -131,6 +147,7 @@ pub const ALL: &[MethodSpec] = &[
     req(RUN_INPUT, "RunInputParams", "Empty"),
     req(RUN_RESIZE, "RunResizeParams", "Empty"),
     req(RUN_LOG_READ, "RunLogReadParams", "RunLogReadResult"),
+    req(RUN_STOP, "RunStopParams", "Empty"),
     req(EVENT_SINCE, "EventSinceParams", "EventSinceResult"),
     req(
         STORAGE_RECOVER,
@@ -145,11 +162,26 @@ pub const ALL: &[MethodSpec] = &[
         "RunResyncNeeded",
         Direction::EngineToClient,
     ),
-    dev(req(
-        DEV_SYNTHETIC_RUN,
-        "SyntheticRunParams",
-        "SyntheticRunResult",
-    )),
-    dev(req(DEV_STOP_RUNS, "Empty", "StopRunsResult")),
+    req(AGENT_LIST, "Empty", "AgentListResult"),
+    req(AGENT_DETECT, "AgentDetectParams", "AgentListResult"),
+    req(ENV_REFRESH, "Empty", "EnvRefreshResult"),
+    req(APPROVAL_LIST, "ApprovalListParams", "ApprovalListResult"),
+    req(
+        APPROVAL_RESPOND,
+        "ApprovalRespondParams",
+        "ApprovalRespondResult",
+    ),
+    event(
+        APPROVAL_REQUESTED,
+        "ApprovalNotification",
+        Direction::EngineToClient,
+    ),
+    event(
+        APPROVAL_DECIDED,
+        "ApprovalNotification",
+        Direction::EngineToClient,
+    ),
+    req(SIGNAL_HOOK, "SignalHookParams", "SignalHookResult"),
+    dev(req(DEV_AGENT_RUN, "AgentRunParams", "AgentRunResult")),
     event(HOST_CONNECTION, "HostConnection", Direction::HostToClient),
 ];

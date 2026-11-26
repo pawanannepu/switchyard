@@ -8,12 +8,61 @@
  */
 export type Actor = "user" | "engine" | "policy" | "agent";
 /**
+ * Identifies one run (one agent process and its terminal).
+ *
+ * This interface was referenced by `ProtocolCatalog`'s JSON-Schema
+ * via the `definition` "RunId".
+ */
+export type RunId = string;
+/**
+ * Identifies a workspace (one worktree, branch and agent working on a task).
+ *
+ * This interface was referenced by `ProtocolCatalog`'s JSON-Schema
+ * via the `definition` "WorkspaceId".
+ */
+export type WorkspaceId = string;
+/**
+ * Who decided an `approved` or `denied` approval.
+ *
+ * This interface was referenced by `ProtocolCatalog`'s JSON-Schema
+ * via the `definition` "DecidedBy".
+ */
+export type DecidedBy = "user" | "policy" | "agent";
+/**
+ * Identifies an approval (`apr_` plus 32 hex digits).
+ *
+ * This interface was referenced by `ProtocolCatalog`'s JSON-Schema
+ * via the `definition` "ApprovalId".
+ */
+export type ApprovalId = string;
+/**
+ * What an approval asks for.
+ *
+ * This interface was referenced by `ProtocolCatalog`'s JSON-Schema
+ * via the `definition` "ApprovalKind".
+ */
+export type ApprovalKind = "command" | "file_edit" | "fetch" | "mcp_tool" | "other";
+/**
+ * An approval's state. Every state but `pending` is final.
+ *
+ * This interface was referenced by `ProtocolCatalog`'s JSON-Schema
+ * via the `definition` "ApprovalStatus".
+ */
+export type ApprovalStatus = "pending" | "approved" | "denied" | "expired" | "cancelled";
+/**
+ * Your answer to an approval.
+ *
+ * This interface was referenced by `ProtocolCatalog`'s JSON-Schema
+ * via the `definition` "ApprovalVerdict".
+ */
+export type ApprovalVerdict = "approve" | "deny";
+/**
  * Which kind of client is connecting.
  *
  * This interface was referenced by `ProtocolCatalog`'s JSON-Schema
  * via the `definition` "ClientKind".
  */
-export type ClientKind = "desktop" | "cli" | "test";
+export type ClientKind = "desktop" | "cli" | "test" | "signal";
 /**
  * One journal event, as `event.since` returns it.
  *
@@ -62,26 +111,12 @@ export type Event = {
  */
 export type ProjectId = string;
 /**
- * Identifies one run (one agent process and its terminal).
- *
- * This interface was referenced by `ProtocolCatalog`'s JSON-Schema
- * via the `definition` "RunId".
- */
-export type RunId = string;
-/**
  * Identifies a task (the intent: a prompt worked on in one or more workspaces).
  *
  * This interface was referenced by `ProtocolCatalog`'s JSON-Schema
  * via the `definition` "TaskId".
  */
 export type TaskId = string;
-/**
- * Identifies a workspace (one worktree, branch and agent working on a task).
- *
- * This interface was referenced by `ProtocolCatalog`'s JSON-Schema
- * via the `definition` "WorkspaceId".
- */
-export type WorkspaceId = string;
 export type Event1 =
   | {
       kind: "project_created";
@@ -243,7 +278,7 @@ export type Event1 =
          */
         status: "queued" | "starting" | "running" | "waiting_input" | "finished" | "failed" | "stopped" | "lost";
         /**
-         * Its workspace.
+         * Identifies a workspace (one worktree, branch and agent working on a task).
          */
         workspace_id: string;
       };
@@ -298,6 +333,48 @@ export type Event1 =
          * The file's path in the worktree.
          */
         path: string;
+      };
+    }
+  | {
+      kind: "approval_requested";
+      payload: {
+        /**
+         * The approval.
+         */
+        approval_id: string;
+        /**
+         * What it asks for.
+         */
+        kind: "command" | "file_edit" | "fetch" | "mcp_tool" | "other";
+        /**
+         * One line for people.
+         */
+        summary: string;
+      };
+    }
+  | {
+      kind: "approval_decided";
+      payload: {
+        /**
+         * The approval.
+         */
+        approval_id: string;
+        /**
+         * Who decided, for `approved` and `denied`.
+         */
+        decided_by?: DecidedBy | null;
+        /**
+         * Where they decided (`inbox`, `terminal`).
+         */
+        decided_by_ref?: string | null;
+        /**
+         * The decision's message, if any.
+         */
+        message?: string | null;
+        /**
+         * An approval's state. Every state but `pending` is final.
+         */
+        status: "pending" | "approved" | "denied" | "expired" | "cancelled";
       };
     };
 /**
@@ -524,6 +601,48 @@ export type EventPayload =
          */
         path: string;
       };
+    }
+  | {
+      kind: "approval_requested";
+      payload: {
+        /**
+         * The approval.
+         */
+        approval_id: string;
+        /**
+         * What it asks for.
+         */
+        kind: "command" | "file_edit" | "fetch" | "mcp_tool" | "other";
+        /**
+         * One line for people.
+         */
+        summary: string;
+      };
+    }
+  | {
+      kind: "approval_decided";
+      payload: {
+        /**
+         * The approval.
+         */
+        approval_id: string;
+        /**
+         * Who decided, for `approved` and `denied`.
+         */
+        decided_by?: DecidedBy | null;
+        /**
+         * Where they decided (`inbox`, `terminal`).
+         */
+        decided_by_ref?: string | null;
+        /**
+         * The decision's message, if any.
+         */
+        message?: string | null;
+        /**
+         * An approval's state. Every state but `pending` is final.
+         */
+        status: "pending" | "approved" | "denied" | "expired" | "cancelled";
+      };
     };
 /**
  * How a file changed in a `file_changed` event.
@@ -539,6 +658,13 @@ export type FileChange = "added" | "modified" | "deleted" | "renamed";
  * via the `definition` "HostConnectionState".
  */
 export type HostConnectionState = "connecting" | "connected" | "stopped" | "failed" | "incompatible";
+/**
+ * Whether the login shell gave the environment.
+ *
+ * This interface was referenced by `ProtocolCatalog`'s JSON-Schema
+ * via the `definition` "LoginEnvStatus".
+ */
+export type LoginEnvStatus = "ok" | "fallback";
 /**
  * Who wrote a `message` event.
  *
@@ -569,6 +695,20 @@ export type RunKind = "agent" | "setup" | "run_script";
 export type RunStatus =
   "queued" | "starting" | "running" | "waiting_input" | "finished" | "failed" | "stopped" | "lost";
 /**
+ * Whether an agent's CLI is signed in.
+ *
+ * This interface was referenced by `ProtocolCatalog`'s JSON-Schema
+ * via the `definition` "SignedIn".
+ */
+export type SignedIn = "yes" | "no" | "unknown";
+/**
+ * Where an adapter's live status comes from.
+ *
+ * This interface was referenced by `ProtocolCatalog`'s JSON-Schema
+ * via the `definition` "StatusSource".
+ */
+export type StatusSource = "hooks" | "patterns" | "exit_only";
+/**
  * Where local storage stands.
  *
  * This interface was referenced by `ProtocolCatalog`'s JSON-Schema
@@ -591,6 +731,474 @@ export type WorkspaceOutcome = "winner" | "not_chosen";
 export type WorkspaceState = "preparing" | "ready" | "merged" | "discarded";
 
 /**
+ * What an adapter can do.
+ *
+ * This interface was referenced by `ProtocolCatalog`'s JSON-Schema
+ * via the `definition` "AgentCapabilities".
+ */
+export interface AgentCapabilities {
+  /**
+   * It relays permission requests.
+   */
+  approvals: boolean;
+  /**
+   * It reports journal events.
+   */
+  events: boolean;
+  /**
+   * It can launch runs (false for a detection only adapter).
+   */
+  launch: boolean;
+  /**
+   * It can resume a session.
+   */
+  resume: boolean;
+  /**
+   * Where its live status comes from.
+   */
+  status_source: "hooks" | "patterns" | "exit_only";
+}
+/**
+ * `agent.detect` params. Runs a detection pass (or joins the one running)
+ * and answers when it ends.
+ *
+ * This interface was referenced by `ProtocolCatalog`'s JSON-Schema
+ * via the `definition` "AgentDetectParams".
+ */
+export interface AgentDetectParams {
+  /**
+   * Answer with only this agent; every agent when absent.
+   */
+  agent_id?: string | null;
+}
+/**
+ * An agent's last detection: asked of its CLI, never read from its files.
+ *
+ * This interface was referenced by `ProtocolCatalog`'s JSON-Schema
+ * via the `definition` "AgentDetection".
+ */
+export interface AgentDetection {
+  /**
+   * When the detection pass ended, Unix ms UTC.
+   */
+  checked_at: number;
+  /**
+   * A hint for people, when something looks off.
+   */
+  hint?: string | null;
+  /**
+   * Its CLI is on the login `PATH` (or at its absolute path).
+   */
+  installed: boolean;
+  /**
+   * Where its CLI was found.
+   */
+  path?: string | null;
+  /**
+   * Whether it is signed in.
+   */
+  signed_in: "yes" | "no" | "unknown";
+  /**
+   * Its version, when it said.
+   */
+  version?: string | null;
+}
+/**
+ * A registered agent adapter.
+ *
+ * This interface was referenced by `ProtocolCatalog`'s JSON-Schema
+ * via the `definition` "AgentInfo".
+ */
+export interface AgentInfo {
+  capabilities: AgentCapabilities1;
+  /**
+   * Its last detection; absent until the first pass ends.
+   */
+  detection?: AgentDetection | null;
+  /**
+   * Its name for people.
+   */
+  display_name: string;
+  /**
+   * Its id (`claude`, ...).
+   */
+  id: string;
+}
+/**
+ * What it can do.
+ */
+export interface AgentCapabilities1 {
+  /**
+   * It relays permission requests.
+   */
+  approvals: boolean;
+  /**
+   * It reports journal events.
+   */
+  events: boolean;
+  /**
+   * It can launch runs (false for a detection only adapter).
+   */
+  launch: boolean;
+  /**
+   * It can resume a session.
+   */
+  resume: boolean;
+  /**
+   * Where its live status comes from.
+   */
+  status_source: "hooks" | "patterns" | "exit_only";
+}
+/**
+ * `agent.list` and `agent.detect` result, in registration order.
+ *
+ * This interface was referenced by `ProtocolCatalog`'s JSON-Schema
+ * via the `definition` "AgentListResult".
+ */
+export interface AgentListResult {
+  /**
+   * The adapters.
+   */
+  agents: AgentInfo[];
+}
+/**
+ * `dev.agent_run` params: fixture rows plus runs of an agent, usually the
+ * fake agent (`agent_id: "fake"` with `options: { script: [...] }`).
+ *
+ * This interface was referenced by `ProtocolCatalog`'s JSON-Schema
+ * via the `definition` "AgentRunParams".
+ */
+export interface AgentRunParams {
+  /**
+   * The agent adapter to launch.
+   */
+  agent_id: string;
+  /**
+   * Terminal width. Default 120.
+   */
+  cols?: number | null;
+  /**
+   * How many runs to start, one workspace each: 1 to 32, default 1.
+   */
+  count?: number | null;
+  /**
+   * The workspace's `agent_options`. Default `{}`.
+   */
+  options?: {
+    [k: string]: unknown | undefined;
+  };
+  /**
+   * The prompt. Default `""`.
+   */
+  prompt?: string | null;
+  /**
+   * Terminal height. Default 40.
+   */
+  rows?: number | null;
+}
+/**
+ * `dev.agent_run` result.
+ *
+ * This interface was referenced by `ProtocolCatalog`'s JSON-Schema
+ * via the `definition` "AgentRunResult".
+ */
+export interface AgentRunResult {
+  /**
+   * The new runs, ready for `run.attach`. A run that could not launch is
+   * already `failed`, with its reason as the first line of its log.
+   */
+  run_ids: RunId[];
+  /**
+   * The task this call created in the dev fixture project.
+   */
+  task_id: string;
+  /**
+   * One workspace per run, in the same order as `run_ids`.
+   */
+  workspace_ids: WorkspaceId[];
+}
+/**
+ * A permission request from a run.
+ *
+ * This interface was referenced by `ProtocolCatalog`'s JSON-Schema
+ * via the `definition` "Approval".
+ */
+export interface Approval {
+  /**
+   * When it left `pending`.
+   */
+  decided_at?: number | null;
+  /**
+   * Who decided (`approved` and `denied` only).
+   */
+  decided_by?: DecidedBy | null;
+  /**
+   * Where they decided: `inbox` (`approval.respond`) or `terminal`.
+   */
+  decided_by_ref?: string | null;
+  /**
+   * The kind's fields (`command` and `cwd`, `path` and `diff`, `url`,
+   * `server`, `tool` and `input`), plus the agent's `raw` payload and
+   * `raw_truncated: true` when it was cut to fit 64 KiB. May hold secrets
+   * the agent was about to use; mask it on display.
+   */
+  detail: {
+    [k: string]: unknown | undefined;
+  };
+  /**
+   * Its id.
+   */
+  id: string;
+  /**
+   * What it asks for.
+   */
+  kind: "command" | "file_edit" | "fetch" | "mcp_tool" | "other";
+  /**
+   * The decision's message, if any.
+   */
+  message?: string | null;
+  /**
+   * When it was asked, Unix ms UTC.
+   */
+  requested_at: number;
+  /**
+   * Identifies one run (one agent process and its terminal).
+   */
+  run_id: string;
+  /**
+   * Its state.
+   */
+  status: "pending" | "approved" | "denied" | "expired" | "cancelled";
+  /**
+   * One line for people, at most 200 characters.
+   */
+  summary: string;
+  /**
+   * Identifies a workspace (one worktree, branch and agent working on a task).
+   */
+  workspace_id: string;
+}
+/**
+ * A position in `approval.list`: the last approval a page returned.
+ *
+ * This interface was referenced by `ProtocolCatalog`'s JSON-Schema
+ * via the `definition` "ApprovalCursor".
+ */
+export interface ApprovalCursor {
+  /**
+   * Its id.
+   */
+  id: string;
+  /**
+   * Its `requested_at`.
+   */
+  requested_at: number;
+}
+/**
+ * `approval.list` params. Filters combine with `after` (AND).
+ *
+ * This interface was referenced by `ProtocolCatalog`'s JSON-Schema
+ * via the `definition` "ApprovalListParams".
+ */
+export interface ApprovalListParams {
+  /**
+   * Start after this approval (a page's `next`).
+   */
+  after?: ApprovalCursor | null;
+  /**
+   * Page size: absent or 0 means 100, capped at 500.
+   */
+  limit?: number | null;
+  /**
+   * Only this run's approvals.
+   */
+  run_id?: RunId | null;
+  /**
+   * Only approvals in this state. Default `pending`.
+   */
+  status?: ApprovalStatus | null;
+}
+/**
+ * `approval.list` result, ordered by (`requested_at`, `id`).
+ *
+ * This interface was referenced by `ProtocolCatalog`'s JSON-Schema
+ * via the `definition` "ApprovalListResult".
+ */
+export interface ApprovalListResult {
+  /**
+   * The page.
+   */
+  approvals: Approval[];
+  /**
+   * True when more approvals match after this page.
+   */
+  has_more: boolean;
+  /**
+   * The last approval of this page, for `after`; absent on an empty page.
+   */
+  next?: ApprovalCursor | null;
+}
+/**
+ * `approval.requested` and `approval.decided` notifications (to every
+ * connection after hello, except `signal` ones).
+ *
+ * This interface was referenced by `ProtocolCatalog`'s JSON-Schema
+ * via the `definition` "ApprovalNotification".
+ */
+export interface ApprovalNotification {
+  approval: Approval1;
+  /**
+   * Its journal event id; `null` only while storage is degraded.
+   */
+  event_id?: number | null;
+}
+/**
+ * A permission request from a run.
+ */
+export interface Approval1 {
+  /**
+   * When it left `pending`.
+   */
+  decided_at?: number | null;
+  /**
+   * Who decided (`approved` and `denied` only).
+   */
+  decided_by?: DecidedBy | null;
+  /**
+   * Where they decided: `inbox` (`approval.respond`) or `terminal`.
+   */
+  decided_by_ref?: string | null;
+  /**
+   * The kind's fields (`command` and `cwd`, `path` and `diff`, `url`,
+   * `server`, `tool` and `input`), plus the agent's `raw` payload and
+   * `raw_truncated: true` when it was cut to fit 64 KiB. May hold secrets
+   * the agent was about to use; mask it on display.
+   */
+  detail: {
+    [k: string]: unknown | undefined;
+  };
+  /**
+   * Its id.
+   */
+  id: string;
+  /**
+   * What it asks for.
+   */
+  kind: "command" | "file_edit" | "fetch" | "mcp_tool" | "other";
+  /**
+   * The decision's message, if any.
+   */
+  message?: string | null;
+  /**
+   * When it was asked, Unix ms UTC.
+   */
+  requested_at: number;
+  /**
+   * Identifies one run (one agent process and its terminal).
+   */
+  run_id: string;
+  /**
+   * Its state.
+   */
+  status: "pending" | "approved" | "denied" | "expired" | "cancelled";
+  /**
+   * One line for people, at most 200 characters.
+   */
+  summary: string;
+  /**
+   * Identifies a workspace (one worktree, branch and agent working on a task).
+   */
+  workspace_id: string;
+}
+/**
+ * `approval.respond` params.
+ *
+ * This interface was referenced by `ProtocolCatalog`'s JSON-Schema
+ * via the `definition` "ApprovalRespondParams".
+ */
+export interface ApprovalRespondParams {
+  /**
+   * The approval to answer (it must be `pending`).
+   */
+  approval_id: string;
+  /**
+   * Allow or refuse.
+   */
+  decision: "approve" | "deny";
+  /**
+   * A message for the agent, at most 4096 bytes.
+   */
+  message?: string | null;
+}
+/**
+ * `approval.respond` result: the decided approval, even if the agent could
+ * no longer take the reply.
+ *
+ * This interface was referenced by `ProtocolCatalog`'s JSON-Schema
+ * via the `definition` "ApprovalRespondResult".
+ */
+export interface ApprovalRespondResult {
+  approval: Approval2;
+}
+/**
+ * A permission request from a run.
+ */
+export interface Approval2 {
+  /**
+   * When it left `pending`.
+   */
+  decided_at?: number | null;
+  /**
+   * Who decided (`approved` and `denied` only).
+   */
+  decided_by?: DecidedBy | null;
+  /**
+   * Where they decided: `inbox` (`approval.respond`) or `terminal`.
+   */
+  decided_by_ref?: string | null;
+  /**
+   * The kind's fields (`command` and `cwd`, `path` and `diff`, `url`,
+   * `server`, `tool` and `input`), plus the agent's `raw` payload and
+   * `raw_truncated: true` when it was cut to fit 64 KiB. May hold secrets
+   * the agent was about to use; mask it on display.
+   */
+  detail: {
+    [k: string]: unknown | undefined;
+  };
+  /**
+   * Its id.
+   */
+  id: string;
+  /**
+   * What it asks for.
+   */
+  kind: "command" | "file_edit" | "fetch" | "mcp_tool" | "other";
+  /**
+   * The decision's message, if any.
+   */
+  message?: string | null;
+  /**
+   * When it was asked, Unix ms UTC.
+   */
+  requested_at: number;
+  /**
+   * Identifies one run (one agent process and its terminal).
+   */
+  run_id: string;
+  /**
+   * Its state.
+   */
+  status: "pending" | "approved" | "denied" | "expired" | "cancelled";
+  /**
+   * One line for people, at most 200 characters.
+   */
+  summary: string;
+  /**
+   * Identifies a workspace (one worktree, branch and agent working on a task).
+   */
+  workspace_id: string;
+}
+/**
  * Params with no fields. Accepts `{}` or an absent `params`.
  *
  * This interface was referenced by `ProtocolCatalog`'s JSON-Schema
@@ -609,6 +1217,11 @@ export interface EngineInfo {
    */
   engine_version: string;
   /**
+   * How the login environment (what agents run with) was found. Absent
+   * until the first capture finishes. Optional, like `storage`.
+   */
+  login_env?: LoginEnvInfo | null;
+  /**
    * The engine's process id.
    */
   pid: number;
@@ -622,6 +1235,22 @@ export interface EngineInfo {
    * for clients that predate it.
    */
   storage?: StorageInfo | null;
+}
+/**
+ * The login environment's state, for `engine.info` and `env.refresh`.
+ *
+ * This interface was referenced by `ProtocolCatalog`'s JSON-Schema
+ * via the `definition` "LoginEnvInfo".
+ */
+export interface LoginEnvInfo {
+  /**
+   * Why it fell back, for people.
+   */
+  message?: string | null;
+  /**
+   * Whether the login shell answered.
+   */
+  status: "ok" | "fallback";
 }
 /**
  * The protocol version the engine speaks.
@@ -659,6 +1288,28 @@ export interface StorageInfo {
    * Where storage stands.
    */
   status: "ok" | "degraded_writes" | "newer_schema" | "corrupt" | "unavailable";
+}
+/**
+ * `env.refresh` result. Detection reruns in the background after it.
+ *
+ * This interface was referenced by `ProtocolCatalog`'s JSON-Schema
+ * via the `definition` "EnvRefreshResult".
+ */
+export interface EnvRefreshResult {
+  login_env: LoginEnvInfo1;
+}
+/**
+ * The login environment's state, for `engine.info` and `env.refresh`.
+ */
+export interface LoginEnvInfo1 {
+  /**
+   * Why it fell back, for people.
+   */
+  message?: string | null;
+  /**
+   * Whether the login shell answered.
+   */
+  status: "ok" | "fallback";
 }
 /**
  * `event.since` params: journal events after a cursor. Set filters combine with AND.
@@ -723,7 +1374,7 @@ export interface HelloParams {
   /**
    * Which kind of client this is.
    */
-  client: "desktop" | "cli" | "test";
+  client: "desktop" | "cli" | "test" | "signal";
   /**
    * The client's own version, for logs.
    */
@@ -1022,16 +1673,59 @@ export interface RunStatusChanged {
   workspace_id: string;
 }
 /**
- * `dev.stop_runs` result.
+ * `run.stop` params. Returns `{}` once the stop has started; the run's end
+ * arrives as `run.status`.
  *
  * This interface was referenced by `ProtocolCatalog`'s JSON-Schema
- * via the `definition` "StopRunsResult".
+ * via the `definition` "RunStopParams".
  */
-export interface StopRunsResult {
+export interface RunStopParams {
   /**
-   * How many runs were stopped.
+   * Identifies one run (one agent process and its terminal).
    */
-  stopped: number;
+  run_id: string;
+}
+/**
+ * `signal.hook` params: one agent hook call, relayed by `sy-signal` on a
+ * `signal` connection. The reply may wait until an approval is decided.
+ *
+ * This interface was referenced by `ProtocolCatalog`'s JSON-Schema
+ * via the `definition` "SignalHookParams".
+ */
+export interface SignalHookParams {
+  /**
+   * The arguments the agent passed to the hook.
+   */
+  args?: string[];
+  /**
+   * The hook's name, as the adapter configured it.
+   */
+  hook: string;
+  /**
+   * What the agent wrote to the hook's stdin, base64. With `args`, at most
+   * 262144 bytes once decoded.
+   */
+  stdin_b64?: string;
+  /**
+   * The run's signal token (from the helper's own arguments).
+   */
+  token: string;
+}
+/**
+ * `signal.hook` result: what `sy-signal` writes to stdout and exits with.
+ *
+ * This interface was referenced by `ProtocolCatalog`'s JSON-Schema
+ * via the `definition` "SignalHookResult".
+ */
+export interface SignalHookResult {
+  /**
+   * The helper's exit code.
+   */
+  exit_code: number;
+  /**
+   * The helper's stdout bytes, base64.
+   */
+  stdout_b64: string;
 }
 /**
  * `storage.recover` params. Allowed only while storage is `newer_schema`,
@@ -1080,44 +1774,4 @@ export interface StorageInfo1 {
    * Where storage stands.
    */
   status: "ok" | "degraded_writes" | "newer_schema" | "corrupt" | "unavailable";
-}
-/**
- * `dev.synthetic_run` params: fake runs that stream output.
- *
- * This interface was referenced by `ProtocolCatalog`'s JSON-Schema
- * via the `definition` "SyntheticRunParams".
- */
-export interface SyntheticRunParams {
-  /**
-   * Output rate per run.
-   */
-  bytes_per_sec: number;
-  /**
-   * How many runs to start.
-   */
-  count: number;
-  /**
-   * Write every `run.input` straight back as output.
-   */
-  echo: boolean;
-}
-/**
- * `dev.synthetic_run` result.
- *
- * This interface was referenced by `ProtocolCatalog`'s JSON-Schema
- * via the `definition` "SyntheticRunResult".
- */
-export interface SyntheticRunResult {
-  /**
-   * The new runs, ready for `run.attach`.
-   */
-  run_ids: RunId[];
-  /**
-   * Identifies a task (the intent: a prompt worked on in one or more workspaces).
-   */
-  task_id: string;
-  /**
-   * One workspace per run, in the same order as `run_ids`.
-   */
-  workspace_ids: WorkspaceId[];
 }

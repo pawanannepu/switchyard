@@ -31,9 +31,26 @@ fn data_dir() -> tempfile::TempDir {
         .unwrap()
 }
 
+/// Build the helper binaries the engine finds beside itself (`sy-signal`
+/// and `sy-fake-agent`), once per test process.
+#[cfg(feature = "devtools")]
+fn build_helpers() {
+    static BUILT: std::sync::Once = std::sync::Once::new();
+    BUILT.call_once(|| {
+        let status = Command::new(env!("CARGO"))
+            .args(["build", "--quiet", "-p", "sy-signal", "-p", "sy-fake-agent"])
+            .status()
+            .expect("running cargo build for the helper binaries");
+        assert!(status.success(), "building the helper binaries failed");
+    });
+}
+
 fn spawn_in(dir: &Path, env: &[(&str, &str)]) -> Child {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_switchyardd"));
-    cmd.env("SWITCHYARD_DATA_DIR", dir)
+    // Devtools engines skip your login shell unless a test says otherwise
+    // (`SWITCHYARD_LOGIN_ENV=shell`); release engines ignore this.
+    cmd.env("SWITCHYARD_LOGIN_ENV", "inherit")
+        .env("SWITCHYARD_DATA_DIR", dir)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -49,6 +66,8 @@ impl Engine {
     }
 
     async fn start_with(env: &[(&str, &str)]) -> Self {
+        #[cfg(feature = "devtools")]
+        build_helpers();
         let dir = data_dir();
         let paths = EnginePaths::for_data_dir(dir.path().to_path_buf());
         let child = spawn_in(dir.path(), env);
@@ -113,6 +132,8 @@ struct Raw {
     reader: BufReader<tokio::net::unix::OwnedReadHalf>,
     writer: tokio::net::unix::OwnedWriteHalf,
     next_id: u64,
+    /// Messages that arrived while waiting for a response, for `next`.
+    pending: std::collections::VecDeque<Value>,
 }
 
 impl Raw {
@@ -122,6 +143,7 @@ impl Raw {
             reader: BufReader::new(read),
             writer,
             next_id: 1,
+            pending: std::collections::VecDeque::new(),
         }
     }
 
@@ -135,8 +157,16 @@ impl Raw {
         id
     }
 
-    /// Next message, or `None` on EOF.
+    /// Next message (first any that arrived while waiting for a response),
+    /// or `None` on EOF or after 10 s of silence.
     async fn next(&mut self) -> Option<Value> {
+        if let Some(msg) = self.pending.pop_front() {
+            return Some(msg);
+        }
+        self.read().await
+    }
+
+    async fn read(&mut self) -> Option<Value> {
         let mut line = String::new();
         let n = tokio::time::timeout(Duration::from_secs(10), self.reader.read_line(&mut line))
             .await
@@ -146,14 +176,18 @@ impl Raw {
     }
 
     async fn response(&mut self, id: u64) -> Value {
+        if let Some(at) = self.pending.iter().position(|m| m["id"] == json!(id)) {
+            return self.pending.remove(at).unwrap_or_default();
+        }
         loop {
             let msg = self
-                .next()
+                .read()
                 .await
                 .expect("connection closed before the response");
             if msg["id"] == json!(id) {
                 return msg;
             }
+            self.pending.push_back(msg);
         }
     }
 
@@ -163,7 +197,11 @@ impl Raw {
     }
 
     async fn hello(&mut self, major: u32) -> Value {
-        self.call(methods::SESSION_HELLO, json!({ "client": "test", "client_version": "raw", "protocol": { "major": major, "minor": 0 } }))
+        self.hello_as("test", major).await
+    }
+
+    async fn hello_as(&mut self, client: &str, major: u32) -> Value {
+        self.call(methods::SESSION_HELLO, json!({ "client": client, "client_version": "raw", "protocol": { "major": major, "minor": 0 } }))
             .await
     }
 }
@@ -397,16 +435,11 @@ async fn new_read_methods_should_need_hello() {
 async fn release_engine_should_not_answer_dev_methods() {
     let engine = Engine::start().await;
     let conn = engine.client().await;
-    for method in [methods::DEV_SYNTHETIC_RUN, methods::DEV_STOP_RUNS] {
-        let err = conn
-            .call_value(
-                method,
-                json!({ "count": 1, "bytes_per_sec": 0, "echo": false }),
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(rpc_code(&err), ErrorCode::MethodNotFound.code(), "{method}");
-    }
+    let err = conn
+        .call_value(methods::DEV_AGENT_RUN, json!({ "agent_id": "fake" }))
+        .await
+        .unwrap_err();
+    assert_eq!(rpc_code(&err), ErrorCode::MethodNotFound.code());
 }
 
 // ---- storage failure handling (spec 0002, AC-1, AC-3, AC-4) ----
@@ -489,7 +522,7 @@ async fn engine_info_should_report_ok_storage_with_its_schema_version() {
     let storage = storage_of(&mut raw).await;
     assert_eq!(
         (storage["status"].clone(), storage["schema_version"].clone()),
-        (json!("ok"), json!(1))
+        (json!("ok"), json!(sy_infra::storage::MIGRATIONS.len()))
     );
 }
 
@@ -627,7 +660,12 @@ async fn corrupt_database_should_be_set_aside_untouched_and_start_fresh() {
             reply["result"]["storage"]["schema_version"].clone(),
             kept == bytes,
         ),
-        (json!("corrupt"), json!("ok"), json!(1), true)
+        (
+            json!("corrupt"),
+            json!("ok"),
+            json!(sy_infra::storage::MIGRATIONS.len()),
+            true
+        )
     );
 }
 
@@ -715,11 +753,66 @@ fn no_engine_code_should_change_the_process_umask() {
     assert!(hits.is_empty(), "umask changed in {hits:?}");
 }
 
+// ---- the login environment (spec 0003, AC-16) ----
+
+/// An executable stub script in `dir`.
+fn stub(dir: &Path, name: &str, body: &str) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(name);
+    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+/// `engine.info.login_env`, once the first capture finished (within 10 s).
+async fn login_env(raw: &mut Raw) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let info = raw.call(methods::ENGINE_INFO, json!({})).await;
+        if let Some(env) = info["result"].get("login_env") {
+            return env.clone();
+        }
+        assert!(Instant::now() < deadline, "no login_env in {info}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_login_shell_should_be_asked_and_a_hanging_one_should_fall_back_after_5_s() {
+    let stubs = tempfile::tempdir().unwrap();
+    let noisy = stub(
+        stubs.path(),
+        "noisy",
+        "echo 'hello from .zshrc'\neval \"$4\"",
+    );
+    let hangs = stub(stubs.path(), "hangs", "sleep 30");
+    let mut results = Vec::new();
+    for shell in [&noisy, &hangs] {
+        let engine =
+            Engine::start_with(&[("SWITCHYARD_LOGIN_ENV", "shell"), ("SHELL", shell)]).await;
+        let mut raw = engine.raw().await;
+        let started = Instant::now();
+        let env = login_env(&mut raw).await;
+        results.push((env, started.elapsed()));
+    }
+    let (ok, fallback) = (&results[0].0, &results[1]);
+    assert_eq!(ok, &json!({ "status": "ok" }));
+    assert_eq!(fallback.0["status"], json!("fallback"));
+    assert!(
+        fallback.0["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("did not answer") && m.contains("/opt/homebrew/bin")),
+        "{}",
+        fallback.0
+    );
+    assert!(fallback.1 < Duration::from_secs(8), "{:?}", fallback.1);
+}
+
 #[cfg(feature = "devtools")]
 mod devtools {
     use super::*;
     use base64::Engine as _;
-    use sy_protocol::{RunAttachResult, SyntheticRunResult};
+    use sy_protocol::{AgentRunResult, RunAttachResult};
 
     fn b64(data: &[u8]) -> String {
         base64::engine::general_purpose::STANDARD.encode(data)
@@ -731,15 +824,62 @@ mod devtools {
             .unwrap()
     }
 
-    async fn synthetic(raw: &mut Raw, count: u32, bytes_per_sec: u64, echo: bool) -> Vec<String> {
+    /// A literal no test ever types, so a step waiting for it waits forever.
+    const NEVER: &str = "never-typed-literal-5d1c";
+
+    /// A fake agent script: a `flood` at `bytes_per_sec` (echoing input with
+    /// `echo`), or with no rate, one line and then echo (or quiet) until stopped.
+    fn script(bytes_per_sec: u64, echo: bool) -> Value {
+        match (bytes_per_sec, echo) {
+            (0, true) => json!([{ "print": "ready\r\n" }, { "echo_until": NEVER }]),
+            (0, false) => json!([{ "print": "ready\r\n" }, { "expect_input": NEVER }]),
+            (rate, echo) => json!([{ "flood": { "bytes_per_sec": rate, "echo": echo } }]),
+        }
+    }
+
+    /// `dev.agent_run` with the fake agent and `steps`.
+    async fn fake_runs(raw: &mut Raw, count: u32, steps: Value) -> AgentRunResult {
         let reply = raw
             .call(
-                methods::DEV_SYNTHETIC_RUN,
-                json!({ "count": count, "bytes_per_sec": bytes_per_sec, "echo": echo }),
+                methods::DEV_AGENT_RUN,
+                json!({ "agent_id": "fake", "count": count, "options": { "script": steps } }),
             )
             .await;
-        let result: SyntheticRunResult = serde_json::from_value(reply["result"].clone()).unwrap();
-        result.run_ids.into_iter().map(|id| id.0).collect()
+        serde_json::from_value(reply["result"].clone()).unwrap_or_else(|_| panic!("{reply}"))
+    }
+
+    /// Fake runs that stream (or echo, or idle) until stopped.
+    async fn agent_runs(raw: &mut Raw, count: u32, bytes_per_sec: u64, echo: bool) -> Vec<String> {
+        fake_runs(raw, count, script(bytes_per_sec, echo))
+            .await
+            .run_ids
+            .into_iter()
+            .map(|id| id.0)
+            .collect()
+    }
+
+    /// `run.stop` each run, then wait for every answer and each run's final
+    /// `run.status`. `raw` must have said hello.
+    async fn stop_runs(raw: &mut Raw, runs: &[String]) {
+        let mut stops = Vec::new();
+        for run in runs {
+            stops.push(raw.send(methods::RUN_STOP, json!({ "run_id": run })).await);
+        }
+        let mut answered = 0;
+        let mut ended = std::collections::HashSet::new();
+        while answered < stops.len() || ended.len() < runs.len() {
+            let msg = raw.next().await.expect("closed while stopping runs");
+            if stops.iter().any(|id| msg["id"] == json!(id)) {
+                assert!(msg.get("error").is_none(), "{msg}");
+                answered += 1;
+            } else if msg["method"] == json!(methods::RUN_STATUS)
+                && ["finished", "failed", "stopped"]
+                    .contains(&msg["params"]["status"].as_str().unwrap_or(""))
+                && runs.iter().any(|r| msg["params"]["run_id"] == json!(r))
+            {
+                ended.insert(msg["params"]["run_id"].as_str().unwrap().to_owned());
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -747,7 +887,7 @@ mod devtools {
         let engine = Engine::start().await;
         let mut raw = engine.raw().await;
         raw.hello(PROTOCOL.major).await;
-        let run = synthetic(&mut raw, 1, 200_000, false).await.remove(0);
+        let run = agent_runs(&mut raw, 1, 200_000, false).await.remove(0);
         tokio::time::sleep(Duration::from_millis(200)).await;
         let id = raw
             .send(methods::RUN_ATTACH, json!({ "run_id": run }))
@@ -755,24 +895,35 @@ mod devtools {
 
         let mut cursor = None;
         let mut live_bytes = 0_usize;
+        // A live chunk can beat its own attach reply; it applies after the reply.
+        let mut early: Vec<(u64, usize)> = Vec::new();
+        let take = |cursor: &mut u64, offset: u64, len: usize, live: &mut usize| {
+            let end = offset + len as u64;
+            assert!(
+                offset <= *cursor,
+                "gap: chunk starts at {offset}, expected at most {cursor}"
+            );
+            if end > *cursor {
+                *live += (end - *cursor) as usize;
+                *cursor = end;
+            }
+        };
         while live_bytes < 100_000 {
             let msg = raw.next().await.unwrap();
             if msg["id"] == json!(id) {
                 let attach: RunAttachResult =
                     serde_json::from_value(msg["result"].clone()).unwrap();
-                cursor = Some(attach.end_offset);
+                let mut at = attach.end_offset;
+                for (offset, len) in early.drain(..) {
+                    take(&mut at, offset, len, &mut live_bytes);
+                }
+                cursor = Some(at);
             } else if msg["method"] == json!(methods::RUN_OUTPUT) {
-                let Some(at) = cursor else { continue };
                 let offset = msg["params"]["offset"].as_u64().unwrap();
-                let data = unb64(&msg["params"]["data_b64"]);
-                let end = offset + data.len() as u64;
-                assert!(
-                    offset <= at,
-                    "gap: chunk starts at {offset}, expected at most {at}"
-                );
-                if end > at {
-                    live_bytes += (end - at) as usize;
-                    cursor = Some(end);
+                let len = unb64(&msg["params"]["data_b64"]).len();
+                match cursor.as_mut() {
+                    Some(at) => take(at, offset, len, &mut live_bytes),
+                    None => early.push((offset, len)),
                 }
             }
         }
@@ -783,7 +934,7 @@ mod devtools {
         let engine = Engine::start().await;
         let mut raw = engine.raw().await;
         raw.hello(PROTOCOL.major).await;
-        let run = synthetic(&mut raw, 1, 0, true).await.remove(0);
+        let run = agent_runs(&mut raw, 1, 0, true).await.remove(0);
         raw.call(methods::RUN_ATTACH, json!({ "run_id": run }))
             .await;
         raw.call(
@@ -806,7 +957,7 @@ mod devtools {
         let engine = Engine::start().await;
         let mut raw = engine.raw().await;
         raw.hello(PROTOCOL.major).await;
-        let run = synthetic(&mut raw, 1, 0, true).await.remove(0);
+        let run = agent_runs(&mut raw, 1, 0, true).await.remove(0);
         let big = vec![b'x'; sy_protocol::MAX_INPUT_BYTES + 1];
         let reply = raw
             .call(
@@ -825,7 +976,7 @@ mod devtools {
         let engine = Engine::start().await;
         let mut slow = engine.raw().await;
         slow.hello(PROTOCOL.major).await;
-        let run = synthetic(&mut slow, 1, 8 * 1024 * 1024, false)
+        let run = agent_runs(&mut slow, 1, 8 * 1024 * 1024, false)
             .await
             .remove(0);
         slow.call(methods::RUN_ATTACH, json!({ "run_id": run }))
@@ -875,13 +1026,10 @@ mod devtools {
         let mut engine = Engine::start().await;
         let mut raw = engine.raw().await;
         raw.hello(PROTOCOL.major).await;
-        synthetic(&mut raw, 2, 1000, false).await;
+        let runs = agent_runs(&mut raw, 2, 1000, false).await;
         raw.call(methods::ENGINE_DRAIN, json!({})).await;
         let refused = raw
-            .call(
-                methods::DEV_SYNTHETIC_RUN,
-                json!({ "count": 1, "bytes_per_sec": 0, "echo": false }),
-            )
+            .call(methods::DEV_AGENT_RUN, json!({ "agent_id": "fake" }))
             .await;
         assert_eq!(
             refused["error"]["code"],
@@ -892,7 +1040,7 @@ mod devtools {
             "exited while runs were active"
         );
 
-        raw.call(methods::DEV_STOP_RUNS, json!({})).await;
+        stop_runs(&mut raw, &runs).await;
         assert!(
             engine
                 .wait_exit(Duration::from_secs(5))
@@ -988,6 +1136,21 @@ mod devtools {
         }
     }
 
+    /// Wait until `engine.info` counts no running agent.
+    async fn wait_no_live_runs(raw: &mut Raw) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let info = raw.call(methods::ENGINE_INFO, json!({})).await;
+            if info["result"]["running_agents"] == json!(0) {
+                // The hub entry goes just before the end commits.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                return;
+            }
+            assert!(Instant::now() < deadline, "runs never ended");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     /// Every journal event, through `event.since` pages.
     async fn all_events(raw: &mut Raw, filter: Value) -> Vec<Value> {
         let mut events = Vec::new();
@@ -1026,8 +1189,7 @@ mod devtools {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn synthetic_runs_should_be_saved_and_every_client_should_get_run_status_in_event_order()
-    {
+    async fn agent_runs_should_be_saved_and_every_client_should_get_run_status_in_event_order() {
         use std::collections::HashMap;
         let engine = Engine::start().await;
         let mut viewer = engine.raw().await;
@@ -1035,26 +1197,32 @@ mod devtools {
         let mut watcher = engine.raw().await; // never attaches
         watcher.hello(PROTOCOL.major).await;
 
-        let reply = viewer
-            .call(
-                methods::DEV_SYNTHETIC_RUN,
-                json!({ "count": 3, "bytes_per_sec": 50_000, "echo": false }),
-            )
-            .await;
-        let result: SyntheticRunResult = serde_json::from_value(reply["result"].clone()).unwrap();
+        let result = fake_runs(&mut viewer, 3, script(50_000, false)).await;
         let runs: Vec<String> = result.run_ids.iter().map(|r| r.0.clone()).collect();
         let mut seen = HashMap::new();
         attach_all(&mut viewer, &runs, &mut seen).await;
+        // Each run's first output makes it `running`; a run stopped before
+        // that rightly skips `running`, so wait for all three.
+        for run in &runs {
+            until_running(&engine, run).await;
+        }
         tokio::time::sleep(Duration::from_millis(300)).await;
-        let stop = viewer.send(methods::DEV_STOP_RUNS, json!({})).await;
+        let mut stops = Vec::new();
+        for run in &runs {
+            stops.push(
+                viewer
+                    .send(methods::RUN_STOP, json!({ "run_id": run }))
+                    .await,
+            );
+        }
 
         // The viewer: output until each run's `stopped`, which must come after its last output.
         let mut stopped = std::collections::HashSet::new();
-        let mut stop_answered = false;
-        while stopped.len() < runs.len() || !stop_answered {
+        let mut answered = 0;
+        while stopped.len() < runs.len() || answered < runs.len() {
             let msg = viewer.next().await.expect("viewer connection closed");
-            if msg["id"] == json!(stop) {
-                stop_answered = true;
+            if stops.iter().any(|id| msg["id"] == json!(id)) {
+                answered += 1;
             } else if msg["method"] == json!(methods::RUN_OUTPUT) {
                 let run = msg["params"]["run_id"].as_str().unwrap().to_owned();
                 assert!(
@@ -1075,10 +1243,9 @@ mod devtools {
         // The watcher: every status, in event_id order, and nothing else.
         let mut statuses = Vec::new();
         while statuses.len() < runs.len() * 3 {
-            let msg = watcher
-                .next()
-                .await
-                .expect("watcher got too few run.status");
+            let Some(msg) = watcher.next().await else {
+                panic!("watcher got too few run.status: {statuses:#?}");
+            };
             assert_eq!(
                 msg["method"],
                 json!(methods::RUN_STATUS),
@@ -1127,8 +1294,8 @@ mod devtools {
             let file = log_file(&engine, run);
             let saw = &seen[run];
             assert_eq!(
-                (status.as_str(), end_reason.as_str(), pid),
-                ("stopped", "user_stop", None)
+                (status.as_str(), end_reason.as_str(), pid.is_some()),
+                ("stopped", "user_stop", true)
             );
             assert_eq!(
                 (log_bytes as usize, saw.highest as usize),
@@ -1176,15 +1343,21 @@ mod devtools {
         let engine = Engine::start().await;
         let mut raw = engine.raw().await;
         raw.hello(PROTOCOL.major).await;
-        // Each call journals a task plus 4 events per run: over 500 events in all.
-        let first = raw
-            .call(
-                methods::DEV_SYNTHETIC_RUN,
-                json!({ "count": 64, "bytes_per_sec": 0, "echo": false }),
-            )
-            .await;
-        let first: SyntheticRunResult = serde_json::from_value(first["result"].clone()).unwrap();
-        let second = synthetic(&mut raw, 64, 0, false).await;
+        // Each call journals a task plus 4 events per run (workspace, run,
+        // starting, finished: the script exits at once with no output), so
+        // four calls of 32 make over 500 events in all.
+        let exits = json!([{ "exit": 0 }]);
+        let first = fake_runs(&mut raw, 32, exits.clone()).await;
+        let second: Vec<String> = fake_runs(&mut raw, 32, exits.clone())
+            .await
+            .run_ids
+            .into_iter()
+            .map(|id| id.0)
+            .collect();
+        for _ in 0..2 {
+            fake_runs(&mut raw, 32, exits.clone()).await;
+        }
+        wait_no_live_runs(&mut raw).await;
         let page = |limit: Value| json!({ "cursor": 0, "limit": limit });
         let default = raw.call(methods::EVENT_SINCE, page(json!(0))).await;
         let absent = raw.call(methods::EVENT_SINCE, json!({ "cursor": 0 })).await;
@@ -1241,14 +1414,14 @@ mod devtools {
         let engine = Engine::start().await;
         let mut raw = engine.raw().await;
         raw.hello(PROTOCOL.major).await;
-        let run = synthetic(&mut raw, 1, 2_000_000, false).await.remove(0);
+        let run = agent_runs(&mut raw, 1, 2_000_000, false).await.remove(0);
         tokio::time::sleep(Duration::from_millis(400)).await;
         // Live: what is saved so far reads back, and `eof` means "the end so far".
         let live = raw
             .call(methods::RUN_LOG_READ, json!({ "run_id": run, "offset": 0 }))
             .await;
         assert!(live["result"]["log_bytes"].as_u64().unwrap() > 0, "{live}");
-        raw.call(methods::DEV_STOP_RUNS, json!({})).await;
+        stop_runs(&mut raw, std::slice::from_ref(&run)).await;
 
         let file = log_file(&engine, &run);
         assert!(
@@ -1299,20 +1472,27 @@ mod devtools {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn second_synthetic_call_should_reuse_the_fixture_project() {
+    async fn second_agent_run_call_should_reuse_the_fixture_project() {
         let engine = Engine::start().await;
         let mut raw = engine.raw().await;
         raw.hello(PROTOCOL.major).await;
-        synthetic(&mut raw, 1, 0, false).await;
-        synthetic(&mut raw, 2, 0, false).await;
-        let (projects, tasks, runs): (i64, i64, i64) = db(&engine)
-            .query_row(
-                "SELECT (SELECT count(*) FROM project), (SELECT count(*) FROM task), (SELECT count(*) FROM run WHERE kind = 'agent' AND status = 'running')",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!((projects, tasks, runs), (1, 2, 3));
+        agent_runs(&mut raw, 1, 0, false).await;
+        agent_runs(&mut raw, 2, 0, false).await;
+        let counts = || -> (i64, i64, i64) {
+            db(&engine)
+                .query_row(
+                    "SELECT (SELECT count(*) FROM project), (SELECT count(*) FROM task), (SELECT count(*) FROM run WHERE kind = 'agent' AND status = 'running')",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap()
+        };
+        // Each run becomes `running` on its first output byte.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while counts().2 < 3 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(counts(), (1, 2, 3));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1321,7 +1501,7 @@ mod devtools {
         let mut engine = Engine::start().await;
         let mut raw = engine.raw().await;
         raw.hello(PROTOCOL.major).await;
-        let runs = synthetic(&mut raw, 3, 200_000, false).await;
+        let runs = agent_runs(&mut raw, 3, 200_000, false).await;
         let mut seen: HashMap<String, Seen> = HashMap::new();
         let mut statuses = Vec::new();
         attach_all(&mut raw, &runs, &mut seen).await;
@@ -1413,7 +1593,7 @@ mod devtools {
             );
         }
         // The fixture's live agent runs are gone, so new runs start cleanly.
-        assert_eq!(synthetic(&mut again, 1, 0, false).await.len(), 1);
+        assert_eq!(agent_runs(&mut again, 1, 0, false).await.len(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1474,8 +1654,8 @@ mod devtools {
         let mut engine = Engine::start().await;
         let mut raw = engine.raw().await;
         raw.hello(PROTOCOL.major).await;
-        let first = synthetic(&mut raw, 1, 0, false).await.remove(0);
-        raw.call(methods::DEV_STOP_RUNS, json!({})).await;
+        let first = agent_runs(&mut raw, 1, 0, false).await.remove(0);
+        stop_runs(&mut raw, std::slice::from_ref(&first)).await;
         assert!(!log_file(&engine, &first).is_empty());
         // A 1 byte cap, and the first run's task archived.
         let conn = rusqlite::Connection::open(engine.paths.data_dir.join("switchyard.db")).unwrap();
@@ -1489,8 +1669,8 @@ mod devtools {
         archive_task_of(&engine, &first);
 
         // A run ending triggers the check: the archived log goes, the active one stays.
-        let second = synthetic(&mut raw, 1, 0, false).await.remove(0);
-        raw.call(methods::DEV_STOP_RUNS, json!({})).await;
+        let second = agent_runs(&mut raw, 1, 0, false).await.remove(0);
+        stop_runs(&mut raw, std::slice::from_ref(&second)).await;
         assert_eq!(wait_log_state(&engine, &first, "trimmed").await, "trimmed");
         assert!(log_file(&engine, &first).is_empty());
         assert_eq!(wait_log_state(&engine, &second, "present").await, "present");
@@ -1518,7 +1698,7 @@ mod devtools {
         let engine = Engine::start().await;
         let mut raw = engine.raw().await;
         raw.hello(PROTOCOL.major).await;
-        synthetic(&mut raw, 3, 0, false).await;
+        agent_runs(&mut raw, 3, 0, false).await;
         let info = raw.call(methods::ENGINE_INFO, json!({})).await;
         assert_eq!(info["result"]["running_agents"], json!(3));
     }
@@ -1564,7 +1744,7 @@ mod devtools {
         viewer.hello(PROTOCOL.major).await;
         let mut watcher = engine.raw().await; // never attaches
         watcher.hello(PROTOCOL.major).await;
-        let run = synthetic(&mut viewer, 1, 200_000, false).await.remove(0);
+        let run = agent_runs(&mut viewer, 1, 200_000, false).await.remove(0);
         let mut seen = HashMap::new();
         attach_all(&mut viewer, std::slice::from_ref(&run), &mut seen).await;
         let mut seen = seen.remove(&run).unwrap();
@@ -1592,13 +1772,10 @@ mod devtools {
             }
         }
         let create = viewer
-            .call(
-                methods::DEV_SYNTHETIC_RUN,
-                json!({ "count": 1, "bytes_per_sec": 0, "echo": false }),
-            )
+            .call(methods::DEV_AGENT_RUN, json!({ "agent_id": "fake" }))
             .await;
         let info = storage_of(&mut viewer).await;
-        viewer.call(methods::DEV_STOP_RUNS, json!({})).await;
+        stop_runs(&mut viewer, std::slice::from_ref(&run)).await;
 
         // The watcher saw degraded, then the stop with no journal id.
         let mut statuses = Vec::new();
@@ -1680,7 +1857,7 @@ mod devtools {
         let (engine, faults) = faulty_engine().await;
         let mut viewer = engine.raw().await;
         viewer.hello(PROTOCOL.major).await;
-        let run = synthetic(&mut viewer, 1, 100_000, false).await.remove(0);
+        let run = agent_runs(&mut viewer, 1, 100_000, false).await.remove(0);
         tokio::time::sleep(Duration::from_millis(200)).await;
         std::fs::write(faults.path().join("run_log"), b"").unwrap();
         // Only waiting here, not reassembling.
@@ -1691,7 +1868,9 @@ mod devtools {
         until_storage(&mut viewer, "degraded_writes", &mut seen, "-").await;
         // The database takes writes, so the next retry's probe passes with the log still failing.
         until_storage(&mut viewer, "ok", &mut seen, "-").await;
-        let stop_id = viewer.send(methods::DEV_STOP_RUNS, json!({})).await;
+        let stop_id = viewer
+            .send(methods::RUN_STOP, json!({ "run_id": run }))
+            .await;
         // The broadcast can land just after the response, so wait for both.
         let (mut answered, mut event_id) = (false, None);
         while !answered || event_id.is_none() {
@@ -1726,7 +1905,7 @@ mod devtools {
         let mut engine = Engine::start_with(&[("SWITCHYARD_LOG", "trace")]).await;
         let mut raw = engine.raw().await;
         raw.hello(PROTOCOL.major).await;
-        let run = synthetic(&mut raw, 1, 0, true).await.remove(0);
+        let run = agent_runs(&mut raw, 1, 0, true).await.remove(0);
         raw.call(methods::RUN_ATTACH, json!({ "run_id": run }))
             .await;
         raw.call(
@@ -1742,7 +1921,7 @@ mod devtools {
                 break;
             }
         }
-        raw.call(methods::DEV_STOP_RUNS, json!({})).await;
+        stop_runs(&mut raw, std::slice::from_ref(&run)).await;
         drop(raw);
         stop(&mut engine).await;
         let log = engine.log();
@@ -1752,5 +1931,1395 @@ mod devtools {
             !log.contains(marker) && !log.contains(&b64(MARKER)),
             "engine.log holds run bytes"
         );
+    }
+
+    // ---- the fake agent through a real PTY (spec 0003, milestone 1) ----
+
+    /// Every `run.status` of `runs`, read until each one ended, by run.
+    async fn until_ended(raw: &mut Raw, runs: &[String]) -> HashMap<String, Vec<Value>> {
+        let mut statuses: HashMap<String, Vec<Value>> = HashMap::new();
+        let ended = |s: &HashMap<String, Vec<Value>>| {
+            runs.iter().all(|r| {
+                s.get(r).and_then(|v| v.last()).is_some_and(|last| {
+                    ["finished", "failed", "stopped"]
+                        .contains(&last["status"].as_str().unwrap_or(""))
+                })
+            })
+        };
+        while !ended(&statuses) {
+            let msg = raw.next().await.expect("closed before the runs ended");
+            if msg["method"] == json!(methods::RUN_STATUS) {
+                let run = msg["params"]["run_id"].as_str().unwrap().to_owned();
+                if runs.contains(&run) {
+                    statuses.entry(run).or_default().push(msg["params"].clone());
+                }
+            }
+        }
+        statuses
+    }
+
+    fn status_names(statuses: &[Value]) -> Vec<&str> {
+        statuses
+            .iter()
+            .map(|s| s["status"].as_str().unwrap())
+            .collect()
+    }
+
+    /// (status, end_reason, exit_code, log_bytes) of a run row.
+    fn row(engine: &Engine, run: &str) -> (String, String, Option<i64>, i64) {
+        let (status, reason, code, bytes): (String, Option<String>, Option<i64>, i64) = db(engine)
+            .query_row(
+                "SELECT status, end_reason, exit_code, log_bytes FROM run WHERE id = ?1",
+                [run],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        (status, reason.unwrap_or_default(), code, bytes)
+    }
+
+    /// Wait (up to 5 s) until the run is `running`: the fake is past its terminal setup.
+    async fn until_running(engine: &Engine, run: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while row(engine, run).0 != "running" {
+            assert!(Instant::now() < deadline, "{run} never ran");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    fn launch_dirs(engine: &Engine) -> usize {
+        std::fs::read_dir(engine.paths.data_dir.join("agent-runtime")).map_or(0, Iterator::count)
+    }
+
+    use std::collections::HashMap;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fake_run_should_print_write_a_file_finish_and_leave_no_launch_dir() {
+        let engine = Engine::start().await;
+        let mut raw = engine.raw().await;
+        raw.hello(PROTOCOL.major).await;
+        let result = fake_runs(
+            &mut raw,
+            1,
+            json!([
+                { "print": "hello from the fake\r\n" },
+                { "write_file": { "path": "out.txt", "contents": "made by the fake" } },
+                { "exit": 0 }
+            ]),
+        )
+        .await;
+        let run = result.run_ids[0].0.clone();
+        let statuses = until_ended(&mut raw, std::slice::from_ref(&run)).await;
+        let worktree: String = db(&engine)
+            .query_row(
+                "SELECT worktree_path FROM workspace WHERE id = ?1",
+                [&result.workspace_ids[0].0],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let log = log_file(&engine, &run);
+        assert_eq!(
+            (
+                status_names(&statuses[&run]),
+                row(&engine, &run),
+                String::from_utf8_lossy(&log).into_owned(),
+                std::fs::read_to_string(Path::new(&worktree).join("out.txt")).unwrap(),
+                launch_dirs(&engine),
+            ),
+            (
+                vec!["starting", "running", "finished"],
+                (
+                    "finished".into(),
+                    "exited".into(),
+                    Some(0),
+                    log.len() as i64
+                ),
+                "hello from the fake\r\n".to_owned(),
+                "made by the fake".to_owned(),
+                0,
+            )
+        );
+        let mode = std::fs::metadata(&worktree).unwrap().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn exit_codes_and_signals_should_classify_the_end() {
+        let engine = Engine::start().await;
+        let mut raw = engine.raw().await;
+        raw.hello(PROTOCOL.major).await;
+        let mut runs = Vec::new();
+        for steps in [
+            json!([{ "exit": 3 }]),
+            json!([{ "print": "x" }, { "die_by_signal": "SIGSEGV" }]),
+            json!([{ "die_by_signal": "SIGKILL" }]),
+        ] {
+            runs.push(fake_runs(&mut raw, 1, steps).await.run_ids[0].0.clone());
+        }
+        until_ended(&mut raw, &runs).await;
+        let ends: Vec<_> = runs.iter().map(|r| row(&engine, r)).collect();
+        assert_eq!(
+            ends.iter()
+                .map(|(s, e, c, _)| (s.as_str(), e.as_str(), *c))
+                .collect::<Vec<_>>(),
+            [
+                ("failed", "exited", Some(3)),
+                ("failed", "exited", None),
+                ("failed", "exited", None)
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_malformed_script_should_fail_each_run_with_its_reason_in_the_log() {
+        let engine = Engine::start().await;
+        let mut raw = engine.raw().await;
+        raw.hello(PROTOCOL.major).await;
+        let result = fake_runs(&mut raw, 2, json!([{ "nope": 1 }])).await;
+        let runs: Vec<String> = result.run_ids.iter().map(|r| r.0.clone()).collect();
+        let statuses = until_ended(&mut raw, &runs).await;
+        for run in &runs {
+            let log = String::from_utf8_lossy(&log_file(&engine, run)).into_owned();
+            let (status, reason, code, log_bytes) = row(&engine, run);
+            assert_eq!(
+                (
+                    status_names(&statuses[run]),
+                    status.as_str(),
+                    reason.as_str(),
+                    code,
+                    log_bytes as usize
+                ),
+                (
+                    vec!["starting", "failed"],
+                    "failed",
+                    "spawn_failed",
+                    None,
+                    log.len()
+                )
+            );
+            assert!(
+                log.starts_with("switchyard: invalid agent options") && log.ends_with("\r\n"),
+                "{log:?}"
+            );
+        }
+        assert_eq!(launch_dirs(&engine), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_missing_agent_program_should_fail_the_run_with_spawn_failed() {
+        let helpers = data_dir(); // empty: no sy-fake-agent here
+        let engine =
+            Engine::start_with(&[("SWITCHYARD_HELPER_DIR", helpers.path().to_str().unwrap())])
+                .await;
+        let mut raw = engine.raw().await;
+        raw.hello(PROTOCOL.major).await;
+        let run = agent_runs(&mut raw, 1, 0, false).await.remove(0);
+        until_ended(&mut raw, std::slice::from_ref(&run)).await;
+        let log = String::from_utf8_lossy(&log_file(&engine, &run)).into_owned();
+        assert_eq!(
+            (
+                row(&engine, &run).1.as_str(),
+                log.contains("could not start the agent")
+            ),
+            ("spawn_failed", true),
+            "{log:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unknown_or_detection_only_agents_should_be_refused_before_any_row() {
+        let engine = Engine::start().await;
+        let mut raw = engine.raw().await;
+        raw.hello(PROTOCOL.major).await;
+        let unknown = raw
+            .call(methods::DEV_AGENT_RUN, json!({ "agent_id": "nobody" }))
+            .await;
+        let claude = raw
+            .call(methods::DEV_AGENT_RUN, json!({ "agent_id": "claude" }))
+            .await;
+        let too_many = raw
+            .call(
+                methods::DEV_AGENT_RUN,
+                json!({ "agent_id": "fake", "count": 33 }),
+            )
+            .await;
+        let rows: (i64, i64) = db(&engine)
+            .query_row(
+                "SELECT (SELECT count(*) FROM task), (SELECT count(*) FROM run)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (
+                &unknown["error"]["code"],
+                &claude["error"]["code"],
+                &too_many["error"]["code"],
+                rows
+            ),
+            (
+                &json!(ErrorCode::AgentNotFound.code()),
+                &json!(ErrorCode::AgentLaunchUnsupported.code()),
+                &json!(ErrorCode::InvalidParams.code()),
+                (0, 0)
+            )
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_stop_should_ctrl_c_the_fake_and_refuse_ended_or_unknown_runs() {
+        let engine = Engine::start().await;
+        let mut raw = engine.raw().await;
+        raw.hello(PROTOCOL.major).await;
+        let run = agent_runs(&mut raw, 1, 0, false).await.remove(0);
+        until_running(&engine, &run).await;
+        let stop = raw.call(methods::RUN_STOP, json!({ "run_id": run })).await;
+        let statuses = until_ended(&mut raw, std::slice::from_ref(&run)).await;
+        let again = raw.call(methods::RUN_STOP, json!({ "run_id": run })).await;
+        let unknown = raw
+            .call(
+                methods::RUN_STOP,
+                json!({ "run_id": "run_0193f0a0b1c27d3e8f9a0b1c2d3e4f50" }),
+            )
+            .await;
+        let (status, reason, code, _) = row(&engine, &run);
+        assert_eq!(
+            (
+                &stop["result"],
+                statuses[&run].last().unwrap()["status"].as_str(),
+                status.as_str(),
+                reason.as_str(),
+                code,
+                &again["error"]["code"],
+                &unknown["error"]["code"],
+            ),
+            (
+                &json!({}),
+                Some("stopped"),
+                "stopped",
+                "user_stop",
+                Some(130),
+                &json!(ErrorCode::RunNotLive.code()),
+                &json!(ErrorCode::RunNotFound.code()),
+            )
+        );
+    }
+
+    /// A fake that prints, then ignores Ctrl C (it reads no input) and SIGHUP.
+    fn stubborn() -> Value {
+        json!([{ "print": "ready\r\n" }, { "ignore_sighup": true }, { "hang": true }])
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_run_ignoring_ctrl_c_and_sighup_should_get_sigkill_after_about_10_s() {
+        let engine = Engine::start().await;
+        let mut raw = engine.raw().await;
+        raw.hello(PROTOCOL.major).await;
+        let run = fake_runs(&mut raw, 1, stubborn()).await.run_ids[0]
+            .0
+            .clone();
+        // Let it reach its hang (its first output means it is past the setup).
+        until_running(&engine, &run).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let started = Instant::now();
+        raw.call(methods::RUN_STOP, json!({ "run_id": run })).await;
+        let mut ended = None;
+        while ended.is_none() {
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "the run never ended"
+            );
+            // The stop is quiet for about 10 s, longer than one `next` waits.
+            let Some(msg) = raw.next().await else {
+                continue;
+            };
+            if msg["method"] == json!(methods::RUN_STATUS)
+                && msg["params"]["status"] == json!("stopped")
+            {
+                ended = Some(started.elapsed());
+            }
+        }
+        let took = ended.unwrap();
+        let (_, reason, code, _) = row(&engine, &run);
+        assert!(
+            took >= Duration::from_millis(9_500) && took < Duration::from_secs(13),
+            "{took:?}"
+        );
+        assert_eq!((reason.as_str(), code), ("user_stop", None));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_should_stop_every_run_within_about_8_s() {
+        let mut engine = Engine::start().await;
+        let mut raw = engine.raw().await;
+        raw.hello(PROTOCOL.major).await;
+        let runs: Vec<String> = fake_runs(&mut raw, 2, stubborn())
+            .await
+            .run_ids
+            .into_iter()
+            .map(|r| r.0)
+            .collect();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let started = Instant::now();
+        raw.call(methods::ENGINE_SHUTDOWN, json!({})).await;
+        let exited = engine.wait_exit(Duration::from_secs(15));
+        let took = started.elapsed();
+        eprintln!("1500 hook calls took {took:?}");
+        assert!(exited.is_some_and(|s| s.success()), "{exited:?}");
+        assert!(took < Duration::from_millis(10_500), "{took:?}");
+        for run in &runs {
+            let (status, reason, _, _) = row(&engine, run);
+            assert_eq!((status.as_str(), reason.as_str()), ("stopped", "user_stop"));
+        }
+        assert_eq!(launch_dirs(&engine), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn start_should_sweep_launch_dirs_left_by_a_crash() {
+        let mut engine = Engine::start().await;
+        let left = engine
+            .paths
+            .data_dir
+            .join("agent-runtime")
+            .join("run_0193f0a0b1c27d3e8f9a0b1c2d3e4f50");
+        std::fs::create_dir_all(&left).unwrap();
+        std::fs::write(left.join("script.json"), "[]").unwrap();
+        engine.child.kill().unwrap();
+        engine.child.wait().unwrap();
+        restart(&mut engine).await;
+        assert!(!left.exists());
+    }
+
+    // ---- the signal side channel (spec 0003, milestone 2) ----
+
+    /// The `agent_session_ref` of a run row.
+    fn session_ref(engine: &Engine, run: &str) -> Option<String> {
+        db(engine)
+            .query_row(
+                "SELECT agent_session_ref FROM run WHERE id = ?1",
+                [run],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// The run's journal events other than its status changes, as
+    /// (kind, actor, actor_ref, payload).
+    async fn agent_events(raw: &mut Raw, run: &str) -> Vec<(Value, Value, Value, Value)> {
+        all_events(raw, json!({ "run_id": run }))
+            .await
+            .into_iter()
+            .filter(|e| {
+                e["kind"] != json!("run_status_changed") && e["kind"] != json!("run_created")
+            })
+            .map(|e| {
+                (
+                    e["kind"].clone(),
+                    e["actor"].clone(),
+                    e["actor_ref"].clone(),
+                    e["payload"].clone(),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hook_steps_should_set_status_journal_agent_events_and_save_the_last_session() {
+        let engine = Engine::start().await;
+        let mut raw = engine.raw().await;
+        raw.hello(PROTOCOL.major).await;
+        let result = fake_runs(
+            &mut raw,
+            1,
+            json!([
+                { "print": "hi\r\n" },
+                { "status": "waiting_input" },
+                { "session": "s-1" },
+                { "event": { "message": { "role": "agent", "text": "hello" } } },
+                { "event": { "command_run": { "argv": ["cargo", "test"], "exit_code": 1 } } },
+                { "event": { "file_changed": { "path": "b.txt", "change": "renamed", "from_path": "a.txt" } } },
+                { "session": "s-2" },
+                { "status": "running" },
+                { "exit": 0 }
+            ]),
+        )
+        .await;
+        let (run, workspace) = (
+            result.run_ids[0].0.clone(),
+            json!(result.workspace_ids[0].0),
+        );
+        let statuses = until_ended(&mut raw, std::slice::from_ref(&run)).await;
+        let agent = json!("agent");
+        assert_eq!(
+            (
+                status_names(&statuses[&run]),
+                session_ref(&engine, &run),
+                agent_events(&mut raw, &run).await,
+            ),
+            (
+                vec![
+                    "starting",
+                    "running",
+                    "waiting_input",
+                    "running",
+                    "finished"
+                ],
+                Some("s-2".to_owned()),
+                vec![
+                    (
+                        json!("message"),
+                        agent.clone(),
+                        workspace.clone(),
+                        json!({ "role": "agent", "text": "hello" })
+                    ),
+                    (
+                        json!("command_run"),
+                        agent.clone(),
+                        workspace.clone(),
+                        json!({ "argv": ["cargo", "test"], "exit_code": 1 })
+                    ),
+                    (
+                        json!("file_changed"),
+                        agent,
+                        workspace,
+                        json!({ "path": "b.txt", "change": "renamed", "from_path": "a.txt" })
+                    ),
+                ]
+            )
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_waiting_pattern_on_screen_should_mean_waiting_input_until_new_output() {
+        let engine = Engine::start().await;
+        let mut raw = engine.raw().await;
+        raw.hello(PROTOCOL.major).await;
+        let result = raw
+            .call(
+                methods::DEV_AGENT_RUN,
+                json!({ "agent_id": "fake", "options": {
+                    "waiting_pattern": "[y/n]",
+                    "script": [
+                        { "print": "working\r\nAllow \u{1b}[1mrm\u{1b}[0m? [y/n] " },
+                        { "expect_input": "y" },
+                        { "print": "\r\nremoving\r\n" },
+                        { "expect_input": "q" },
+                    ],
+                } }),
+            )
+            .await;
+        let run = result["result"]["run_ids"][0].as_str().unwrap().to_owned();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while row(&engine, &run).0 != "waiting_input" {
+            assert!(Instant::now() < deadline, "never waiting: {result}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        raw.call(
+            methods::RUN_INPUT,
+            json!({ "run_id": run, "data_b64": b64(b"y") }),
+        )
+        .await;
+        until_running(&engine, &run).await;
+        raw.call(
+            methods::RUN_INPUT,
+            json!({ "run_id": run, "data_b64": b64(b"q") }),
+        )
+        .await;
+        let statuses = until_ended(&mut raw, std::slice::from_ref(&run)).await;
+        assert_eq!(
+            status_names(&statuses[&run]),
+            [
+                "starting",
+                "running",
+                "waiting_input",
+                "running",
+                "finished"
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hook_payload_over_256_kib_should_fall_back_and_journal_nothing() {
+        let engine = Engine::start().await;
+        let mut raw = engine.raw().await;
+        raw.hello(PROTOCOL.major).await;
+        let big = "x".repeat(300 * 1024);
+        let result = fake_runs(
+            &mut raw,
+            1,
+            json!([
+                { "event": { "message": { "role": "agent", "text": big } } },
+                { "event": { "message": { "role": "agent", "text": "small" } } },
+                { "exit": 0 }
+            ]),
+        )
+        .await;
+        let run = result.run_ids[0].0.clone();
+        until_ended(&mut raw, std::slice::from_ref(&run)).await;
+        let events = agent_events(&mut raw, &run).await;
+        assert_eq!(
+            (
+                row(&engine, &run).0,
+                events
+                    .iter()
+                    .map(|e| e.3["text"].clone())
+                    .collect::<Vec<_>>()
+            ),
+            ("finished".to_owned(), vec![json!("small")])
+        );
+    }
+
+    /// The next message within `within`, if any.
+    async fn next_within(raw: &mut Raw, within: Duration) -> Option<Value> {
+        tokio::time::timeout(within, raw.next())
+            .await
+            .ok()
+            .flatten()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_signal_connection_should_only_relay_hooks_and_get_no_notifications() {
+        let engine = Engine::start().await;
+        let mut signal = engine.raw().await;
+        let before = signal
+            .call(
+                methods::SIGNAL_HOOK,
+                json!({ "token": "t", "hook": "status" }),
+            )
+            .await;
+        signal.hello_as("signal", PROTOCOL.major).await;
+        let info = signal.call(methods::ENGINE_INFO, json!({})).await;
+        let attach = signal
+            .call(methods::RUN_ATTACH, json!({ "run_id": "run_x" }))
+            .await;
+        let unknown = signal
+            .call(
+                methods::SIGNAL_HOOK,
+                json!({ "token": "0".repeat(32), "hook": "status", "args": [], "stdin_b64": "" }),
+            )
+            .await;
+        let too_big = signal
+            .call(
+                methods::SIGNAL_HOOK,
+                json!({
+                    "token": "0".repeat(32),
+                    "hook": "event",
+                    "args": ["ab"],
+                    "stdin_b64": b64(&vec![b'x'; sy_protocol::MAX_SIGNAL_PAYLOAD_BYTES - 1]),
+                }),
+            )
+            .await;
+
+        // Another client's run: its status changes reach that client, not this one.
+        let mut other = engine.raw().await;
+        other.hello(PROTOCOL.major).await;
+        let not_signal = other
+            .call(
+                methods::SIGNAL_HOOK,
+                json!({ "token": "t", "hook": "status" }),
+            )
+            .await;
+        let run = fake_runs(&mut other, 1, json!([{ "print": "x" }, { "exit": 0 }]))
+            .await
+            .run_ids[0]
+            .0
+            .clone();
+        until_ended(&mut other, std::slice::from_ref(&run)).await;
+        let code = |reply: &Value| reply["error"]["code"].clone();
+        assert_eq!(
+            (
+                code(&before),
+                info["result"]["pid"].is_number(),
+                code(&attach),
+                code(&unknown),
+                code(&too_big),
+                code(&not_signal),
+                next_within(&mut signal, Duration::from_millis(300)).await,
+            ),
+            (
+                json!(ErrorCode::HelloRequired.code()),
+                true,
+                json!(ErrorCode::NotAllowedForClient.code()),
+                json!(ErrorCode::SignalTokenUnknown.code()),
+                json!(ErrorCode::SignalPayloadTooLarge.code()),
+                json!(ErrorCode::NotAllowedForClient.code()),
+                None,
+            )
+        );
+    }
+
+    /// A live fake run's signal token, read from its argv (visible to your own
+    /// processes through `ps`, which spec 0003's security model accepts).
+    fn fake_token(engine: &Engine, run: &str) -> String {
+        let pid: i64 = db(engine)
+            .query_row("SELECT pid FROM run WHERE id = ?1", [run], |r| r.get(0))
+            .unwrap();
+        let out = Command::new("ps")
+            .args(["-o", "command=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        let command = String::from_utf8(out.stdout).unwrap();
+        let mut words = command.split_whitespace();
+        words.find(|w| *w == "--token");
+        words
+            .next()
+            .expect("no --token in the fake's argv")
+            .to_owned()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hook_calls_past_the_burst_should_be_rate_limited_with_one_warning() {
+        let engine = Engine::start().await;
+        let mut raw = engine.raw().await;
+        raw.hello(PROTOCOL.major).await;
+        let run = agent_runs(&mut raw, 1, 0, false).await.remove(0);
+        until_running(&engine, &run).await;
+        let token = fake_token(&engine, &run);
+        let mut signal = engine.raw().await;
+        signal.hello_as("signal", PROTOCOL.major).await;
+        let (mut answered, mut limited) = (0, 0);
+        let started = Instant::now();
+        for _ in 0..700 {
+            let reply = signal
+                .call(
+                    methods::SIGNAL_HOOK,
+                    json!({ "token": token, "hook": "status", "stdin_b64": b64(br#""running""#) }),
+                )
+                .await;
+            if reply["result"]["exit_code"] == json!(0) {
+                answered += 1;
+            } else if reply["error"]["code"] == json!(ErrorCode::SignalRateLimited.code()) {
+                limited += 1;
+            } else {
+                panic!("{reply}");
+            }
+        }
+        // The bucket refills 100 a second while the calls go out.
+        let refill = (started.elapsed().as_millis() / 10) as u32 + 1;
+        // A held call is never charged: it still holds with the bucket empty.
+        let ask = br#"{"kind":"other","summary":"after the burst","detail":{"tool":"t"}}"#;
+        signal
+            .send(
+                methods::SIGNAL_HOOK,
+                json!({ "token": token, "hook": "approval", "stdin_b64": b64(ask) }),
+            )
+            .await;
+        let (held, _) = until_note(&mut raw, methods::APPROVAL_REQUESTED, Some(&run)).await;
+        assert_eq!(held["approval"]["summary"], json!("after the burst"));
+        stop_runs(&mut raw, std::slice::from_ref(&run)).await;
+        let warnings = engine.log().matches("over their rate limit").count();
+        assert!(
+            (500..=500 + refill).contains(&answered) && answered + limited == 700,
+            "{answered} answered, {limited} limited, refill up to {refill}"
+        );
+        assert_eq!(warnings, 1);
+    }
+
+    // ---- approvals (spec 0003, milestone 3) ----
+
+    /// An `approval` step: approve prints `approved` and exits 0; deny
+    /// prints `denied` and exits 4.
+    fn ask(summary: &str) -> Value {
+        json!({ "approval": {
+            "kind": "command",
+            "summary": summary,
+            "detail": { "command": "rm -rf build", "cwd": "/w" },
+            "on_approve": [{ "print": "approved\r\n" }, { "exit": 0 }],
+            "on_deny": [{ "print": "denied\r\n" }, { "exit": 4 }],
+        } })
+    }
+
+    /// Read until a `method` notification (for `run` when given); returns its
+    /// params and every message seen before it.
+    async fn until_note(raw: &mut Raw, method: &str, run: Option<&str>) -> (Value, Vec<Value>) {
+        let mut seen = Vec::new();
+        loop {
+            let msg = raw
+                .next()
+                .await
+                .unwrap_or_else(|| panic!("no {method}; saw {seen:?}"));
+            let for_run = run.is_none_or(|r| {
+                msg["params"]["run_id"] == json!(r)
+                    || msg["params"]["approval"]["run_id"] == json!(r)
+            });
+            if msg["method"] == json!(method) && for_run {
+                return (msg["params"].clone(), seen);
+            }
+            seen.push(msg);
+        }
+    }
+
+    /// Attach and read the run's output until it holds `needle`.
+    async fn until_output(raw: &mut Raw, run: &str, needle: &str) {
+        let reply = raw
+            .call(methods::RUN_ATTACH, json!({ "run_id": run }))
+            .await;
+        let mut text = String::from_utf8_lossy(&unb64(&reply["result"]["replay_b64"])).into_owned();
+        while !text.contains(needle) {
+            let msg = raw
+                .next()
+                .await
+                .unwrap_or_else(|| panic!("no {needle:?} in {text:?}"));
+            if msg["method"] == json!(methods::RUN_OUTPUT) && msg["params"]["run_id"] == json!(run)
+            {
+                text.push_str(&String::from_utf8_lossy(&unb64(&msg["params"]["data_b64"])));
+            }
+        }
+    }
+
+    fn approval_status(engine: &Engine, id: &Value) -> String {
+        db(engine)
+            .query_row(
+                "SELECT status FROM approval WHERE id = ?1",
+                [id.as_str().unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    async fn respond(raw: &mut Raw, id: &Value, decision: &str, message: Option<&str>) -> Value {
+        let mut params = json!({ "approval_id": id, "decision": decision });
+        if let Some(m) = message {
+            params["message"] = json!(m);
+        }
+        raw.call(methods::APPROVAL_RESPOND, params).await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_approval_should_hold_the_fake_until_answered_then_run_that_branch() {
+        let engine = Engine::start().await;
+        let mut raw = engine.raw().await;
+        raw.hello(PROTOCOL.major).await;
+        let mut ends = Vec::new();
+        for (decision, message) in [("approve", None), ("deny", Some("not today"))] {
+            let result = fake_runs(
+                &mut raw,
+                1,
+                json!([{ "print": "start\r\n" }, ask("clean build")]),
+            )
+            .await;
+            let (run, workspace) = (
+                result.run_ids[0].0.clone(),
+                result.workspace_ids[0].0.clone(),
+            );
+            let (requested, _) =
+                until_note(&mut raw, methods::APPROVAL_REQUESTED, Some(&run)).await;
+            let id = requested["approval"]["id"].clone();
+            let (waiting, _) = until_note(&mut raw, methods::RUN_STATUS, Some(&run)).await;
+            let waiting = if waiting["status"] == json!("running") {
+                until_note(&mut raw, methods::RUN_STATUS, Some(&run))
+                    .await
+                    .0
+            } else {
+                waiting
+            };
+            let answer = respond(&mut raw, &id, decision, message).await;
+            let (decided, _) = until_note(&mut raw, methods::APPROVAL_DECIDED, Some(&run)).await;
+            until_ended(&mut raw, std::slice::from_ref(&run)).await;
+            let a = &requested["approval"];
+            assert_eq!(
+                (
+                    (&a["kind"], &a["status"], &a["summary"], &a["workspace_id"]),
+                    (&a["detail"]["command"], &a["detail"]["cwd"]),
+                    requested["event_id"].is_i64(),
+                    &waiting["status"],
+                ),
+                (
+                    (
+                        &json!("command"),
+                        &json!("pending"),
+                        &json!("clean build"),
+                        &json!(workspace)
+                    ),
+                    (&json!("rm -rf build"), &json!("/w")),
+                    true,
+                    &json!("waiting_input"),
+                ),
+                "{requested}"
+            );
+            let status = if decision == "approve" {
+                "approved"
+            } else {
+                "denied"
+            };
+            assert_eq!(
+                (
+                    &answer["result"]["approval"]["status"],
+                    &answer["result"]["approval"]["decided_by"],
+                    &answer["result"]["approval"]["decided_by_ref"],
+                    &decided["approval"]["status"],
+                    &decided["approval"]["message"],
+                    decided["event_id"].is_i64(),
+                ),
+                (
+                    &json!(status),
+                    &json!("user"),
+                    &json!("inbox"),
+                    &json!(status),
+                    &message.map_or(Value::Null, |m| json!(m)),
+                    true,
+                ),
+                "{answer}"
+            );
+            let again = respond(&mut raw, &id, "approve", None).await;
+            assert_eq!(
+                again["error"]["code"],
+                json!(ErrorCode::ApprovalNotPending.code())
+            );
+            ends.push((
+                row(&engine, &run),
+                String::from_utf8_lossy(&log_file(&engine, &run)).into_owned(),
+            ));
+        }
+        assert_eq!(
+            ends.iter()
+                .map(|((s, _, c, _), log)| (
+                    s.as_str(),
+                    *c,
+                    log.contains("approved"),
+                    log.contains("denied")
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("finished", Some(0), true, false),
+                ("failed", Some(4), false, true)
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_held_approval_whose_helper_dies_should_expire_and_the_fake_should_ask_itself() {
+        let engine = Engine::start().await;
+        let mut raw = engine.raw().await;
+        raw.hello(PROTOCOL.major).await;
+        let run = fake_runs(&mut raw, 1, json!([ask("deploy")])).await.run_ids[0]
+            .0
+            .clone();
+        let (requested, _) = until_note(&mut raw, methods::APPROVAL_REQUESTED, Some(&run)).await;
+        let id = requested["approval"]["id"].clone();
+        let pid: i64 = db(&engine)
+            .query_row("SELECT pid FROM run WHERE id = ?1", [&run], |r| r.get(0))
+            .unwrap();
+        // The fake's only child is its `sy-signal`.
+        let killed = Command::new("pkill")
+            .args(["-KILL", "-P", &pid.to_string()])
+            .status()
+            .unwrap();
+        assert!(killed.success());
+        let (expired, _) = until_note(&mut raw, methods::APPROVAL_DECIDED, Some(&run)).await;
+        until_output(&mut raw, &run, "Allow deploy? [y/n] ").await;
+        let late = respond(&mut raw, &id, "approve", None).await;
+        raw.call(
+            methods::RUN_INPUT,
+            json!({ "run_id": run, "data_b64": b64(b"y\r") }),
+        )
+        .await;
+        until_ended(&mut raw, std::slice::from_ref(&run)).await;
+        assert_eq!(
+            (
+                &expired["approval"]["status"],
+                &expired["approval"].get("decided_by"),
+                &late["error"]["code"],
+                row(&engine, &run).0,
+                String::from_utf8_lossy(&log_file(&engine, &run)).contains("approved"),
+            ),
+            (
+                &json!("expired"),
+                &None,
+                &json!(ErrorCode::ApprovalNotPending.code()),
+                "finished".to_owned(),
+                true,
+            )
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_approval_the_engine_cannot_take_should_fall_back_to_the_agents_own_prompt() {
+        let engine = Engine::start().await;
+        let mut raw = engine.raw().await;
+        raw.hello(PROTOCOL.major).await;
+        // Over 256 KiB: `sy-signal` answers with its fallback without calling.
+        let huge = "z".repeat(300 * 1024);
+        let run = fake_runs(&mut raw, 1, json!([ask(&huge)])).await.run_ids[0]
+            .0
+            .clone();
+        until_output(&mut raw, &run, "? [y/n] ").await;
+        raw.call(
+            methods::RUN_INPUT,
+            json!({ "run_id": run, "data_b64": b64(b"n\r") }),
+        )
+        .await;
+        until_ended(&mut raw, std::slice::from_ref(&run)).await;
+        let rows: i64 = db(&engine)
+            .query_row("SELECT count(*) FROM approval", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            (row(&engine, &run).0, row(&engine, &run).2, rows),
+            ("failed".to_owned(), Some(4), 0)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stopping_a_run_should_deny_and_cancel_its_held_approval_before_it_ends() {
+        let engine = Engine::start().await;
+        let mut raw = engine.raw().await;
+        raw.hello(PROTOCOL.major).await;
+        let steps = json!([{ "approval": {
+            "kind": "fetch", "summary": "fetch it", "detail": { "url": "https://example.com" },
+            "on_deny": [{ "print": "told no\r\n" }, { "expect_input": NEVER }],
+        } }]);
+        let run = fake_runs(&mut raw, 1, steps).await.run_ids[0].0.clone();
+        let (requested, _) = until_note(&mut raw, methods::APPROVAL_REQUESTED, Some(&run)).await;
+        let stop = raw.send(methods::RUN_STOP, json!({ "run_id": run })).await;
+        let (cancelled, _) = until_note(&mut raw, methods::APPROVAL_DECIDED, Some(&run)).await;
+        let (ended, before) = loop {
+            let (status, before) = until_note(&mut raw, methods::RUN_STATUS, Some(&run)).await;
+            if status["status"] == json!("stopped") {
+                break (status, before);
+            }
+        };
+        assert!(
+            before
+                .iter()
+                .all(|m| m["id"] != json!(stop) || m.get("error").is_none())
+        );
+        assert_eq!(
+            (
+                &cancelled["approval"]["id"],
+                &cancelled["approval"]["status"],
+                &cancelled["approval"]["message"],
+                &ended["end_reason"],
+                approval_status(&engine, &requested["approval"]["id"]),
+            ),
+            (
+                &requested["approval"]["id"],
+                &json!("cancelled"),
+                &json!("run stopped"),
+                &json!("user_stop"),
+                "cancelled".to_owned(),
+            )
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_run_that_dies_holding_an_approval_should_cancel_it_before_its_end_and_revoke_the_token()
+     {
+        let engine = Engine::start().await;
+        let mut raw = engine.raw().await;
+        raw.hello(PROTOCOL.major).await;
+        let run = fake_runs(&mut raw, 1, json!([ask("held")])).await.run_ids[0]
+            .0
+            .clone();
+        until_note(&mut raw, methods::APPROVAL_REQUESTED, Some(&run)).await;
+        let token = fake_token(&engine, &run);
+        let pid: i64 = db(&engine)
+            .query_row("SELECT pid FROM run WHERE id = ?1", [&run], |r| r.get(0))
+            .unwrap();
+        Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .status()
+            .unwrap();
+        let (decided, _) = until_note(&mut raw, methods::APPROVAL_DECIDED, Some(&run)).await;
+        let (status, _) = loop {
+            let (status, seen) = until_note(&mut raw, methods::RUN_STATUS, Some(&run)).await;
+            if status["status"] == json!("failed") {
+                break (status, seen);
+            }
+        };
+        let mut signal = engine.raw().await;
+        signal.hello_as("signal", PROTOCOL.major).await;
+        let after = signal
+            .call(
+                methods::SIGNAL_HOOK,
+                json!({ "token": token, "hook": "status", "stdin_b64": b64(br#""running""#) }),
+            )
+            .await;
+        assert_eq!(
+            (
+                &decided["approval"]["status"],
+                &status["end_reason"],
+                &after["error"]["code"],
+                launch_dirs(&engine),
+            ),
+            (
+                &json!("cancelled"),
+                &json!("exited"),
+                &json!(ErrorCode::SignalTokenUnknown.code()),
+                0,
+            )
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pending_approval_should_be_expired_after_an_engine_restart() {
+        let mut engine = Engine::start().await;
+        let mut raw = engine.raw().await;
+        raw.hello(PROTOCOL.major).await;
+        let run = fake_runs(&mut raw, 1, json!([ask("left behind")]))
+            .await
+            .run_ids[0]
+            .0
+            .clone();
+        let (requested, _) = until_note(&mut raw, methods::APPROVAL_REQUESTED, Some(&run)).await;
+        let id = requested["approval"]["id"].clone();
+        engine.child.kill().unwrap();
+        engine.child.wait().unwrap();
+        restart(&mut engine).await;
+        let mut again = engine.raw().await;
+        again.hello(PROTOCOL.major).await;
+        let late = respond(&mut again, &id, "approve", None).await;
+        let expired = again
+            .call(methods::APPROVAL_LIST, json!({ "status": "expired" }))
+            .await;
+        assert_eq!(
+            (
+                approval_status(&engine, &id),
+                &late["error"]["code"],
+                &expired["result"]["approvals"][0]["id"],
+            ),
+            (
+                "expired".to_owned(),
+                &json!(ErrorCode::ApprovalNotPending.code()),
+                &id,
+            )
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn approval_list_should_page_pending_filter_by_run_and_check_its_params() {
+        let engine = Engine::start().await;
+        let mut raw = engine.raw().await;
+        raw.hello(PROTOCOL.major).await;
+        let runs: Vec<String> = fake_runs(&mut raw, 3, json!([ask("one of three")]))
+            .await
+            .run_ids
+            .into_iter()
+            .map(|r| r.0)
+            .collect();
+        for _ in 0..3 {
+            until_note(&mut raw, methods::APPROVAL_REQUESTED, None).await;
+        }
+        let first = raw
+            .call(methods::APPROVAL_LIST, json!({ "limit": 2 }))
+            .await;
+        let second = raw
+            .call(
+                methods::APPROVAL_LIST,
+                json!({ "limit": 2, "after": first["result"]["next"] }),
+            )
+            .await;
+        let of_run = raw
+            .call(methods::APPROVAL_LIST, json!({ "run_id": runs[1] }))
+            .await;
+        let none = raw
+            .call(methods::APPROVAL_LIST, json!({ "status": "denied" }))
+            .await;
+        let bad_status = raw
+            .call(methods::APPROVAL_LIST, json!({ "status": "asleep" }))
+            .await;
+        let bad_after = raw
+            .call(methods::APPROVAL_LIST, json!({ "after": { "id": "x" } }))
+            .await;
+        let id = &first["result"]["approvals"][0]["id"];
+        let long = respond(&mut raw, id, "deny", Some(&"m".repeat(4097))).await;
+        let unknown = respond(&mut raw, &json!("apr_0"), "approve", None).await;
+        let count = |r: &Value| r["result"]["approvals"].as_array().map_or(0, Vec::len);
+        let code = |r: &Value| r["error"]["code"].clone();
+        let invalid = json!(ErrorCode::InvalidParams.code());
+        assert_eq!(
+            (
+                (count(&first), &first["result"]["has_more"]),
+                (count(&second), &second["result"]["has_more"]),
+                (count(&of_run), &of_run["result"]["approvals"][0]["run_id"]),
+                (count(&none), none["result"].get("next").is_none()),
+                (code(&bad_status), code(&bad_after), code(&long)),
+                code(&unknown),
+            ),
+            (
+                (2, &json!(true)),
+                (1, &json!(false)),
+                (1, &json!(runs[1])),
+                (0, true),
+                (invalid.clone(), invalid.clone(), invalid),
+                json!(ErrorCode::ApprovalNotFound.code()),
+            )
+        );
+        stop_runs(&mut raw, &runs).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_held_signal_call_should_answer_over_the_wire_and_refuse_a_second_call_meanwhile() {
+        let engine = Engine::start().await;
+        let mut raw = engine.raw().await;
+        raw.hello(PROTOCOL.major).await;
+        let run = agent_runs(&mut raw, 1, 0, false).await.remove(0);
+        until_running(&engine, &run).await;
+        let token = fake_token(&engine, &run);
+        let mut signal = engine.raw().await;
+        signal.hello_as("signal", PROTOCOL.major).await;
+        let ask = br#"{"kind":"other","summary":"by hand","detail":{"tool":"t"}}"#;
+        let held = signal
+            .send(
+                methods::SIGNAL_HOOK,
+                json!({ "token": token, "hook": "approval", "stdin_b64": b64(ask) }),
+            )
+            .await;
+        let (requested, _) = until_note(&mut raw, methods::APPROVAL_REQUESTED, Some(&run)).await;
+        let second = signal
+            .call(
+                methods::SIGNAL_HOOK,
+                json!({ "token": token, "hook": "status", "stdin_b64": "" }),
+            )
+            .await;
+        respond(&mut raw, &requested["approval"]["id"], "deny", Some("nope")).await;
+        let reply = signal.response(held).await;
+        stop_runs(&mut raw, std::slice::from_ref(&run)).await;
+        assert_eq!(
+            (
+                &second["error"]["code"],
+                String::from_utf8(unb64(&reply["result"]["stdout_b64"])).unwrap(),
+                &reply["result"]["exit_code"],
+            ),
+            (
+                &json!(ErrorCode::InvalidRequest.code()),
+                r#"{"decision":"deny","message":"nope"}"#.to_owned(),
+                &json!(0),
+            )
+        );
+    }
+
+    // ---- detection (spec 0003, milestone 4) ----
+
+    /// An engine whose login `PATH` starts with `stubs`.
+    async fn engine_with_path(stubs: &Path) -> Engine {
+        let path = format!("{}:/usr/bin:/bin", stubs.display());
+        Engine::start_with(&[("PATH", &path)]).await
+    }
+
+    fn by_id<'a>(agents: &'a Value, id: &str) -> &'a Value {
+        agents["result"]["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"] == json!(id))
+            .unwrap_or_else(|| panic!("no {id} in {agents}"))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn detection_should_ask_claude_for_its_version_on_the_login_path() {
+        let stubs = tempfile::tempdir().unwrap();
+        let claude = stub(stubs.path(), "claude", "echo '2.1.325 (Claude Code)'");
+        let engine = engine_with_path(stubs.path()).await;
+        let mut raw = engine.raw().await;
+        raw.hello(PROTOCOL.major).await;
+        let detected = raw.call(methods::AGENT_DETECT, json!({})).await;
+        let listed = raw.call(methods::AGENT_LIST, json!({})).await;
+        let only = raw
+            .call(methods::AGENT_DETECT, json!({ "agent_id": "claude" }))
+            .await;
+        let unknown = raw
+            .call(methods::AGENT_DETECT, json!({ "agent_id": "nope" }))
+            .await;
+        let ids: Vec<_> = listed["result"]["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["id"].clone())
+            .collect();
+        let c = by_id(&detected, "claude");
+        let fake = by_id(&detected, "fake");
+        assert_eq!(
+            (
+                ids,
+                &c["detection"]["installed"],
+                &c["detection"]["version"],
+                &c["detection"]["signed_in"],
+                &c["detection"]["path"],
+                c["detection"].get("hint"),
+                c["detection"]["checked_at"].as_i64().unwrap() > 0,
+                &c["capabilities"]["launch"],
+            ),
+            (
+                vec![json!("claude"), json!("fake")],
+                &json!(true),
+                &json!("2.1.325"),
+                &json!("unknown"),
+                &json!(claude),
+                None,
+                true,
+                &json!(false),
+            )
+        );
+        assert_eq!(
+            (
+                &fake["detection"]["installed"],
+                fake["detection"].get("path"),
+                only["result"]["agents"].as_array().unwrap().len(),
+                &unknown["error"]["code"],
+            ),
+            (
+                &json!(true),
+                None,
+                1,
+                &json!(ErrorCode::AgentNotFound.code()),
+            )
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_missing_claude_should_be_not_installed_with_no_path() {
+        let stubs = tempfile::tempdir().unwrap();
+        let engine = engine_with_path(stubs.path()).await;
+        let mut raw = engine.raw().await;
+        raw.hello(PROTOCOL.major).await;
+        let detected = raw
+            .call(methods::AGENT_DETECT, json!({ "agent_id": "claude" }))
+            .await;
+        let d = &by_id(&detected, "claude")["detection"];
+        assert_eq!(
+            (&d["installed"], d.get("path"), d.get("version")),
+            (&json!(false), None, None)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hanging_claude_should_be_killed_at_5_s_and_concurrent_detects_share_one_pass() {
+        let stubs = tempfile::tempdir().unwrap();
+        let count = stubs.path().join("count");
+        stub(
+            stubs.path(),
+            "claude",
+            &format!("echo run >> '{}'\nsleep 30", count.display()),
+        );
+        let engine = engine_with_path(stubs.path()).await;
+        let started = Instant::now();
+        let mut conns = Vec::new();
+        for _ in 0..3 {
+            let mut raw = engine.raw().await;
+            raw.hello(PROTOCOL.major).await;
+            conns.push(raw);
+        }
+        let mut ids = Vec::new();
+        for raw in &mut conns {
+            ids.push(raw.send(methods::AGENT_DETECT, json!({})).await);
+        }
+        let mut answers = Vec::new();
+        for (raw, id) in conns.iter_mut().zip(ids) {
+            answers.push(raw.response(id).await);
+        }
+        let took = started.elapsed();
+        let runs = std::fs::read_to_string(&count).unwrap().lines().count();
+        let d = &by_id(&answers[0], "claude")["detection"];
+        assert_eq!(
+            (&d["installed"], &d["hint"], d.get("version"), runs),
+            (
+                &json!(true),
+                &json!("claude --version did not answer"),
+                None,
+                1
+            )
+        );
+        assert!(
+            took >= Duration::from_millis(4500) && took < Duration::from_secs(9),
+            "{took:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn env_refresh_should_report_the_capture_and_rerun_detection() {
+        let stubs = tempfile::tempdir().unwrap();
+        stub(stubs.path(), "claude", "echo '1.0.0'");
+        let engine = engine_with_path(stubs.path()).await;
+        let mut raw = engine.raw().await;
+        raw.hello(PROTOCOL.major).await;
+        let first = raw.call(methods::AGENT_DETECT, json!({})).await;
+        let at = by_id(&first, "claude")["detection"]["checked_at"]
+            .as_i64()
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let refreshed = raw.call(methods::ENV_REFRESH, json!({})).await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let listed = raw.call(methods::AGENT_LIST, json!({})).await;
+            if by_id(&listed, "claude")["detection"]["checked_at"]
+                .as_i64()
+                .unwrap()
+                > at
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "detection never reran");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            (refreshed["result"].clone(), login_env(&mut raw).await),
+            (
+                json!({ "login_env": { "status": "ok" } }),
+                json!({ "status": "ok" })
+            )
+        );
+    }
+
+    // ---- what is never logged (spec 0003, *Observability*) ----
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn engine_log_should_never_hold_payloads_tokens_env_values_or_prompts() {
+        const MARK: &str = "sy-never-logged-41c9";
+        let stubs = tempfile::tempdir().unwrap();
+        stub(
+            stubs.path(),
+            "claude",
+            &format!("echo '9.9.9 {MARK}-probe'"),
+        );
+        let path = format!("{}:/usr/bin:/bin", stubs.path().display());
+        let env_value = format!("{MARK}-env");
+        let mut engine = Engine::start_with(&[
+            ("SWITCHYARD_LOG", "trace"),
+            ("PATH", &path),
+            ("SY_TEST_SECRET", &env_value),
+        ])
+        .await;
+        let mut raw = engine.raw().await;
+        raw.hello(PROTOCOL.major).await;
+        raw.call(methods::AGENT_DETECT, json!({})).await;
+        let steps = json!([
+            { "session": format!("{MARK}-session") },
+            { "event": { "message": { "role": "agent", "text": format!("{MARK}-event") } } },
+            { "approval": {
+                "kind": "command",
+                "summary": format!("{MARK}-summary"),
+                "detail": { "command": format!("{MARK}-command") },
+                "on_approve": [{ "expect_input": NEVER }],
+            } },
+        ]);
+        let result = raw
+            .call(
+                methods::DEV_AGENT_RUN,
+                json!({ "agent_id": "fake", "prompt": format!("{MARK}-prompt"), "options": { "script": steps } }),
+            )
+            .await;
+        let run = result["result"]["run_ids"][0].as_str().unwrap().to_owned();
+        let (requested, _) = until_note(&mut raw, methods::APPROVAL_REQUESTED, Some(&run)).await;
+        let token = fake_token(&engine, &run);
+        respond(
+            &mut raw,
+            &requested["approval"]["id"],
+            "approve",
+            Some(&format!("{MARK}-message")),
+        )
+        .await;
+        stop_runs(&mut raw, std::slice::from_ref(&run)).await;
+        drop(raw);
+        stop(&mut engine).await;
+        let log = engine.log();
+        let leaks: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains(MARK) || l.contains(&token))
+            .collect();
+        assert!(
+            log.contains("hook call"),
+            "no hook call debug lines at trace level"
+        );
+        assert!(log.contains(&run), "the run's span fields are missing");
+        assert!(leaks.is_empty(), "engine.log leaks: {leaks:#?}");
     }
 }

@@ -25,6 +25,550 @@
         }
       ]
     },
+    "AgentCapabilities": {
+      "description": "What an adapter can do.",
+      "properties": {
+        "approvals": {
+          "description": "It relays permission requests.",
+          "type": "boolean"
+        },
+        "events": {
+          "description": "It reports journal events.",
+          "type": "boolean"
+        },
+        "launch": {
+          "description": "It can launch runs (false for a detection only adapter).",
+          "type": "boolean"
+        },
+        "resume": {
+          "description": "It can resume a session.",
+          "type": "boolean"
+        },
+        "status_source": {
+          "$ref": "#/$defs/StatusSource",
+          "description": "Where its live status comes from."
+        }
+      },
+      "required": [
+        "launch",
+        "approvals",
+        "resume",
+        "events",
+        "status_source"
+      ],
+      "type": "object"
+    },
+    "AgentDetectParams": {
+      "additionalProperties": false,
+      "description": "`agent.detect` params. Runs a detection pass (or joins the one running)\nand answers when it ends.",
+      "properties": {
+        "agent_id": {
+          "description": "Answer with only this agent; every agent when absent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "AgentDetection": {
+      "description": "An agent's last detection: asked of its CLI, never read from its files.",
+      "properties": {
+        "checked_at": {
+          "description": "When the detection pass ended, Unix ms UTC.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "hint": {
+          "description": "A hint for people, when something looks off.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "installed": {
+          "description": "Its CLI is on the login `PATH` (or at its absolute path).",
+          "type": "boolean"
+        },
+        "path": {
+          "description": "Where its CLI was found.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "signed_in": {
+          "$ref": "#/$defs/SignedIn",
+          "description": "Whether it is signed in."
+        },
+        "version": {
+          "description": "Its version, when it said.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "installed",
+        "signed_in",
+        "checked_at"
+      ],
+      "type": "object"
+    },
+    "AgentInfo": {
+      "description": "A registered agent adapter.",
+      "properties": {
+        "capabilities": {
+          "$ref": "#/$defs/AgentCapabilities",
+          "description": "What it can do."
+        },
+        "detection": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentDetection"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Its last detection; absent until the first pass ends."
+        },
+        "display_name": {
+          "description": "Its name for people.",
+          "type": "string"
+        },
+        "id": {
+          "description": "Its id (`claude`, ...).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "display_name",
+        "capabilities"
+      ],
+      "type": "object"
+    },
+    "AgentListResult": {
+      "description": "`agent.list` and `agent.detect` result, in registration order.",
+      "properties": {
+        "agents": {
+          "description": "The adapters.",
+          "items": {
+            "$ref": "#/$defs/AgentInfo"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "agents"
+      ],
+      "type": "object"
+    },
+    "AgentRunParams": {
+      "description": "`dev.agent_run` params: fixture rows plus runs of an agent, usually the\nfake agent (`agent_id: \"fake\"` with `options: { script: [...] }`).",
+      "properties": {
+        "agent_id": {
+          "description": "The agent adapter to launch.",
+          "type": "string"
+        },
+        "cols": {
+          "description": "Terminal width. Default 120.",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "count": {
+          "description": "How many runs to start, one workspace each: 1 to 32, default 1.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "options": {
+          "description": "The workspace's `agent_options`. Default `{}`."
+        },
+        "prompt": {
+          "description": "The prompt. Default `\"\"`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rows": {
+          "description": "Terminal height. Default 40.",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "agent_id"
+      ],
+      "type": "object"
+    },
+    "AgentRunResult": {
+      "description": "`dev.agent_run` result.",
+      "properties": {
+        "run_ids": {
+          "description": "The new runs, ready for `run.attach`. A run that could not launch is\nalready `failed`, with its reason as the first line of its log.",
+          "items": {
+            "$ref": "#/$defs/RunId"
+          },
+          "type": "array"
+        },
+        "task_id": {
+          "$ref": "#/$defs/TaskId",
+          "description": "The task this call created in the dev fixture project."
+        },
+        "workspace_ids": {
+          "description": "One workspace per run, in the same order as `run_ids`.",
+          "items": {
+            "$ref": "#/$defs/WorkspaceId"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "task_id",
+        "workspace_ids",
+        "run_ids"
+      ],
+      "type": "object"
+    },
+    "Approval": {
+      "description": "A permission request from a run.",
+      "properties": {
+        "decided_at": {
+          "description": "When it left `pending`.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "decided_by": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DecidedBy"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Who decided (`approved` and `denied` only)."
+        },
+        "decided_by_ref": {
+          "description": "Where they decided: `inbox` (`approval.respond`) or `terminal`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "detail": {
+          "description": "The kind's fields (`command` and `cwd`, `path` and `diff`, `url`,\n`server`, `tool` and `input`), plus the agent's `raw` payload and\n`raw_truncated: true` when it was cut to fit 64 KiB. May hold secrets\nthe agent was about to use; mask it on display."
+        },
+        "id": {
+          "$ref": "#/$defs/ApprovalId",
+          "description": "Its id."
+        },
+        "kind": {
+          "$ref": "#/$defs/ApprovalKind",
+          "description": "What it asks for."
+        },
+        "message": {
+          "description": "The decision's message, if any.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "requested_at": {
+          "description": "When it was asked, Unix ms UTC.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "run_id": {
+          "$ref": "#/$defs/RunId",
+          "description": "The run that asked."
+        },
+        "status": {
+          "$ref": "#/$defs/ApprovalStatus",
+          "description": "Its state."
+        },
+        "summary": {
+          "description": "One line for people, at most 200 characters.",
+          "type": "string"
+        },
+        "workspace_id": {
+          "$ref": "#/$defs/WorkspaceId",
+          "description": "That run's workspace."
+        }
+      },
+      "required": [
+        "id",
+        "run_id",
+        "workspace_id",
+        "kind",
+        "summary",
+        "detail",
+        "status",
+        "requested_at"
+      ],
+      "type": "object"
+    },
+    "ApprovalCursor": {
+      "additionalProperties": false,
+      "description": "A position in `approval.list`: the last approval a page returned.",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/ApprovalId",
+          "description": "Its id."
+        },
+        "requested_at": {
+          "description": "Its `requested_at`.",
+          "format": "int64",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "requested_at",
+        "id"
+      ],
+      "type": "object"
+    },
+    "ApprovalId": {
+      "description": "Identifies an approval (`apr_` plus 32 hex digits).",
+      "type": "string"
+    },
+    "ApprovalKind": {
+      "description": "What an approval asks for.",
+      "oneOf": [
+        {
+          "const": "command",
+          "description": "Run a command.",
+          "type": "string"
+        },
+        {
+          "const": "file_edit",
+          "description": "Edit a file.",
+          "type": "string"
+        },
+        {
+          "const": "fetch",
+          "description": "Fetch a URL.",
+          "type": "string"
+        },
+        {
+          "const": "mcp_tool",
+          "description": "Call an MCP tool.",
+          "type": "string"
+        },
+        {
+          "const": "other",
+          "description": "Anything else.",
+          "type": "string"
+        }
+      ]
+    },
+    "ApprovalListParams": {
+      "additionalProperties": false,
+      "description": "`approval.list` params. Filters combine with `after` (AND).",
+      "properties": {
+        "after": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ApprovalCursor"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Start after this approval (a page's `next`)."
+        },
+        "limit": {
+          "description": "Page size: absent or 0 means 100, capped at 500.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "run_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RunId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Only this run's approvals."
+        },
+        "status": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ApprovalStatus"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Only approvals in this state. Default `pending`."
+        }
+      },
+      "type": "object"
+    },
+    "ApprovalListResult": {
+      "description": "`approval.list` result, ordered by (`requested_at`, `id`).",
+      "properties": {
+        "approvals": {
+          "description": "The page.",
+          "items": {
+            "$ref": "#/$defs/Approval"
+          },
+          "type": "array"
+        },
+        "has_more": {
+          "description": "True when more approvals match after this page.",
+          "type": "boolean"
+        },
+        "next": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ApprovalCursor"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The last approval of this page, for `after`; absent on an empty page."
+        }
+      },
+      "required": [
+        "approvals",
+        "has_more"
+      ],
+      "type": "object"
+    },
+    "ApprovalNotification": {
+      "description": "`approval.requested` and `approval.decided` notifications (to every\nconnection after hello, except `signal` ones).",
+      "properties": {
+        "approval": {
+          "$ref": "#/$defs/Approval",
+          "description": "The approval as it is now."
+        },
+        "event_id": {
+          "description": "Its journal event id; `null` only while storage is degraded.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "approval"
+      ],
+      "type": "object"
+    },
+    "ApprovalRespondParams": {
+      "additionalProperties": false,
+      "description": "`approval.respond` params.",
+      "properties": {
+        "approval_id": {
+          "$ref": "#/$defs/ApprovalId",
+          "description": "The approval to answer (it must be `pending`)."
+        },
+        "decision": {
+          "$ref": "#/$defs/ApprovalVerdict",
+          "description": "Allow or refuse."
+        },
+        "message": {
+          "description": "A message for the agent, at most 4096 bytes.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "approval_id",
+        "decision"
+      ],
+      "type": "object"
+    },
+    "ApprovalRespondResult": {
+      "description": "`approval.respond` result: the decided approval, even if the agent could\nno longer take the reply.",
+      "properties": {
+        "approval": {
+          "$ref": "#/$defs/Approval",
+          "description": "The approval, now `approved` or `denied`."
+        }
+      },
+      "required": [
+        "approval"
+      ],
+      "type": "object"
+    },
+    "ApprovalStatus": {
+      "description": "An approval's state. Every state but `pending` is final.",
+      "oneOf": [
+        {
+          "const": "pending",
+          "description": "Waiting for you.",
+          "type": "string"
+        },
+        {
+          "const": "approved",
+          "description": "Allowed.",
+          "type": "string"
+        },
+        {
+          "const": "denied",
+          "description": "Refused.",
+          "type": "string"
+        },
+        {
+          "const": "expired",
+          "description": "The agent stopped waiting (its own hook timed out), or the engine restarted.",
+          "type": "string"
+        },
+        {
+          "const": "cancelled",
+          "description": "Its run ended or was stopped first.",
+          "type": "string"
+        }
+      ]
+    },
+    "ApprovalVerdict": {
+      "description": "Your answer to an approval.",
+      "oneOf": [
+        {
+          "const": "approve",
+          "description": "Allow it.",
+          "type": "string"
+        },
+        {
+          "const": "deny",
+          "description": "Refuse it.",
+          "type": "string"
+        }
+      ]
+    },
     "ClientKind": {
       "description": "Which kind of client is connecting.",
       "oneOf": [
@@ -42,6 +586,31 @@
           "const": "test",
           "description": "An automated test.",
           "type": "string"
+        },
+        {
+          "const": "signal",
+          "description": "`sy-signal`, relaying one agent hook call. It may call only the stable\nmethods and `signal.hook`, and it gets no notifications.",
+          "type": "string"
+        }
+      ]
+    },
+    "DecidedBy": {
+      "description": "Who decided an `approved` or `denied` approval.",
+      "oneOf": [
+        {
+          "const": "user",
+          "description": "You, in the inbox or the terminal.",
+          "type": "string"
+        },
+        {
+          "const": "policy",
+          "description": "An approval policy.",
+          "type": "string"
+        },
+        {
+          "const": "agent",
+          "description": "The agent itself.",
+          "type": "string"
         }
       ]
     },
@@ -56,6 +625,17 @@
         "engine_version": {
           "description": "The engine's build version.",
           "type": "string"
+        },
+        "login_env": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LoginEnvInfo"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How the login environment (what agents run with) was found. Absent\nuntil the first capture finishes. Optional, like `storage`."
         },
         "pid": {
           "description": "The engine's process id.",
@@ -90,6 +670,19 @@
         "pid",
         "protocol",
         "running_agents"
+      ],
+      "type": "object"
+    },
+    "EnvRefreshResult": {
+      "description": "`env.refresh` result. Detection reruns in the background after it.",
+      "properties": {
+        "login_env": {
+          "$ref": "#/$defs/LoginEnvInfo",
+          "description": "The new capture's state. Only later launches and probes use it."
+        }
+      },
+      "required": [
+        "login_env"
       ],
       "type": "object"
     },
@@ -602,6 +1195,98 @@
               "required": [
                 "path",
                 "change"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "kind",
+            "payload"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A run asked for your permission.",
+          "properties": {
+            "kind": {
+              "const": "approval_requested",
+              "type": "string"
+            },
+            "payload": {
+              "properties": {
+                "approval_id": {
+                  "$ref": "#/$defs/ApprovalId",
+                  "description": "The approval."
+                },
+                "kind": {
+                  "$ref": "#/$defs/ApprovalKind",
+                  "description": "What it asks for."
+                },
+                "summary": {
+                  "description": "One line for people.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "approval_id",
+                "kind",
+                "summary"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "kind",
+            "payload"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "An approval left `pending`.",
+          "properties": {
+            "kind": {
+              "const": "approval_decided",
+              "type": "string"
+            },
+            "payload": {
+              "properties": {
+                "approval_id": {
+                  "$ref": "#/$defs/ApprovalId",
+                  "description": "The approval."
+                },
+                "decided_by": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/DecidedBy"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "Who decided, for `approved` and `denied`."
+                },
+                "decided_by_ref": {
+                  "description": "Where they decided (`inbox`, `terminal`).",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "message": {
+                  "description": "The decision's message, if any.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "status": {
+                  "$ref": "#/$defs/ApprovalStatus",
+                  "description": "Its end state."
+                }
+              },
+              "required": [
+                "approval_id",
+                "status"
               ],
               "type": "object"
             }
@@ -1205,6 +1890,98 @@
             "payload"
           ],
           "type": "object"
+        },
+        {
+          "description": "A run asked for your permission.",
+          "properties": {
+            "kind": {
+              "const": "approval_requested",
+              "type": "string"
+            },
+            "payload": {
+              "properties": {
+                "approval_id": {
+                  "$ref": "#/$defs/ApprovalId",
+                  "description": "The approval."
+                },
+                "kind": {
+                  "$ref": "#/$defs/ApprovalKind",
+                  "description": "What it asks for."
+                },
+                "summary": {
+                  "description": "One line for people.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "approval_id",
+                "kind",
+                "summary"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "kind",
+            "payload"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "An approval left `pending`.",
+          "properties": {
+            "kind": {
+              "const": "approval_decided",
+              "type": "string"
+            },
+            "payload": {
+              "properties": {
+                "approval_id": {
+                  "$ref": "#/$defs/ApprovalId",
+                  "description": "The approval."
+                },
+                "decided_by": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/DecidedBy"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "Who decided, for `approved` and `denied`."
+                },
+                "decided_by_ref": {
+                  "description": "Where they decided (`inbox`, `terminal`).",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "message": {
+                  "description": "The decision's message, if any.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "status": {
+                  "$ref": "#/$defs/ApprovalStatus",
+                  "description": "Its end state."
+                }
+              },
+              "required": [
+                "approval_id",
+                "status"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "kind",
+            "payload"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -1439,6 +2216,41 @@
         {
           "const": "incompatible",
           "description": "The engine answered, but speaks an incompatible protocol major.",
+          "type": "string"
+        }
+      ]
+    },
+    "LoginEnvInfo": {
+      "description": "The login environment's state, for `engine.info` and `env.refresh`.",
+      "properties": {
+        "message": {
+          "description": "Why it fell back, for people.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/LoginEnvStatus",
+          "description": "Whether the login shell answered."
+        }
+      },
+      "required": [
+        "status"
+      ],
+      "type": "object"
+    },
+    "LoginEnvStatus": {
+      "description": "Whether the login shell gave the environment.",
+      "oneOf": [
+        {
+          "const": "ok",
+          "description": "Your login shell answered.",
+          "type": "string"
+        },
+        {
+          "const": "fallback",
+          "description": "It didn't; agents run with `PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin`.",
           "type": "string"
         }
       ]
@@ -1831,20 +2643,109 @@
       ],
       "type": "object"
     },
-    "StopRunsResult": {
-      "description": "`dev.stop_runs` result.",
+    "RunStopParams": {
+      "description": "`run.stop` params. Returns `{}` once the stop has started; the run's end\narrives as `run.status`.",
       "properties": {
-        "stopped": {
-          "description": "How many runs were stopped.",
-          "format": "uint32",
-          "minimum": 0,
-          "type": "integer"
+        "run_id": {
+          "$ref": "#/$defs/RunId",
+          "description": "The run to stop."
         }
       },
       "required": [
-        "stopped"
+        "run_id"
       ],
       "type": "object"
+    },
+    "SignalHookParams": {
+      "additionalProperties": false,
+      "description": "`signal.hook` params: one agent hook call, relayed by `sy-signal` on a\n`signal` connection. The reply may wait until an approval is decided.",
+      "properties": {
+        "args": {
+          "default": [],
+          "description": "The arguments the agent passed to the hook.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "hook": {
+          "description": "The hook's name, as the adapter configured it.",
+          "type": "string"
+        },
+        "stdin_b64": {
+          "default": "",
+          "description": "What the agent wrote to the hook's stdin, base64. With `args`, at most\n262144 bytes once decoded.",
+          "type": "string"
+        },
+        "token": {
+          "description": "The run's signal token (from the helper's own arguments).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "token",
+        "hook"
+      ],
+      "type": "object"
+    },
+    "SignalHookResult": {
+      "description": "`signal.hook` result: what `sy-signal` writes to stdout and exits with.",
+      "properties": {
+        "exit_code": {
+          "description": "The helper's exit code.",
+          "format": "int32",
+          "type": "integer"
+        },
+        "stdout_b64": {
+          "description": "The helper's stdout bytes, base64.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "stdout_b64",
+        "exit_code"
+      ],
+      "type": "object"
+    },
+    "SignedIn": {
+      "description": "Whether an agent's CLI is signed in.",
+      "oneOf": [
+        {
+          "const": "yes",
+          "description": "Yes.",
+          "type": "string"
+        },
+        {
+          "const": "no",
+          "description": "No.",
+          "type": "string"
+        },
+        {
+          "const": "unknown",
+          "description": "The CLI can't say without switchyard reading its files, which it never does.",
+          "type": "string"
+        }
+      ]
+    },
+    "StatusSource": {
+      "description": "Where an adapter's live status comes from.",
+      "oneOf": [
+        {
+          "const": "hooks",
+          "description": "The agent's own hooks.",
+          "type": "string"
+        },
+        {
+          "const": "patterns",
+          "description": "Patterns in its terminal output.",
+          "type": "string"
+        },
+        {
+          "const": "exit_only",
+          "description": "Only whether it exited.",
+          "type": "string"
+        }
+      ]
     },
     "StorageInfo": {
       "description": "Local storage health, in `engine.info` and the `storage.status` notification.",
@@ -1940,62 +2841,6 @@
         }
       ]
     },
-    "SyntheticRunParams": {
-      "description": "`dev.synthetic_run` params: fake runs that stream output.",
-      "properties": {
-        "bytes_per_sec": {
-          "description": "Output rate per run.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "count": {
-          "description": "How many runs to start.",
-          "format": "uint32",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "echo": {
-          "description": "Write every `run.input` straight back as output.",
-          "type": "boolean"
-        }
-      },
-      "required": [
-        "count",
-        "bytes_per_sec",
-        "echo"
-      ],
-      "type": "object"
-    },
-    "SyntheticRunResult": {
-      "description": "`dev.synthetic_run` result.",
-      "properties": {
-        "run_ids": {
-          "description": "The new runs, ready for `run.attach`.",
-          "items": {
-            "$ref": "#/$defs/RunId"
-          },
-          "type": "array"
-        },
-        "task_id": {
-          "$ref": "#/$defs/TaskId",
-          "description": "The task this call created in the dev fixture project."
-        },
-        "workspace_ids": {
-          "description": "One workspace per run, in the same order as `run_ids`.",
-          "items": {
-            "$ref": "#/$defs/WorkspaceId"
-          },
-          "type": "array"
-        }
-      },
-      "required": [
-        "run_ids",
-        "task_id",
-        "workspace_ids"
-      ],
-      "type": "object"
-    },
     "TaskId": {
       "description": "Identifies a task (the intent: a prompt worked on in one or more workspaces).",
       "type": "string"
@@ -2050,6 +2895,10 @@
   "description": "JSON-RPC 2.0, one UTF-8 message per line, over a user only local socket. Generated from crates/sy-protocol; do not edit.",
   "title": "switchyard engine protocol",
   "x-error-codes": {
+    "AgentLaunchUnsupported": -32061,
+    "AgentNotFound": -32060,
+    "ApprovalNotFound": -32070,
+    "ApprovalNotPending": -32071,
     "BackupMissing": -32052,
     "EngineDraining": -32010,
     "EngineShuttingDown": -32011,
@@ -2062,10 +2911,15 @@
     "InvalidParams": -32602,
     "InvalidRequest": -32600,
     "MethodNotFound": -32601,
+    "NotAllowedForClient": -32002,
     "ParseError": -32700,
     "RequestAbandoned": -32091,
     "RunLogUnavailable": -32043,
     "RunNotFound": -32040,
+    "RunNotLive": -32044,
+    "SignalPayloadTooLarge": -32081,
+    "SignalRateLimited": -32082,
+    "SignalTokenUnknown": -32080,
     "StorageRecoverNotNeeded": -32051,
     "StorageUnavailable": -32050
   },
@@ -2153,6 +3007,15 @@
       "dev_only": false,
       "direction": "client_to_engine",
       "kind": "request",
+      "name": "run.stop",
+      "params": "RunStopParams",
+      "result": "Empty",
+      "stable": false
+    },
+    {
+      "dev_only": false,
+      "direction": "client_to_engine",
+      "kind": "request",
       "name": "event.since",
       "params": "EventSinceParams",
       "result": "EventSinceResult",
@@ -2204,21 +3067,84 @@
       "stable": false
     },
     {
-      "dev_only": true,
+      "dev_only": false,
       "direction": "client_to_engine",
       "kind": "request",
-      "name": "dev.synthetic_run",
-      "params": "SyntheticRunParams",
-      "result": "SyntheticRunResult",
+      "name": "agent.list",
+      "params": "Empty",
+      "result": "AgentListResult",
+      "stable": false
+    },
+    {
+      "dev_only": false,
+      "direction": "client_to_engine",
+      "kind": "request",
+      "name": "agent.detect",
+      "params": "AgentDetectParams",
+      "result": "AgentListResult",
+      "stable": false
+    },
+    {
+      "dev_only": false,
+      "direction": "client_to_engine",
+      "kind": "request",
+      "name": "env.refresh",
+      "params": "Empty",
+      "result": "EnvRefreshResult",
+      "stable": false
+    },
+    {
+      "dev_only": false,
+      "direction": "client_to_engine",
+      "kind": "request",
+      "name": "approval.list",
+      "params": "ApprovalListParams",
+      "result": "ApprovalListResult",
+      "stable": false
+    },
+    {
+      "dev_only": false,
+      "direction": "client_to_engine",
+      "kind": "request",
+      "name": "approval.respond",
+      "params": "ApprovalRespondParams",
+      "result": "ApprovalRespondResult",
+      "stable": false
+    },
+    {
+      "dev_only": false,
+      "direction": "engine_to_client",
+      "kind": "notification",
+      "name": "approval.requested",
+      "params": "ApprovalNotification",
+      "result": null,
+      "stable": false
+    },
+    {
+      "dev_only": false,
+      "direction": "engine_to_client",
+      "kind": "notification",
+      "name": "approval.decided",
+      "params": "ApprovalNotification",
+      "result": null,
+      "stable": false
+    },
+    {
+      "dev_only": false,
+      "direction": "client_to_engine",
+      "kind": "request",
+      "name": "signal.hook",
+      "params": "SignalHookParams",
+      "result": "SignalHookResult",
       "stable": false
     },
     {
       "dev_only": true,
       "direction": "client_to_engine",
       "kind": "request",
-      "name": "dev.stop_runs",
-      "params": "Empty",
-      "result": "StopRunsResult",
+      "name": "dev.agent_run",
+      "params": "AgentRunParams",
+      "result": "AgentRunResult",
       "stable": false
     },
     {
@@ -2233,6 +3159,6 @@
   ],
   "x-protocol": {
     "major": 1,
-    "minor": 0
+    "minor": 1
   }
 }

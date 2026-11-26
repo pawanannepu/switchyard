@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use sy_core::runs::RunHub;
 use tokio::sync::watch;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,10 +39,7 @@ impl Lifecycle {
 
     #[cfg_attr(
         not(feature = "devtools"),
-        expect(
-            dead_code,
-            reason = "only dev.synthetic_run starts runs until feature 8"
-        )
+        expect(dead_code, reason = "only dev.agent_run starts runs until feature 8")
     )]
     pub fn is_draining(&self) -> bool {
         self.draining.load(Ordering::Relaxed)
@@ -70,13 +66,13 @@ impl Lifecycle {
     }
 
     /// `engine.drain`: refuse new work, exit once no agent is running, whatever clients are connected.
-    pub fn drain(self: &Arc<Self>, hub: &Arc<RunHub>) {
+    /// `runs` counts live agent runs, through the end of each one's end sequence.
+    pub fn drain(self: &Arc<Self>, mut runs: watch::Receiver<usize>) {
         if self.draining.swap(true, Ordering::Relaxed) {
             return;
         }
-        tracing::info!(running = hub.len(), "draining");
+        tracing::info!(running = *runs.borrow(), "draining");
         let this = Arc::clone(self);
-        let mut runs = hub.watch_count();
         tokio::spawn(async move {
             if runs.wait_for(|n| *n == 0).await.is_ok() {
                 this.request_exit(ExitReason::Drained);
@@ -85,10 +81,9 @@ impl Lifecycle {
     }
 
     /// Exit after `idle` with no agent running and no client connected.
-    pub fn spawn_idle_monitor(self: &Arc<Self>, hub: &Arc<RunHub>, idle: Duration) {
+    pub fn spawn_idle_monitor(self: &Arc<Self>, mut runs: watch::Receiver<usize>, idle: Duration) {
         let this = Arc::clone(self);
         let mut clients = self.clients.subscribe();
-        let mut runs = hub.watch_count();
         tokio::spawn(async move {
             loop {
                 let idle_now = *clients.borrow_and_update() == 0 && *runs.borrow_and_update() == 0;

@@ -27,11 +27,18 @@ pub struct Migration {
 }
 
 /// Every migration, in order. Append only.
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    name: "0001_spine.sql",
-    sql: include_str!("../../migrations/0001_spine.sql"),
-    rebuild: false,
-}];
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        name: "0001_spine.sql",
+        sql: include_str!("../../migrations/0001_spine.sql"),
+        rebuild: false,
+    },
+    Migration {
+        name: "0002_approval.sql",
+        sql: include_str!("../../migrations/0002_approval.sql"),
+        rebuild: false,
+    },
+];
 
 /// The newest schema version a list of migrations reaches.
 pub fn latest(migrations: &[Migration]) -> i64 {
@@ -169,7 +176,7 @@ mod tests {
         let broken = [
             MIGRATIONS,
             &[Migration {
-                name: "0002_broken.sql",
+                name: "9999_broken.sql",
                 sql: "CREATE TABLE half (x INTEGER) STRICT; INSERT INTO nowhere VALUES (1);",
                 rebuild: false,
             }],
@@ -183,10 +190,14 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
+        let next = latest(MIGRATIONS) + 1;
         assert!(matches!(
             result,
-            Err(OpenError::Migration { version: 2, .. })
+            Err(OpenError::Migration { version, .. }) if version == next
         ));
-        assert_eq!((user_version(&conn).unwrap(), half_exists), (1, 0));
+        assert_eq!(
+            (user_version(&conn).unwrap(), half_exists),
+            (latest(MIGRATIONS), 0)
+        );
     }
 }

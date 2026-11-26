@@ -9,7 +9,7 @@
   },
   "scripts": {
     "build": "pnpm --filter @switchyard/desktop build",
-    "dev": "cargo build -p sy-daemon --features devtools && pnpm --filter @switchyard/desktop tauri dev",
+    "dev": "cargo build -p sy-daemon -p sy-signal -p sy-fake-agent --features sy-daemon/devtools && pnpm --filter @switchyard/desktop tauri dev",
     "tauri": "pnpm --filter @switchyard/desktop tauri",
     "app:build": "node scripts/build-engine.mjs --release --universal && pnpm --filter @switchyard/desktop tauri build --target universal-apple-darwin --config src-tauri/tauri.bundle.conf.json",
     "app:build:devtools": "SWITCHYARD_DEVTOOLS=1 pnpm app:build",

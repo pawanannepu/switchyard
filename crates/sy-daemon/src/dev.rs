@@ -1,47 +1,37 @@
 //! `dev.*` methods, compiled only with the `devtools` feature.
 //!
-//! `dev.synthetic_run` creates fake runs that stream ANSI colored log lines at
-//! a set rate and, with `echo`, write every `run.input` straight back as
-//! output. The scaffold's load check uses it until feature 4's fake agent lands.
-//!
-//! Every synthetic run is a real row (spec 0002, AC-15): one fixture project,
-//! one task per call, one workspace plus one `agent` run per synthetic run,
-//! all through the `Store`, and output is saved through the `RunLog` before
-//! it is delivered. This is the end to end thread for persist before broadcast.
+//! `dev.agent_run` (spec 0003, AC-4) creates fixture rows the way spec 0002
+//! AC-15 describes (one fixture project, one task per call, one workspace per
+//! run) and launches each run through the real agent path: the adapter, a
+//! real PTY, the run hub. With the fake agent (`agent_id: "fake"`) its
+//! script decides what each run does; a `flood` script drives the load check.
 
+use std::fs::DirBuilder;
+use std::os::unix::fs::DirBuilderExt;
+use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
-use sy_core::ids::{RunId, WorkspaceId};
-use sy_core::model::{
-    Actor, EndReason, InitialWorkspaceState, NewProject, NewRun, NewTask, NewWorkspace, Project,
-    RunEnd, RunKind, RunStatus, RunTransition,
-};
+use serde_json::json;
+use sy_adapter_api::PtySize;
+use sy_core::agents::{StartError, StartRun, StoreWrites};
+use sy_core::ids::WorkspaceId;
+use sy_core::model::{Actor, InitialWorkspaceState, NewProject, NewTask, NewWorkspace, Project};
 use sy_core::ports::{Store, StoreError};
-use sy_core::runs::{RunControl, RunWriter};
 use sy_protocol::{
-    ErrorCode, RpcError, StopRunsResult, SyntheticRunParams, SyntheticRunResult, TaskId,
-    WorkspaceId as WireWorkspaceId,
+    AgentRunParams, AgentRunResult, ErrorCode, RpcError, TaskId, WorkspaceId as WireWorkspaceId,
 };
-use tokio::sync::mpsc;
 
 use crate::dispatch;
 use crate::engine::Engine;
 use crate::wire;
 
-const MAX_RUNS: u32 = 64;
-const MAX_BYTES_PER_SEC: u64 = 64 * 1024 * 1024;
-const TICK: Duration = Duration::from_millis(16);
-
-const FILLER: &str =
-    "the quick brown fox jumps over the lazy dog while switchyard keeps every agent in its lane ";
-
+/// Most runs one `dev.agent_run` call starts.
+const MAX_RUNS: u32 = 32;
+const DEFAULT_SIZE: PtySize = PtySize {
+    cols: 120,
+    rows: 40,
+};
 const FIXTURE_DIR: &str = "dev-fixture";
-
-fn store_error(err: &StoreError) -> RpcError {
-    // Feature 8 gives the store errors their own protocol codes.
-    RpcError::new(ErrorCode::InternalError, err.to_string())
-}
 
 /// The dev fixture project, created on first use and found by its path after.
 async fn fixture_project(engine: &Engine, store: &dyn Store) -> Result<Project, StoreError> {
@@ -66,202 +56,124 @@ async fn fixture_project(engine: &Engine, store: &dyn Store) -> Result<Project, 
     Ok(created.value)
 }
 
-fn fixture_workspace(engine: &Engine) -> NewWorkspace {
+/// A fixture workspace, with its worktree as a plain `0700` directory
+/// (feature 8 makes it a git worktree).
+fn fixture_workspace(
+    engine: &Engine,
+    agent_id: &str,
+    options: &str,
+) -> std::io::Result<NewWorkspace> {
     let id = WorkspaceId::new();
-    let worktree_path = engine
-        .data_dir
-        .join(FIXTURE_DIR)
-        .join(id.as_str())
-        .to_string_lossy()
-        .into_owned();
-    NewWorkspace {
+    let fixture = engine.data_dir.join(FIXTURE_DIR);
+    let worktree = fixture.join(id.as_str());
+    DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&fixture)?;
+    DirBuilder::new().mode(0o700).create(&worktree)?;
+    Ok(NewWorkspace {
         branch: format!("dev/{id}"),
         id,
-        agent_id: "synthetic".into(),
-        agent_options: "{}".into(),
-        worktree_path,
+        agent_id: agent_id.to_owned(),
+        agent_options: options.to_owned(),
+        worktree_path: path_text(&worktree),
         base_commit: String::new(),
         state: InitialWorkspaceState::Ready,
-    }
+    })
 }
 
-pub async fn synthetic_run(
+fn path_text(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+fn internal(message: impl std::fmt::Display) -> RpcError {
+    RpcError::new(ErrorCode::InternalError, message.to_string())
+}
+
+pub async fn agent_run(
     engine: &Arc<Engine>,
-    p: &SyntheticRunParams,
-) -> Result<SyntheticRunResult, RpcError> {
-    if p.count == 0 || p.count > MAX_RUNS {
+    p: AgentRunParams,
+) -> Result<AgentRunResult, RpcError> {
+    let count = p.count.unwrap_or(1);
+    if count == 0 || count > MAX_RUNS {
         return Err(RpcError::new(
             ErrorCode::InvalidParams,
             format!("count must be 1 to {MAX_RUNS}"),
         ));
     }
-    if p.bytes_per_sec > MAX_BYTES_PER_SEC {
+    // Both checked before any row exists.
+    let adapter = engine.agents.adapters().get(&p.agent_id).ok_or_else(|| {
+        RpcError::new(
+            ErrorCode::AgentNotFound,
+            format!("no agent adapter {}", p.agent_id),
+        )
+    })?;
+    if !adapter.capabilities().launch {
         return Err(RpcError::new(
-            ErrorCode::InvalidParams,
-            format!("bytes_per_sec must be at most {MAX_BYTES_PER_SEC}"),
+            ErrorCode::AgentLaunchUnsupported,
+            format!("{} can't launch runs yet", adapter.display_name()),
         ));
     }
+    let options = p.options.unwrap_or_else(|| json!({})).to_string();
+    let size = PtySize {
+        cols: p.cols.unwrap_or(DEFAULT_SIZE.cols),
+        rows: p.rows.unwrap_or(DEFAULT_SIZE.rows),
+    };
     let store = dispatch::store(engine)?;
     let project = fixture_project(engine, store.as_ref())
         .await
-        .map_err(|e| store_error(&e))?;
-    let workspaces = (0..p.count).map(|_| fixture_workspace(engine)).collect();
+        .map_err(|e| dispatch::store_error(&e))?;
+    let workspaces = (0..count)
+        .map(|_| fixture_workspace(engine, &p.agent_id, &options))
+        .collect::<std::io::Result<Vec<_>>>()
+        .map_err(|e| internal(format!("creating a fixture worktree: {e}")))?;
     let (task, workspaces) = store
         .create_task(
             Actor::User,
             NewTask {
                 project_id: project.id,
-                title: "Synthetic runs".into(),
-                prompt: String::new(),
+                title: format!("{} runs", adapter.display_name()),
+                prompt: p.prompt.clone().unwrap_or_default(),
                 base_ref: "main".into(),
                 parent_task_id: None,
                 workspaces,
             },
         )
         .await
-        .map_err(|e| store_error(&e))?
+        .map_err(|e| dispatch::store_error(&e))?
         .value;
 
+    let writes = Arc::new(StoreWrites(Arc::clone(&store)));
     let mut run_ids = Vec::with_capacity(workspaces.len());
-    for ws in &workspaces {
-        let id = start_run(engine, store.as_ref(), &ws.id, p.bytes_per_sec, p.echo).await?;
-        run_ids.push(wire::run_id(&id));
+    for workspace in &workspaces {
+        // Each run starts (or fails) on its own; rows already made stay.
+        let run = engine
+            .agents
+            .start(
+                writes.clone(),
+                StartRun {
+                    workspace: workspace.clone(),
+                    prompt: p.prompt.clone().unwrap_or_default(),
+                    size,
+                },
+            )
+            .await
+            .map_err(|err| match err {
+                StartError::UnknownAgent(id) => {
+                    RpcError::new(ErrorCode::AgentNotFound, format!("no agent adapter {id}"))
+                }
+                StartError::Store(e) => dispatch::store_error(&e),
+                StartError::Hub(e) => internal(e),
+            })?;
+        run_ids.push(wire::run_id(&run));
     }
-    tracing::info!(
-        count = p.count,
-        bytes_per_sec = p.bytes_per_sec,
-        echo = p.echo,
-        task = %task.id,
-        "synthetic runs started"
-    );
-    Ok(SyntheticRunResult {
-        run_ids,
+    tracing::info!(count, agent_id = %p.agent_id, task = %task.id, "dev agent runs started");
+    Ok(AgentRunResult {
         task_id: TaskId(task.id.to_string()),
         workspace_ids: workspaces
             .iter()
             .map(|w| WireWorkspaceId(w.id.to_string()))
             .collect(),
+        run_ids,
     })
-}
-
-/// The per run order from spec 0002: `create_run` (queued), then the hub
-/// entry, then `starting`, then `running`, then the producer.
-async fn start_run(
-    engine: &Arc<Engine>,
-    store: &dyn Store,
-    workspace: &WorkspaceId,
-    bytes_per_sec: u64,
-    echo: bool,
-) -> Result<RunId, RpcError> {
-    let id = RunId::new();
-    store
-        .create_run(
-            Actor::User,
-            NewRun {
-                id: id.clone(),
-                workspace_id: workspace.clone(),
-                kind: RunKind::Agent,
-                input: None,
-                resumes_run_id: None,
-            },
-        )
-        .await
-        .map_err(|e| store_error(&e))?;
-    let (writer, control) = engine
-        .hub
-        .create_run(id.clone())
-        .map_err(|e| RpcError::new(ErrorCode::InternalError, e.to_string()))?;
-    for status in [RunStatus::Starting, RunStatus::Running] {
-        store
-            .transition_run(Actor::User, &id, RunTransition::to(status))
-            .await
-            .map_err(|e| store_error(&e))?;
-    }
-    tokio::spawn(produce(writer, control, bytes_per_sec, echo));
-    Ok(id)
-}
-
-/// `dev.stop_runs`: for each live run, the final flush (append and deliver),
-/// then `stopped` with the final `log_bytes`, whose commit sends `run.status`.
-pub async fn stop_runs(engine: &Arc<Engine>) -> Result<StopRunsResult, RpcError> {
-    let store = dispatch::store(engine)?;
-    let mut stopped = 0_u32;
-    for id in engine.hub.run_ids() {
-        let hub = Arc::clone(&engine.hub);
-        let run = id.clone();
-        let removed = tokio::task::spawn_blocking(move || hub.remove(&run))
-            .await
-            .map_err(|e| RpcError::new(ErrorCode::InternalError, e.to_string()))?;
-        let Some(removed) = removed else { continue };
-        // A failed append already marked the log `incomplete` when it happened (AC-13).
-        store
-            .transition_run(
-                Actor::User,
-                &id,
-                RunTransition::end(
-                    RunStatus::Stopped,
-                    RunEnd {
-                        reason: EndReason::UserStop,
-                        exit_code: None,
-                        log_bytes: removed.log_bytes,
-                    },
-                ),
-            )
-            .await
-            .map_err(|e| store_error(&e))?;
-        stopped += 1;
-    }
-    Ok(StopRunsResult { stopped })
-}
-
-async fn produce(
-    writer: RunWriter,
-    mut control: mpsc::Receiver<RunControl>,
-    bytes_per_sec: u64,
-    echo: bool,
-) {
-    let started = Instant::now();
-    let mut last = started;
-    let mut budget = 0.0_f64;
-    let mut line_no = 0_u64;
-    let mut tick = tokio::time::interval(TICK);
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    writer.write(
-        format!(
-            "\x1b[1msynthetic run {}\x1b[0m ({bytes_per_sec} B/s, echo {echo})\r\n",
-            writer.id()
-        )
-        .as_bytes(),
-    );
-
-    loop {
-        tokio::select! {
-            _ = tick.tick(), if bytes_per_sec > 0 => {
-                let now = Instant::now();
-                let earned = bytes_per_sec as f64 * now.duration_since(last).as_secs_f64();
-                budget += earned;
-                last = now;
-                let mut buf = String::new();
-                while (buf.len() as f64) < budget {
-                    line_no += 1;
-                    let start = usize::try_from(line_no % 40).unwrap_or(0);
-                    let filler = &FILLER[start..start + 40];
-                    buf.push_str(&format!(
-                        "\x1b[2m{:>9.3}s\x1b[0m \x1b[36m{}\x1b[0m \x1b[32mINFO\x1b[0m line {line_no:>7} {filler}\r\n",
-                        started.elapsed().as_secs_f64(),
-                        writer.id(),
-                    ));
-                }
-                let written = buf.len() as f64;
-                budget -= written;
-                writer.write(buf.as_bytes());
-            }
-            message = control.recv() => match message {
-                Some(RunControl::Input(data)) if echo => writer.write(&data),
-                Some(_) => {}
-                None => break,
-            }
-        }
-    }
-    tracing::debug!(run = %writer.id(), bytes = writer.total(), "synthetic run stopped");
 }

@@ -1,11 +1,12 @@
 //! The storage ports (spec 0002, *Ports*): implemented by `sy-infra`
 //! (`SqliteStore`, `FileRunLog`, `SystemClock`) and by test doubles.
 
-use crate::ids::{ProjectId, RunId, TaskId, WorkspaceId};
+use crate::ids::{ApprovalId, ProjectId, RunId, TaskId, WorkspaceId};
 use crate::model::{
-    Actor, AdapterEvent, Event, InvalidTransition, InvalidWorkspaceTransition, JsonValue, LogState,
-    NewProject, NewRun, NewTask, NewWorkspace, NotAComparison, Project, ProjectSettings, Run,
-    RunStatus, RunTransition, Task, Workspace, WorkspaceChange, WorkspaceOutcome,
+    Actor, AdapterEvent, Approval, ApprovalDecision, ApprovalNotPending, ApprovalStatus, Event,
+    InvalidTransition, InvalidWorkspaceTransition, JsonValue, LogState, NewApproval, NewProject,
+    NewRun, NewTask, NewWorkspace, NotAComparison, Project, ProjectSettings, Run, RunStatus,
+    RunTransition, Task, Workspace, WorkspaceChange, WorkspaceOutcome,
 };
 
 /// The time source for every `*_at` value.
@@ -51,6 +52,9 @@ pub enum StoreError {
     /// The command needs every run to have ended first.
     #[error("it still has a live run")]
     HasLiveRuns,
+    /// The approval already left `pending` (spec 0003).
+    #[error(transparent)]
+    ApprovalNotPending(#[from] ApprovalNotPending),
     /// Storage is not open (degraded mode), or its thread has stopped.
     #[error("storage is unavailable")]
     Unavailable,
@@ -122,6 +126,19 @@ pub const fn page_size(limit: u32) -> u32 {
     }
 }
 
+/// Default page size for `approval.list` (spec 0003, AC-11).
+pub const DEFAULT_APPROVAL_PAGE: u32 = 100;
+
+/// The effective page size for an `approval.list` `limit`: 0 means
+/// [`DEFAULT_APPROVAL_PAGE`], and it is capped at [`MAX_PAGE`].
+pub const fn approval_page_size(limit: u32) -> u32 {
+    match limit {
+        0 => DEFAULT_APPROVAL_PAGE,
+        n if n > MAX_PAGE => MAX_PAGE,
+        n => n,
+    }
+}
+
 /// A keyset position: the sort time (`created_at`, or `queued_at` for runs)
 /// and id of the last row a page returned. The next page starts after it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,6 +176,15 @@ pub enum RunFilter {
     Status(Vec<RunStatus>),
 }
 
+/// Which approvals [`Store::list_approvals`] returns (spec 0003, AC-11).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalFilter {
+    /// Only approvals in this state.
+    pub status: ApprovalStatus,
+    /// Only this run's approvals.
+    pub run_id: Option<RunId>,
+}
+
 /// One run log the log cap may trim (AC-10).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrimCandidate {
@@ -176,7 +202,8 @@ pub struct RunProcess {
     /// Process group id.
     pub pgid: i64,
     /// The process start time, to tell a live orphan from a reused pid.
-    pub pid_started_at: i64,
+    /// `None` until feature 5 records it.
+    pub pid_started_at: Option<i64>,
 }
 
 /// The relational state and the event journal.
@@ -412,6 +439,50 @@ pub trait Store: Send + Sync {
         run: &RunId,
         event: AdapterEvent,
     ) -> Result<Committed<()>, StoreError>;
+
+    // ---- approvals (spec 0003) ----
+
+    /// Create a `pending` approval (its summary cut to 200 characters) with
+    /// its `approval_requested` event, filed under its run and every ancestor.
+    async fn create_approval(
+        &self,
+        actor: Actor,
+        actor_ref: Option<String>,
+        new: NewApproval,
+    ) -> Result<Committed<Approval>, StoreError>;
+
+    /// Move a `pending` approval to an end state, with its `approval_decided`
+    /// event. [`StoreError::ApprovalNotPending`] when it already left `pending`.
+    async fn decide_approval(
+        &self,
+        actor: Actor,
+        approval: &ApprovalId,
+        decision: ApprovalDecision,
+    ) -> Result<Committed<Approval>, StoreError>;
+
+    /// One approval.
+    async fn get_approval(&self, approval: &ApprovalId) -> Result<Approval, StoreError>;
+
+    /// Approvals by (`requested_at`, `id`), keyset paged (AC-11). The page
+    /// size is 100 by default (also for 0), at most 500.
+    async fn list_approvals(
+        &self,
+        filter: ApprovalFilter,
+        query: ListQuery,
+    ) -> Result<Page<Approval>, StoreError>;
+
+    /// Cancel every `pending` approval of a run (it ended or stopped), with
+    /// one `approval_decided` event each; the events are in the same order
+    /// as the approvals.
+    async fn cancel_pending_approvals(
+        &self,
+        actor: Actor,
+        run: &RunId,
+        message: Option<String>,
+    ) -> Result<Committed<Vec<Approval>>, StoreError>;
+
+    /// Expire every `pending` approval (engine start), one event each.
+    async fn expire_pending_approvals(&self) -> Result<Committed<Vec<Approval>>, StoreError>;
 
     // ---- log cap (AC-10) ----
 

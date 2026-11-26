@@ -29,6 +29,9 @@ pub enum ClientKind {
     Cli,
     /// An automated test.
     Test,
+    /// `sy-signal`, relaying one agent hook call. It may call only the stable
+    /// methods and `signal.hook`, and it gets no notifications.
+    Signal,
 }
 
 /// Params with no fields. Accepts `{}` or an absent `params`.
@@ -77,6 +80,37 @@ pub struct EngineInfo {
     /// for clients that predate it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage: Option<StorageInfo>,
+    /// How the login environment (what agents run with) was found. Absent
+    /// until the first capture finishes. Optional, like `storage`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login_env: Option<LoginEnvInfo>,
+}
+
+/// Whether the login shell gave the environment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LoginEnvStatus {
+    /// Your login shell answered.
+    Ok,
+    /// It didn't; agents run with `PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin`.
+    Fallback,
+}
+
+/// The login environment's state, for `engine.info` and `env.refresh`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct LoginEnvInfo {
+    /// Whether the login shell answered.
+    pub status: LoginEnvStatus,
+    /// Why it fell back, for people.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// `env.refresh` result. Detection reruns in the background after it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct EnvRefreshResult {
+    /// The new capture's state. Only later launches and probes use it.
+    pub login_env: LoginEnvInfo,
 }
 
 // ---- storage ----
@@ -354,6 +388,31 @@ pub enum EventPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         from_path: Option<String>,
     },
+    /// A run asked for your permission.
+    ApprovalRequested {
+        /// The approval.
+        approval_id: ApprovalId,
+        /// What it asks for.
+        kind: ApprovalKind,
+        /// One line for people.
+        summary: String,
+    },
+    /// An approval left `pending`.
+    ApprovalDecided {
+        /// The approval.
+        approval_id: ApprovalId,
+        /// Its end state.
+        status: ApprovalStatus,
+        /// Who decided, for `approved` and `denied`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        decided_by: Option<DecidedBy>,
+        /// Where they decided (`inbox`, `terminal`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        decided_by_ref: Option<String>,
+        /// The decision's message, if any.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
 }
 
 /// One journal event, as `event.since` returns it.
@@ -563,6 +622,14 @@ pub struct RunLogReadResult {
     pub log_bytes: u64,
 }
 
+/// `run.stop` params. Returns `{}` once the stop has started; the run's end
+/// arrives as `run.status`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RunStopParams {
+    /// The run to stop.
+    pub run_id: RunId,
+}
+
 /// `run.resync_needed` notification: this client fell behind; attach again.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct RunResyncNeeded {
@@ -570,35 +637,332 @@ pub struct RunResyncNeeded {
     pub run_id: RunId,
 }
 
-// ---- dev (only in engines built with the `devtools` feature) ----
+// ---- agent (spec 0003) ----
 
-/// `dev.synthetic_run` params: fake runs that stream output.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct SyntheticRunParams {
-    /// How many runs to start.
-    pub count: u32,
-    /// Output rate per run.
-    pub bytes_per_sec: u64,
-    /// Write every `run.input` straight back as output.
-    pub echo: bool,
+/// Where an adapter's live status comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusSource {
+    /// The agent's own hooks.
+    Hooks,
+    /// Patterns in its terminal output.
+    Patterns,
+    /// Only whether it exited.
+    ExitOnly,
 }
 
-/// `dev.synthetic_run` result.
+/// What an adapter can do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AgentCapabilities {
+    /// It can launch runs (false for a detection only adapter).
+    pub launch: bool,
+    /// It relays permission requests.
+    pub approvals: bool,
+    /// It can resume a session.
+    pub resume: bool,
+    /// It reports journal events.
+    pub events: bool,
+    /// Where its live status comes from.
+    pub status_source: StatusSource,
+}
+
+/// Whether an agent's CLI is signed in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SignedIn {
+    /// Yes.
+    Yes,
+    /// No.
+    No,
+    /// The CLI can't say without switchyard reading its files, which it never does.
+    Unknown,
+}
+
+/// An agent's last detection: asked of its CLI, never read from its files.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct SyntheticRunResult {
-    /// The new runs, ready for `run.attach`.
-    pub run_ids: Vec<RunId>,
+pub struct AgentDetection {
+    /// Its CLI is on the login `PATH` (or at its absolute path).
+    pub installed: bool,
+    /// Whether it is signed in.
+    pub signed_in: SignedIn,
+    /// Its version, when it said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Where its CLI was found.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// A hint for people, when something looks off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+    /// When the detection pass ended, Unix ms UTC.
+    pub checked_at: i64,
+}
+
+/// A registered agent adapter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AgentInfo {
+    /// Its id (`claude`, ...).
+    pub id: String,
+    /// Its name for people.
+    pub display_name: String,
+    /// What it can do.
+    pub capabilities: AgentCapabilities,
+    /// Its last detection; absent until the first pass ends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detection: Option<AgentDetection>,
+}
+
+/// `agent.list` and `agent.detect` result, in registration order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AgentListResult {
+    /// The adapters.
+    pub agents: Vec<AgentInfo>,
+}
+
+/// `agent.detect` params. Runs a detection pass (or joins the one running)
+/// and answers when it ends.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentDetectParams {
+    /// Answer with only this agent; every agent when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+}
+
+// ---- approval (spec 0003) ----
+
+/// Identifies an approval (`apr_` plus 32 hex digits).
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(transparent)]
+pub struct ApprovalId(pub String);
+
+/// What an approval asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalKind {
+    /// Run a command.
+    Command,
+    /// Edit a file.
+    FileEdit,
+    /// Fetch a URL.
+    Fetch,
+    /// Call an MCP tool.
+    McpTool,
+    /// Anything else.
+    Other,
+}
+
+/// An approval's state. Every state but `pending` is final.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalStatus {
+    /// Waiting for you.
+    Pending,
+    /// Allowed.
+    Approved,
+    /// Refused.
+    Denied,
+    /// The agent stopped waiting (its own hook timed out), or the engine restarted.
+    Expired,
+    /// Its run ended or was stopped first.
+    Cancelled,
+}
+
+/// Who decided an `approved` or `denied` approval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DecidedBy {
+    /// You, in the inbox or the terminal.
+    User,
+    /// An approval policy.
+    Policy,
+    /// The agent itself.
+    Agent,
+}
+
+/// A permission request from a run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct Approval {
+    /// Its id.
+    pub id: ApprovalId,
+    /// The run that asked.
+    pub run_id: RunId,
+    /// That run's workspace.
+    pub workspace_id: WorkspaceId,
+    /// What it asks for.
+    pub kind: ApprovalKind,
+    /// One line for people, at most 200 characters.
+    pub summary: String,
+    /// The kind's fields (`command` and `cwd`, `path` and `diff`, `url`,
+    /// `server`, `tool` and `input`), plus the agent's `raw` payload and
+    /// `raw_truncated: true` when it was cut to fit 64 KiB. May hold secrets
+    /// the agent was about to use; mask it on display.
+    pub detail: serde_json::Value,
+    /// Its state.
+    pub status: ApprovalStatus,
+    /// When it was asked, Unix ms UTC.
+    pub requested_at: i64,
+    /// When it left `pending`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decided_at: Option<i64>,
+    /// Who decided (`approved` and `denied` only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decided_by: Option<DecidedBy>,
+    /// Where they decided: `inbox` (`approval.respond`) or `terminal`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decided_by_ref: Option<String>,
+    /// The decision's message, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// A position in `approval.list`: the last approval a page returned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalCursor {
+    /// Its `requested_at`.
+    pub requested_at: i64,
+    /// Its id.
+    pub id: ApprovalId,
+}
+
+/// `approval.list` params. Filters combine with `after` (AND).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalListParams {
+    /// Only approvals in this state. Default `pending`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<ApprovalStatus>,
+    /// Only this run's approvals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<RunId>,
+    /// Start after this approval (a page's `next`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<ApprovalCursor>,
+    /// Page size: absent or 0 means 100, capped at 500.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// `approval.list` result, ordered by (`requested_at`, `id`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ApprovalListResult {
+    /// The page.
+    pub approvals: Vec<Approval>,
+    /// The last approval of this page, for `after`; absent on an empty page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<ApprovalCursor>,
+    /// True when more approvals match after this page.
+    pub has_more: bool,
+}
+
+/// Your answer to an approval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalVerdict {
+    /// Allow it.
+    Approve,
+    /// Refuse it.
+    Deny,
+}
+
+/// `approval.respond` params.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalRespondParams {
+    /// The approval to answer (it must be `pending`).
+    pub approval_id: ApprovalId,
+    /// Allow or refuse.
+    pub decision: ApprovalVerdict,
+    /// A message for the agent, at most 4096 bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// `approval.respond` result: the decided approval, even if the agent could
+/// no longer take the reply.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ApprovalRespondResult {
+    /// The approval, now `approved` or `denied`.
+    pub approval: Approval,
+}
+
+/// `approval.requested` and `approval.decided` notifications (to every
+/// connection after hello, except `signal` ones).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ApprovalNotification {
+    /// The approval as it is now.
+    pub approval: Approval,
+    /// Its journal event id; `null` only while storage is degraded.
+    pub event_id: Option<i64>,
+}
+
+// ---- signal (from `sy-signal`, the agent hook helper) ----
+
+/// `signal.hook` params: one agent hook call, relayed by `sy-signal` on a
+/// `signal` connection. The reply may wait until an approval is decided.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SignalHookParams {
+    /// The run's signal token (from the helper's own arguments).
+    pub token: String,
+    /// The hook's name, as the adapter configured it.
+    pub hook: String,
+    /// The arguments the agent passed to the hook.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// What the agent wrote to the hook's stdin, base64. With `args`, at most
+    /// 262144 bytes once decoded.
+    #[serde(default)]
+    pub stdin_b64: String,
+}
+
+/// `signal.hook` result: what `sy-signal` writes to stdout and exits with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SignalHookResult {
+    /// The helper's stdout bytes, base64.
+    pub stdout_b64: String,
+    /// The helper's exit code.
+    pub exit_code: i32,
+}
+
+// ---- dev (only in engines built with the `devtools` feature) ----
+
+/// `dev.agent_run` params: fixture rows plus runs of an agent, usually the
+/// fake agent (`agent_id: "fake"` with `options: { script: [...] }`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct AgentRunParams {
+    /// The agent adapter to launch.
+    pub agent_id: String,
+    /// The prompt. Default `""`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    /// The workspace's `agent_options`. Default `{}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<serde_json::Value>,
+    /// How many runs to start, one workspace each: 1 to 32, default 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u32>,
+    /// Terminal width. Default 120.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cols: Option<u16>,
+    /// Terminal height. Default 40.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<u16>,
+}
+
+/// `dev.agent_run` result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AgentRunResult {
     /// The task this call created in the dev fixture project.
     pub task_id: TaskId,
     /// One workspace per run, in the same order as `run_ids`.
     pub workspace_ids: Vec<WorkspaceId>,
-}
-
-/// `dev.stop_runs` result.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct StopRunsResult {
-    /// How many runs were stopped.
-    pub stopped: u32,
+    /// The new runs, ready for `run.attach`. A run that could not launch is
+    /// already `failed`, with its reason as the first line of its log.
+    pub run_ids: Vec<RunId>,
 }
 
 // ---- host (app host or dev bridge to UI; never sent by the engine) ----

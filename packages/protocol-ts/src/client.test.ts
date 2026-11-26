@@ -39,10 +39,10 @@ describe("createEngineClient", () => {
     const { transport, push } = fakeTransport();
     const client = createEngineClient(transport);
     const first = client.call("engine.info", {});
-    const second = client.call("dev.stop_runs", {});
-    push({ jsonrpc: "2.0", id: 2, result: { stopped: 3 } });
+    const second = client.call("run.stop", { run_id: "run_1" });
+    push({ jsonrpc: "2.0", id: 2, result: {} });
     push({ jsonrpc: "2.0", id: 1, result: { ...hello, running_agents: 0 } });
-    await expect(second).resolves.toEqual({ stopped: 3 });
+    await expect(second).resolves.toEqual({});
     await expect(first).resolves.toMatchObject({ pid: 42, running_agents: 0 });
   });
 

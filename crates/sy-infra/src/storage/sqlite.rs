@@ -18,16 +18,17 @@ use std::time::{Duration, Instant};
 use rusqlite::config::DbConfig;
 use rusqlite::{Connection, ErrorCode, OptionalExtension, Row, Transaction, params};
 use serde_json::{Value, json};
-use sy_core::ids::{ProjectId, RunId, TaskId, WorkspaceId};
+use sy_core::ids::{ApprovalId, ProjectId, RunId, TaskId, WorkspaceId};
 use sy_core::model::{
-    Actor, AdapterEvent, EndReason, Event, EventKind, EventScope, JsonValue, LogState, NewEvent,
+    Actor, AdapterEvent, Approval, ApprovalDecision, ApprovalKind, ApprovalStatus, DecidedBy,
+    EndReason, Event, EventKind, EventScope, JsonValue, LogState, NewApproval, NewEvent,
     NewProject, NewRun, NewTask, NewWorkspace, Project, ProjectSettings, Run, RunKind, RunStatus,
     RunTransition, STORAGE_PROBE_KEY, Task, Workspace, WorkspaceChange, WorkspaceOutcome,
-    WorkspaceState,
+    WorkspaceState, cut_summary,
 };
 use sy_core::ports::{
-    Clock, Committed, EventFilter, EventPage, Keyset, ListQuery, LogReconcile, Page, RunFilter,
-    RunProcess, Store, StoreError, TrimCandidate, page_size,
+    ApprovalFilter, Clock, Committed, EventFilter, EventPage, Keyset, ListQuery, LogReconcile,
+    Page, RunFilter, RunProcess, Store, StoreError, TrimCandidate, approval_page_size, page_size,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -634,6 +635,141 @@ fn update_run(
     let next = get_run(&tx, run)?;
     tx.commit().map_err(map_err)?;
     Ok(next)
+}
+
+const APPROVAL_COLUMNS: &str = "a.id, a.run_id, r.workspace_id, a.kind, a.summary, a.detail, a.status, a.requested_at, a.decided_at, a.decided_by, a.decided_by_ref, a.response";
+/// Approvals with their run, for the workspace id.
+const APPROVAL_FROM: &str = "approval a JOIN run r ON r.id = a.run_id";
+
+fn approval_row(r: &Row<'_>) -> rusqlite::Result<Approval> {
+    let decided_by: Option<String> = r.get(9)?;
+    let response: Option<String> = r.get(11)?;
+    let detail: String = r.get(5)?;
+    let as_json = |index: usize, text: &str| {
+        serde_json::from_str::<Value>(text).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                index,
+                rusqlite::types::Type::Text,
+                Box::new(e),
+            )
+        })
+    };
+    let message = response
+        .map(|text| as_json(11, &text))
+        .transpose()?
+        .and_then(|v| v.get("message").and_then(Value::as_str).map(str::to_owned));
+    Ok(Approval {
+        id: parse_id(r.get(0)?, ApprovalId::parse)?,
+        run_id: parse_id(r.get(1)?, RunId::parse)?,
+        workspace_id: parse_id(r.get(2)?, WorkspaceId::parse)?,
+        kind: parse_text(&r.get::<_, String>(3)?, ApprovalKind::parse)?,
+        summary: r.get(4)?,
+        detail: as_json(5, &detail)?,
+        status: parse_text(&r.get::<_, String>(6)?, ApprovalStatus::parse)?,
+        requested_at: r.get(7)?,
+        decided_at: r.get(8)?,
+        decided_by: decided_by
+            .map(|d| parse_text(&d, DecidedBy::parse))
+            .transpose()?,
+        decided_by_ref: r.get(10)?,
+        message,
+    })
+}
+
+fn get_approval(conn: &Connection, id: &ApprovalId) -> Result<Approval, StoreError> {
+    conn.prepare_cached(&format!(
+        "SELECT {APPROVAL_COLUMNS} FROM {APPROVAL_FROM} WHERE a.id = ?1"
+    ))
+    .and_then(|mut st| st.query_row([id.as_str()], approval_row))
+    .map_err(map_err)
+}
+
+/// The pending approvals of one run (or every run), oldest first.
+fn pending_approvals(conn: &Connection, run: Option<&RunId>) -> Result<Vec<Approval>, StoreError> {
+    conn.prepare_cached(&format!(
+        "SELECT {APPROVAL_COLUMNS} FROM {APPROVAL_FROM}
+         WHERE a.status = 'pending' AND (?1 IS NULL OR a.run_id = ?1)
+         ORDER BY a.requested_at, a.id"
+    ))
+    .and_then(|mut st| {
+        st.query_map([run.map(RunId::as_str)], approval_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+    })
+    .map_err(map_err)
+}
+
+/// Move one approval out of `pending` inside `tx`, with its event. The
+/// `WHERE status = 'pending'` makes the first change win.
+fn decide_in(
+    tx: &Transaction<'_>,
+    actor: Actor,
+    current: &Approval,
+    decision: &ApprovalDecision,
+    now: i64,
+) -> Result<(Approval, Event), StoreError> {
+    let next = current.decide(decision, now)?;
+    // `response` is `{ message? }` for your decisions, and only a message otherwise.
+    let response = (next.decided_by.is_some() || next.message.is_some()).then(|| {
+        match &next.message {
+            Some(m) => json!({ "message": m }),
+            None => json!({}),
+        }
+        .to_string()
+    });
+    let changed = tx
+        .prepare_cached(
+            "UPDATE approval SET status = ?2, decided_at = ?3, decided_by = ?4, decided_by_ref = ?5, response = ?6
+             WHERE id = ?1 AND status = 'pending'",
+        )
+        .and_then(|mut st| {
+            st.execute(params![
+                next.id.as_str(),
+                next.status.as_str(),
+                next.decided_at,
+                next.decided_by.map(DecidedBy::as_str),
+                next.decided_by_ref,
+                response,
+            ])
+        })
+        .map_err(map_err)?;
+    if changed == 0 {
+        return Err(StoreError::NotFound);
+    }
+    let ws = get_workspace(tx, &next.workspace_id)?;
+    let event = insert_event(
+        tx,
+        NewEvent {
+            at: now,
+            actor,
+            actor_ref: None,
+            scope: EventScope::run(&ws, &next.run_id),
+            kind: next.decided_event(),
+        },
+    )?;
+    Ok((next, event))
+}
+
+/// Decide every approval in `pending` as `decision`, in one transaction.
+fn decide_all(
+    db: &mut Db,
+    actor: Actor,
+    run: Option<&RunId>,
+    decision: &ApprovalDecision,
+) -> Result<Committed<Vec<Approval>>, StoreError> {
+    let now = db.clock.now_ms();
+    let tx = db.conn.transaction().map_err(map_err)?;
+    let mut approvals = Vec::new();
+    let mut events = Vec::new();
+    for current in pending_approvals(&tx, run)? {
+        let (next, event) = decide_in(&tx, actor, &current, decision, now)?;
+        approvals.push(next);
+        events.push(event);
+    }
+    Db::commit(tx, &events, &db.events)?;
+    Ok(Committed {
+        value: approvals,
+        events,
+    })
 }
 
 /// Insert a workspace, copying `project_id` from its task inside the insert.
@@ -1781,6 +1917,148 @@ impl Store for SqliteStore {
             )?];
             Db::commit(tx, &events, &db.events)?;
             Ok(Committed { value: (), events })
+        })
+        .await
+    }
+
+    // ---- approvals (spec 0003) ----
+
+    async fn create_approval(
+        &self,
+        actor: Actor,
+        actor_ref: Option<String>,
+        new: NewApproval,
+    ) -> Result<Committed<Approval>, StoreError> {
+        self.call("create_approval", move |db| {
+            let now = db.clock.now_ms();
+            let tx = db.conn.transaction().map_err(map_err)?;
+            let run = get_run(&tx, &new.run_id)?;
+            let ws = get_workspace(&tx, &run.workspace_id)?;
+            let summary = cut_summary(&new.summary);
+            tx.prepare_cached(
+                "INSERT INTO approval (id, run_id, kind, summary, detail, status, requested_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6)",
+            )
+            .and_then(|mut st| {
+                st.execute(params![
+                    new.id.as_str(),
+                    new.run_id.as_str(),
+                    new.kind.as_str(),
+                    summary,
+                    new.detail.to_string(),
+                    now
+                ])
+            })
+            .map_err(map_err)?;
+            let approval = get_approval(&tx, &new.id)?;
+            let events = vec![insert_event(
+                &tx,
+                NewEvent {
+                    at: now,
+                    actor,
+                    actor_ref,
+                    scope: EventScope::run(&ws, &run.id),
+                    kind: EventKind::ApprovalRequested {
+                        approval_id: approval.id.clone(),
+                        kind: approval.kind,
+                        summary: approval.summary.clone(),
+                    },
+                },
+            )?];
+            Db::commit(tx, &events, &db.events)?;
+            Ok(Committed {
+                value: approval,
+                events,
+            })
+        })
+        .await
+    }
+
+    async fn decide_approval(
+        &self,
+        actor: Actor,
+        approval: &ApprovalId,
+        decision: ApprovalDecision,
+    ) -> Result<Committed<Approval>, StoreError> {
+        let approval = approval.clone();
+        self.call("decide_approval", move |db| {
+            let now = db.clock.now_ms();
+            let tx = db.conn.transaction().map_err(map_err)?;
+            let current = get_approval(&tx, &approval)?;
+            let (next, event) = decide_in(&tx, actor, &current, &decision, now)?;
+            let events = vec![event];
+            Db::commit(tx, &events, &db.events)?;
+            Ok(Committed {
+                value: next,
+                events,
+            })
+        })
+        .await
+    }
+
+    async fn get_approval(&self, approval: &ApprovalId) -> Result<Approval, StoreError> {
+        let approval = approval.clone();
+        self.call("get_approval", move |db| get_approval(&db.conn, &approval))
+            .await
+    }
+
+    async fn list_approvals(
+        &self,
+        filter: ApprovalFilter,
+        query: ListQuery,
+    ) -> Result<Page<Approval>, StoreError> {
+        self.call("list_approvals", move |db| {
+            let limit = approval_page_size(query.limit);
+            let (at, id) = query
+                .after
+                .as_ref()
+                .map_or((i64::MIN, String::new()), |k| (k.at, k.id.clone()));
+            let rows = db
+                .conn
+                .prepare_cached(&format!(
+                    "SELECT {APPROVAL_COLUMNS} FROM {APPROVAL_FROM}
+                     WHERE a.status = ?1 AND (?2 IS NULL OR a.run_id = ?2)
+                       AND (a.requested_at > ?3 OR (a.requested_at = ?3 AND a.id > ?4))
+                     ORDER BY a.requested_at, a.id LIMIT ?5"
+                ))
+                .and_then(|mut st| {
+                    st.query_map(
+                        params![
+                            filter.status.as_str(),
+                            filter.run_id.as_ref().map(RunId::as_str),
+                            at,
+                            id,
+                            i64::from(limit) + 1
+                        ],
+                        approval_row,
+                    )?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .map_err(map_err)?;
+            Ok(page(rows, limit, |a| Keyset {
+                at: a.requested_at,
+                id: a.id.to_string(),
+            }))
+        })
+        .await
+    }
+
+    async fn cancel_pending_approvals(
+        &self,
+        actor: Actor,
+        run: &RunId,
+        message: Option<String>,
+    ) -> Result<Committed<Vec<Approval>>, StoreError> {
+        let run = run.clone();
+        self.call("cancel_pending_approvals", move |db| {
+            decide_all(db, actor, Some(&run), &ApprovalDecision::cancelled(message))
+        })
+        .await
+    }
+
+    async fn expire_pending_approvals(&self) -> Result<Committed<Vec<Approval>>, StoreError> {
+        self.call("expire_pending_approvals", |db| {
+            decide_all(db, Actor::Engine, None, &ApprovalDecision::expired())
         })
         .await
     }

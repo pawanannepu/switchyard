@@ -3,7 +3,7 @@
 import type * as T from "./types.ts";
 
 /** The protocol version this build speaks. Majors must match; minors only add things. */
-export const PROTOCOL = {"major":1,"minor":0} as const;
+export const PROTOCOL = {"major":1,"minor":1} as const;
 
 /** Size limits the engine enforces, in bytes. */
 export const LIMITS = {
@@ -16,6 +16,10 @@ export const LIMITS = {
 
 /** Every JSON-RPC error code the protocol uses, by name. */
 export const ErrorCode = {
+  "AgentLaunchUnsupported": -32061,
+  "AgentNotFound": -32060,
+  "ApprovalNotFound": -32070,
+  "ApprovalNotPending": -32071,
   "BackupMissing": -32052,
   "EngineDraining": -32010,
   "EngineShuttingDown": -32011,
@@ -28,10 +32,15 @@ export const ErrorCode = {
   "InvalidParams": -32602,
   "InvalidRequest": -32600,
   "MethodNotFound": -32601,
+  "NotAllowedForClient": -32002,
   "ParseError": -32700,
   "RequestAbandoned": -32091,
   "RunLogUnavailable": -32043,
   "RunNotFound": -32040,
+  "RunNotLive": -32044,
+  "SignalPayloadTooLarge": -32081,
+  "SignalRateLimited": -32082,
+  "SignalTokenUnknown": -32080,
   "StorageRecoverNotNeeded": -32051,
   "StorageUnavailable": -32050
 } as const;
@@ -48,10 +57,16 @@ export interface Requests {
   "run.input": { params: T.RunInputParams; result: T.Empty };
   "run.resize": { params: T.RunResizeParams; result: T.Empty };
   "run.log_read": { params: T.RunLogReadParams; result: T.RunLogReadResult };
+  "run.stop": { params: T.RunStopParams; result: T.Empty };
   "event.since": { params: T.EventSinceParams; result: T.EventSinceResult };
   "storage.recover": { params: T.StorageRecoverParams; result: T.StorageRecoverResult };
-  "dev.synthetic_run": { params: T.SyntheticRunParams; result: T.SyntheticRunResult };
-  "dev.stop_runs": { params: T.Empty; result: T.StopRunsResult };
+  "agent.list": { params: T.Empty; result: T.AgentListResult };
+  "agent.detect": { params: T.AgentDetectParams; result: T.AgentListResult };
+  "env.refresh": { params: T.Empty; result: T.EnvRefreshResult };
+  "approval.list": { params: T.ApprovalListParams; result: T.ApprovalListResult };
+  "approval.respond": { params: T.ApprovalRespondParams; result: T.ApprovalRespondResult };
+  "signal.hook": { params: T.SignalHookParams; result: T.SignalHookResult };
+  "dev.agent_run": { params: T.AgentRunParams; result: T.AgentRunResult };
 }
 
 /** Every notification: its params type. */
@@ -60,6 +75,8 @@ export interface Notifications {
   "run.status": T.RunStatusChanged;
   "storage.status": T.StorageInfo;
   "run.resync_needed": T.RunResyncNeeded;
+  "approval.requested": T.ApprovalNotification;
+  "approval.decided": T.ApprovalNotification;
   "host.connection": T.HostConnection;
 }
 
@@ -67,4 +84,4 @@ export interface Notifications {
 export const STABLE_METHODS = ["session.hello", "engine.info", "engine.drain", "engine.shutdown"] as const;
 
 /** Answered only by engines built with the `devtools` feature. */
-export const DEV_METHODS = ["dev.synthetic_run", "dev.stop_runs"] as const;
+export const DEV_METHODS = ["dev.agent_run"] as const;

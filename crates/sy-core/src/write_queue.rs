@@ -14,6 +14,9 @@
 //!   with `event_id: null`.
 //! - The queue holds at most [`QUEUE_CAP`] commands. Past that, new
 //!   `append_event` commands are dropped and counted.
+//! - `decide_approval` and `cancel_pending_approvals` (spec 0003) queue the
+//!   same way, projected through the approval's own rule (it leaves
+//!   `pending` once), so a run's end still cancels its approvals in order.
 //! - Creates (`create_*`, `add_workspace`) are never queued. They, and every
 //!   other write (archive, delete, trim, startup recovery), fail at once with
 //!   [`StoreError::Full`] while degraded.
@@ -32,15 +35,15 @@ use std::time::Duration;
 
 use tokio::sync::{Mutex, MutexGuard, mpsc, watch};
 
-use crate::ids::{ProjectId, RunId, TaskId, WorkspaceId};
+use crate::ids::{ApprovalId, ProjectId, RunId, TaskId, WorkspaceId};
 use crate::model::{
-    Actor, AdapterEvent, EventKind, JsonValue, LogState, NewProject, NewRun, NewTask, NewWorkspace,
-    Project, ProjectSettings, Run, RunTransition, STORAGE_PROBE_KEY, Task, Workspace,
-    WorkspaceChange, WorkspaceOutcome,
+    Actor, AdapterEvent, Approval, ApprovalDecision, ApprovalStatus, EventKind, JsonValue,
+    LogState, NewApproval, NewProject, NewRun, NewTask, NewWorkspace, Project, ProjectSettings,
+    Run, RunTransition, STORAGE_PROBE_KEY, Task, Workspace, WorkspaceChange, WorkspaceOutcome,
 };
 use crate::ports::{
-    Clock, Committed, EventFilter, EventPage, ListQuery, LogReconcile, Page, RunFilter,
-    RunLogError, RunProcess, Store, StoreError, TrimCandidate,
+    ApprovalFilter, Clock, Committed, EventFilter, EventPage, ListQuery, LogReconcile, Page,
+    RunFilter, RunLogError, RunProcess, Store, StoreError, TrimCandidate,
 };
 
 /// How often the engine retries the queue and probes while degraded.
@@ -118,6 +121,16 @@ enum Queued {
         run: RunId,
         event: AdapterEvent,
     },
+    DecideApproval {
+        actor: Actor,
+        approval: ApprovalId,
+        decision: ApprovalDecision,
+    },
+    CancelApprovals {
+        actor: Actor,
+        run: RunId,
+        message: Option<String>,
+    },
 }
 
 impl Queued {
@@ -132,6 +145,8 @@ impl Queued {
             Self::SessionRef { .. } => "set_agent_session_ref",
             Self::LogState { .. } => "set_log_state",
             Self::Event { .. } => "append_event",
+            Self::DecideApproval { .. } => "decide_approval",
+            Self::CancelApprovals { .. } => "cancel_pending_approvals",
         }
     }
 }
@@ -158,6 +173,8 @@ struct State {
     runs: HashMap<RunId, Run>,
     /// Workspaces a queued command changed.
     workspaces: HashMap<WorkspaceId, Workspace>,
+    /// Approvals a queued command decided.
+    approvals: HashMap<ApprovalId, Approval>,
 }
 
 impl State {
@@ -278,6 +295,7 @@ impl QueuedStore {
         st.degraded = None;
         st.dropped = 0;
         st.workspaces.clear();
+        st.approvals.clear();
         st.runs.retain(|_, run| !run.status.is_terminal());
         self.health.send_replace(WriteHealth::Ok);
         let _ = self.notices.send(StorageNotice::Health(WriteHealth::Ok));
@@ -335,6 +353,30 @@ impl QueuedStore {
                 .append_event(actor, actor_ref, &run, event)
                 .await
                 .map(drop),
+            Queued::DecideApproval {
+                actor,
+                approval,
+                decision,
+            } => inner
+                .decide_approval(actor, &approval, decision)
+                .await
+                .map(drop),
+            Queued::CancelApprovals {
+                actor,
+                run,
+                message,
+            } => inner
+                .cancel_pending_approvals(actor, &run, message)
+                .await
+                .map(drop),
+        }
+    }
+
+    /// The approval as it is now: a queued decision's result, or the database's row.
+    async fn approval_now(&self, st: &State, id: &ApprovalId) -> Result<Approval, StoreError> {
+        match st.approvals.get(id) {
+            Some(known) => Ok(known.clone()),
+            None => self.inner.get_approval(id).await,
         }
     }
 
@@ -853,7 +895,7 @@ impl Store for QueuedStore {
         let mut next = self.run_now(&st, run).await?;
         next.pid = Some(process.pid);
         next.pgid = Some(process.pgid);
-        next.pid_started_at = Some(process.pid_started_at);
+        next.pid_started_at = process.pid_started_at;
         st.runs.insert(run.clone(), next.clone());
         self.enqueue(
             &mut st,
@@ -900,6 +942,154 @@ impl Store for QueuedStore {
     async fn set_log_state(&self, run: &RunId, state: LogState) -> Result<Run, StoreError> {
         let mut st = self.state.lock().await;
         self.log_state_in(&mut st, run, state).await
+    }
+
+    async fn create_approval(
+        &self,
+        actor: Actor,
+        actor_ref: Option<String>,
+        new: NewApproval,
+    ) -> Result<Committed<Approval>, StoreError> {
+        // Never queued: with no row there is no approval, and the held hook
+        // falls back to the agent's own prompt (AC-9).
+        self.unqueued(
+            "create_approval",
+            self.inner.create_approval(actor, actor_ref, new),
+        )
+        .await
+    }
+
+    async fn decide_approval(
+        &self,
+        actor: Actor,
+        approval: &ApprovalId,
+        decision: ApprovalDecision,
+    ) -> Result<Committed<Approval>, StoreError> {
+        let mut st = self.state.lock().await;
+        if let Some(result) = self
+            .direct(
+                &mut st,
+                "decide_approval",
+                self.inner
+                    .decide_approval(actor, approval, decision.clone()),
+            )
+            .await
+        {
+            return result;
+        }
+        let current = self.approval_now(&st, approval).await?;
+        let next = current.decide(&decision, self.clock.now_ms())?;
+        st.approvals.insert(approval.clone(), next.clone());
+        self.enqueue(
+            &mut st,
+            Queued::DecideApproval {
+                actor,
+                approval: approval.clone(),
+                decision,
+            },
+        );
+        Ok(Committed {
+            value: next,
+            events: Vec::new(),
+        })
+    }
+
+    async fn get_approval(&self, approval: &ApprovalId) -> Result<Approval, StoreError> {
+        {
+            let st = self.state.lock().await;
+            if let Some(known) = st.approvals.get(approval) {
+                return Ok(known.clone());
+            }
+        }
+        self.inner.get_approval(approval).await
+    }
+
+    async fn list_approvals(
+        &self,
+        filter: ApprovalFilter,
+        query: ListQuery,
+    ) -> Result<Page<Approval>, StoreError> {
+        let mut page = self.inner.list_approvals(filter.clone(), query).await?;
+        // Queued decisions the database doesn't hold yet.
+        let st = self.state.lock().await;
+        if !st.approvals.is_empty() {
+            page.items = page
+                .items
+                .into_iter()
+                .map(|a| st.approvals.get(&a.id).cloned().unwrap_or(a))
+                .filter(|a| a.status == filter.status)
+                .collect();
+        }
+        Ok(page)
+    }
+
+    async fn cancel_pending_approvals(
+        &self,
+        actor: Actor,
+        run: &RunId,
+        message: Option<String>,
+    ) -> Result<Committed<Vec<Approval>>, StoreError> {
+        let mut st = self.state.lock().await;
+        if let Some(result) = self
+            .direct(
+                &mut st,
+                "cancel_pending_approvals",
+                self.inner
+                    .cancel_pending_approvals(actor, run, message.clone()),
+            )
+            .await
+        {
+            return result;
+        }
+        // Approvals are never created while degraded, so every pending one
+        // is in the database; the queued decisions take precedence.
+        let filter = ApprovalFilter {
+            status: ApprovalStatus::Pending,
+            run_id: Some(run.clone()),
+        };
+        let mut query = ListQuery::default();
+        let mut cancelled = Vec::new();
+        let now = self.clock.now_ms();
+        let decision = ApprovalDecision::cancelled(message.clone());
+        loop {
+            let page = self.inner.list_approvals(filter.clone(), query).await?;
+            for approval in page.items {
+                let current = st.approvals.get(&approval.id).cloned().unwrap_or(approval);
+                if let Ok(next) = current.decide(&decision, now) {
+                    st.approvals.insert(next.id.clone(), next.clone());
+                    cancelled.push(next);
+                }
+            }
+            match page.next {
+                Some(next) => {
+                    query = ListQuery {
+                        after: Some(next),
+                        limit: 0,
+                    }
+                }
+                None => break,
+            }
+        }
+        self.enqueue(
+            &mut st,
+            Queued::CancelApprovals {
+                actor,
+                run: run.clone(),
+                message,
+            },
+        );
+        Ok(Committed {
+            value: cancelled,
+            events: Vec::new(),
+        })
+    }
+
+    async fn expire_pending_approvals(&self) -> Result<Committed<Vec<Approval>>, StoreError> {
+        self.unqueued(
+            "expire_pending_approvals",
+            self.inner.expire_pending_approvals(),
+        )
+        .await
     }
 
     async fn append_event(

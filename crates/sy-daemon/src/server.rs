@@ -10,8 +10,16 @@ use sy_client::EnginePaths;
 use sy_client::transport::LinesCodecError;
 use sy_client::transport::{self, Stream};
 use sy_core::adapters::AdapterRegistry;
+use sy_core::agents::detect::{Detector, DetectorDeps};
+use sy_core::agents::ports::LoginEnv;
+use sy_core::agents::ports::RuntimeDir;
+use sy_core::agents::{AgentRuns, AgentRunsDeps, Timings};
 use sy_core::ports::Clock;
 use sy_core::recovery;
+use sy_core::runs::RunHub;
+use sy_infra::agents::{
+    FsRuntimeDir, InheritedEnv, PortablePty, RandomTokens, ShellLoginEnv, SystemProcessRunner,
+};
 use sy_infra::clock::SystemClock;
 use sy_infra::storage::{FileRunLog, StoragePaths, sweep_backup_temps};
 use sy_protocol::CLIENT_QUEUE_BYTES;
@@ -81,15 +89,77 @@ pub async fn run(
             removed_files = recovered.removed_files,
             "startup recovery done"
         );
+        // No hook still waits for an approval the last engine held (AC-10).
+        match store.expire_pending_approvals().await {
+            Ok(expired) if !expired.value.is_empty() => {
+                tracing::info!(expired = expired.value.len(), "expired pending approvals");
+            }
+            Ok(_) => {}
+            Err(err) => tracing::warn!(%err, "could not expire pending approvals"),
+        }
     }
 
-    let engine = Engine::new(
+    // No launch dir outlives its engine (spec 0003, AC-13), and none is in use yet.
+    let runtime = Arc::new(FsRuntimeDir::new(&paths.data_dir));
+    match runtime.sweep() {
+        Ok(0) => {}
+        Ok(removed) => tracing::info!(removed, "removed leftover launch dirs"),
+        Err(err) => tracing::warn!(%err, "could not sweep leftover launch dirs"),
+    }
+    // Detection probes run in `agent-runtime/` itself.
+    if let Err(err) = runtime.ensure_root() {
+        tracing::warn!(%err, "could not create the agent runtime dir");
+    }
+    let login: Arc<dyn LoginEnv> = if config.inherit_login_env {
+        tracing::info!("using the engine's own environment as the login environment");
+        Arc::new(InheritedEnv::capture())
+    } else {
+        ShellLoginEnv::new(None)
+    };
+    let detector = Detector::new(DetectorDeps {
+        adapters: adapters.clone(),
+        runner: Arc::new(SystemProcessRunner),
+        login: Arc::clone(&login),
+        runtime: Arc::clone(&runtime) as Arc<dyn RuntimeDir>,
+        clock: Arc::clone(&clock),
+    });
+    let hub = RunHub::new(Arc::clone(&run_log));
+    let (approvals_tx, approvals_rx) = mpsc::unbounded_channel();
+    let agents = AgentRuns::new(AgentRunsDeps {
+        approvals: approvals_tx,
         adapters,
+        hub: Arc::clone(&hub),
+        pty: Arc::new(PortablePty),
+        runtime,
+        login: Arc::clone(&login),
+        tokens: Arc::new(RandomTokens::default()),
+        clock: Arc::clone(&clock),
+        signal_helper: config.helper(crate::config::SIGNAL_HELPER),
+        socket: paths.socket.to_string_lossy().into_owned(),
+        timings: Timings::default(),
+    });
+    // The first login capture, then the first detection pass, in the
+    // background; a launch waits for the capture (spec 0003, AC-3, AC-16).
+    {
+        let (login, detector) = (Arc::clone(&login), Arc::clone(&detector));
+        tokio::spawn(async move {
+            let captured = login.refresh().await;
+            if let Some(why) = &captured.fallback {
+                tracing::warn!(%why, "login environment fell back");
+            }
+            detector.detect().await;
+        });
+    }
+    let engine = Engine::new(
+        hub,
+        agents,
+        detector,
+        login,
         Arc::clone(&storage),
         run_log,
         paths.data_dir.clone(),
     );
-    engine::spawn_broadcaster(&engine, committed_rx, notices_rx);
+    engine::spawn_broadcaster(&engine, committed_rx, notices_rx, approvals_rx);
     engine::spawn_log_cap(&engine);
     engine::spawn_write_retry(&engine);
     engine::spawn_log_failures(&engine);
@@ -99,7 +169,7 @@ pub async fn run(
         .context("starting the run flusher")?;
     engine
         .lifecycle
-        .spawn_idle_monitor(&engine.hub, config.idle_exit);
+        .spawn_idle_monitor(engine.agents.watch_live(), config.idle_exit);
     let mut exit = engine.lifecycle.watch_exit();
     let mut connections = JoinSet::new();
 
@@ -107,7 +177,7 @@ pub async fn run(
         version = crate::ENGINE_VERSION,
         pid = engine.pid,
         socket = %paths.socket.display(),
-        adapters = ?engine.adapters.ids().collect::<Vec<_>>(),
+        adapters = ?engine.agents.adapters().ids().collect::<Vec<_>>(),
         devtools = cfg!(feature = "devtools"),
         "engine started"
     );
@@ -141,8 +211,10 @@ pub async fn run(
 
     tracing::info!(?reason, "engine stopping");
     drop(listener);
-    // Feature 5 replaces this with SIGHUP to each agent's process group, a 5 s wait, then SIGKILL.
-    let stopped = engine.remove_all_runs().await;
+    // Every live run at once: its graceful step (capped at 3 s), SIGHUP, 5 s,
+    // SIGKILL, then its end is recorded (spec 0003, AC-12).
+    let stopped = engine.agents.live_count();
+    engine.agents.stop_all().await;
     // Each connection sees the exit, finishes the request it is handling (a
     // store commit may still be in flight), closes its own outbox and drains
     // it. Only a connection still busy after the grace period is cut off.
@@ -185,14 +257,20 @@ async fn serve(engine: Arc<Engine>, stream: Stream) {
     let mut ctx = ConnectionCtx {
         id,
         session: Session::NoHello,
+        signal: false,
         sink: ClientSink::new(Arc::clone(&outbox)),
+        outbox: Arc::clone(&outbox),
+        hook: None,
     };
     let mut lines = transport::line_reader(read);
     let mut exit = engine.lifecycle.watch_exit();
     loop {
+        // A connection with an open `signal.hook` stays until its answer is
+        // sent and the helper hangs up, even while the engine exits (AC-12).
+        let hook_open = ctx.hook_open();
         let next = tokio::select! {
             next = lines.next() => next,
-            _ = exit.wait_for(Option::is_some) => break,
+            _ = exit.wait_for(Option::is_some), if !hook_open => break,
         };
         match next {
             Some(Ok(text)) => {
@@ -215,6 +293,10 @@ async fn serve(engine: Arc<Engine>, stream: Stream) {
         }
     }
 
+    // The helper went away with its call open: nobody waits for the answer.
+    if let Some(hook) = ctx.hook.take() {
+        hook.abort();
+    }
     outbox.close();
     engine.unregister_connection(id);
     let _ = writer.await;

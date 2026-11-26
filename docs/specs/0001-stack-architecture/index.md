@@ -107,13 +107,15 @@ These rules keep "a new agent never touches the core" and "nothing in the core t
 |---|---|---|
 | `sy-protocol` | serde, schemars | anything else in the workspace |
 | `sy-client` | `sy-protocol`, tokio, serde_json, `dirs` (or similar for OS paths) | `sy-core`, `sy-infra`, any adapter, tauri |
-| `sy-adapter-api` | serde, tokio, thiserror | `sy-core`, `sy-infra`, any adapter |
+| `sy-adapter-api` | serde, serde_json, thiserror, vte (changed by [spec 0003](../0003-agent-adapter-contract-fake-agent/index.md): the contract is pure and synchronous) | `sy-core`, `sy-infra`, any adapter |
 | `sy-core` | `sy-adapter-api`, serde, tokio, thiserror, tracing | `sy-infra`, any adapter, tauri, rusqlite, portable-pty, keyring. No `cfg(target_os)` code. |
 | `sy-infra` | `sy-core` (to implement its ports), rusqlite, portable-pty, keyring | `sy-daemon`, tauri, any adapter |
 | `sy-adapters/*` | `sy-adapter-api` only (plus general utility crates) | `sy-core`, `sy-infra`, any other adapter |
 | `sy-daemon` | everything above | tauri |
 | `apps/desktop/src-tauri` | `sy-protocol`, `sy-client`, tauri and its plugins | `sy-core`, `sy-infra`, `sy-daemon`, adapters |
 | `sy-devbridge` (dev and test only) | `sy-protocol`, `sy-client` | everything else |
+| `sy-signal` (hook helper, bundled beside `switchyardd`, spec 0003) | `sy-protocol`, `sy-client` | everything else |
+| `sy-fake-agent` (dev and test only, spec 0003) | no workspace crate | every workspace crate |
 | UI (`apps/desktop/src`) | `packages/protocol-ts`, React and the UI libraries | Tauri's file system, shell or HTTP plugins |
 
 Operating system specific code (`cfg(target_os)`) lives only in `sy-infra`, `sy-client` (path and socket details only) and `src-tauri`. There is exactly one data dir and socket path resolver, in `sy-client`. The engine, the app host and the dev bridge all call it, so they can never disagree about where the socket is. Each adapter registers itself with the daemon at startup, so adding one touches `sy-adapters/<new>/` plus one registration line in `sy-daemon`, and nothing in `sy-core`.
@@ -138,7 +140,7 @@ Operating system specific code (`cfg(target_os)`) lives only in `sy-infra`, `sy-
 - **Window closed.** The app keeps a menu bar item showing running and attention counts. It keeps its engine connection, posts OS notifications from the app host, and reopens the window in one click. **Quit** from the menu bar asks first when agents are running.
 - **Idle exit.** The engine exits by itself when no agent is running and no client has been connected for 5 minutes. While the app runs, its connection keeps the engine alive. That's intended, and draining (below) is the only way an engine exits while a client is connected.
 - **Version mismatch (drain then swap).** After an update, if the running engine's protocol major differs from the app's, the app reads `engine.info` and shows "N agents are running on the previous engine". You choose **Restart now**, which calls `engine.shutdown` after a confirmation (feature 23 then resumes the agents), or **When they finish**, which calls `engine.drain`. The old engine exits once its last agent stops, and the app's retry loop then starts the new engine. A compatible older engine is used normally until it goes idle.
-- **Shutdown.** On `engine.shutdown`, SIGTERM (for example at logout) or idle exit, the engine stops accepting connections. It sends SIGHUP to each agent's process group, waits up to 5 seconds, then SIGKILLs whatever remains. It flushes logs and the database, removes the socket, and exits. Feature 5 may refine the timeouts.
+- **Shutdown.** On `engine.shutdown`, SIGTERM (for example at logout) or idle exit, the engine stops accepting connections. It sends SIGHUP to each agent's process group, waits up to 5 seconds, then SIGKILLs whatever remains. (Amended by spec 0003, AC-12: each agent's adapter first gets a graceful stop step capped at 3 seconds during shutdown, so shutdown takes at most about 8 seconds.) It flushes logs and the database, removes the socket, and exits. Feature 5 may refine the timeouts.
 - **Engine crash.** The app detects the dropped connection, shows "engine stopped", and offers to restart it. Agents owned by the crashed engine are lost or orphaned. Finding and cleaning those up is feature 23's job (see Consequences).
 
 ### Local data
@@ -181,7 +183,7 @@ Derived from feature 1's "done when" in the scope. `/develop stack & architectur
 3. Closing the window leaves the menu bar item and the engine running. Reopening from the menu bar reconnects to the same engine: the `pid` from `engine.info` is unchanged. This is checked in the built `.app`.
 4. Running a second `switchyardd` by hand logs "already running" and exits with code 0. The socket is untouched and the app keeps working. Launching the app twice in a row ends with exactly one engine.
 5. After `kill -9` of the engine, the app shows "engine stopped". Restarting it takes over the lock, replaces the stale socket and reconnects.
-6. A load check (a `devtools` build): `dev.synthetic_run { count: 12, bytes_per_sec: 51200, echo: true }`. The UI renders all 12 runs in xterm.js over the Tauri channel, not the dev bridge. On an Apple silicon Mac, the p95 time from sending `run.input` to the echoed bytes being drawn (`performance.now()` at send, then xterm's write callback) is under 100 ms. The engine's per run producer is never blocked by a slow client. Feature 4's fake agent replaces the synthetic run once it lands.
+6. A load check (a `devtools` build): `dev.synthetic_run { count: 12, bytes_per_sec: 51200, echo: true }`. The UI renders all 12 runs in xterm.js over the Tauri channel, not the dev bridge. On an Apple silicon Mac, the p95 time from sending `run.input` to the echoed bytes being drawn (`performance.now()` at send, then xterm's write callback) is under 100 ms. The engine's per run producer is never blocked by a slow client. Feature 4's fake agent replaces the synthetic run once it lands (spec 0003: `dev.agent_run` with a `flood` script).
 7. The dependency rules above hold: `sy-core` builds with no `cfg(target_os)` and none of the forbidden dependencies, adapters depend only on `sy-adapter-api`, and `src-tauri` depends only on `sy-protocol` and `sy-client`.
 8. The generated TS protocol types match `protocol.schema.json`, so a drift check fails if they don't.
 9. The peer check function rejects a user id that differs from the engine's (a unit test, since a second macOS user isn't available in CI). A line over 1 MiB closes only that connection.
@@ -215,7 +217,7 @@ Derived from feature 1's "done when" in the scope. `/develop stack & architectur
 ## Follow-up
 
 - [ ] Feature 3 (data model): run output log layout and retention on disk, and the schema.
-- [ ] Feature 4 (adapter contract): define `sy-adapter-api`, and weigh the Agent Client Protocol (all four target agents are listed as supporting it) as the primary transport beside PTY.
+- [x] Feature 4 (adapter contract): define `sy-adapter-api`, and weigh the Agent Client Protocol (all four target agents are listed as supporting it) as the primary transport beside PTY. Settled in spec 0003: PTY plus a hook side channel, with ACP left as a possible later driver.
 - [ ] Feature 5 (supervisor): decide whether a per agent holder process is needed so agents outlive an engine crash. Set time and output limits.
 - [ ] Feature 2 (tooling): enforce the dependency table in CI (for example with `cargo-deny` bans or a `cargo metadata` check), the schema drift check, lint, format and type checks, and the Playwright and Vitest setup.
 - [ ] Feature 7 (design system): styling approach and the accessible component primitives.

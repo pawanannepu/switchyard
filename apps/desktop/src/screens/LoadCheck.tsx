@@ -66,8 +66,17 @@ function TerminalCell({
   );
 }
 
+/** The fake agent floods output at the rate and echoes every input byte (spec 0003). */
+const FLOOD_SCRIPT = [{ flood: { bytes_per_sec: BYTES_PER_SEC, echo: true } }];
+
+/** Stop each run; a run that already ended is fine. */
+function stopRuns(runIds: readonly string[]): Promise<unknown> {
+  return Promise.all(runIds.map((run_id) => engine.call("run.stop", { run_id }).catch(() => {})));
+}
+
 export function LoadCheck() {
   const [runIds, setRunIds] = useState<string[]>([]);
+  const live = useRef<string[]>([]);
   const [stats, setStats] = useState<Stats | null>(null);
   const [error, setError] = useState<string | null>(null);
   const terminals = useRef(new Map<string, RunTerminal>());
@@ -113,11 +122,12 @@ export function LoadCheck() {
     latencies.current = [];
     setStats(null);
     try {
-      const { run_ids } = await engine.call("dev.synthetic_run", {
+      const { run_ids } = await engine.call("dev.agent_run", {
+        agent_id: "fake",
         count: RUNS,
-        bytes_per_sec: BYTES_PER_SEC,
-        echo: true,
+        options: { script: FLOOD_SCRIPT },
       });
+      live.current = run_ids;
       setRunIds(run_ids);
     } catch (err) {
       const missing = err instanceof RpcError && err.code === ErrorCode.MethodNotFound;
@@ -126,11 +136,13 @@ export function LoadCheck() {
   }
 
   async function stop() {
+    const runs = live.current;
+    live.current = [];
     setRunIds([]);
-    await engine.call("dev.stop_runs", {}).catch(() => {});
+    await stopRuns(runs);
   }
 
-  useEffect(() => () => void engine.call("dev.stop_runs", {}).catch(() => {}), []);
+  useEffect(() => () => void stopRuns(live.current), []);
 
   const ms = (n: number) => `${n.toFixed(1)} ms`;
 

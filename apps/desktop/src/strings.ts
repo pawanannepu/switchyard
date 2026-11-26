@@ -30,7 +30,7 @@ export const strings = {
   load: {
     heading: "Load check",
     intro:
-      "Starts 12 synthetic runs at 50 KiB/s each, renders them all, and measures the time from sending input to the echo being drawn. The target is a p95 under 100 ms.",
+      "Starts 12 fake agent runs at 50 KiB/s each, renders them all, and measures the time from sending input to the echo being drawn. The target is a p95 under 100 ms.",
     start: "Start 12 runs",
     stop: "Stop runs",
     running: "Measuring…",
@@ -44,6 +44,6 @@ export const strings = {
     paused: "Stream paused because this view fell behind.",
     resume: "Resume",
     terminal: (runId: string) => `Terminal for ${runId}`,
-    unavailable: "This engine was built without devtools, so it has no synthetic runs.",
+    unavailable: "This engine was built without devtools, so it has no fake agent runs.",
   },
 } as const;

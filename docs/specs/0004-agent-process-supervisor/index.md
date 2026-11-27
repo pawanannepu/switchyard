@@ -1,7 +1,7 @@
 # 0004. Agent process supervisor: engine owned PTYs, run limits, full process tree cleanup and per run fault isolation
 
 **Date**: 2026-11-27
-**Status**: In Progress
+**Status**: Accepted
 
 ## Summary
 

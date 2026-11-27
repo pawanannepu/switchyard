@@ -1,7 +1,7 @@
 # 0003. Agent adapter contract: pure adapters, the real TUI in a PTY, and a hook side channel, plus a scripted fake agent
 
 **Date**: 2026-11-22
-**Status**: In Progress
+**Status**: Accepted
 
 ## Summary
 

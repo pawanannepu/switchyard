@@ -17,9 +17,9 @@ _These are recommendations to keep your build orderly, not requirements. Skip an
 |---|---------|-------|--------|
 | 1 | Stack & architecture | Foundation | done |
 | 2 | Coding standards & tooling | Foundation | done |
-| 3 | Data model | Foundation | in-progress |
-| 4 | Agent adapter contract & fake agent | Foundation | in-progress |
-| 5 | Agent process supervisor | Foundation | in-progress |
+| 3 | Data model | Foundation | done |
+| 4 | Agent adapter contract & fake agent | Foundation | done |
+| 5 | Agent process supervisor | Foundation | done |
 | 6 | Logging & diagnostics | Foundation | planned |
 | 7 | Design system & UI foundation | Foundation | planned |
 | 8 | Core task loop | Slice 1 | planned |
@@ -53,7 +53,7 @@ _These are recommendations to keep your build orderly, not requirements. Skip an
 
 ## Epics
 
-- [Foundations](foundations.md): 1 to 7 · 2 done, 3 in progress, 2 planned
+- [Foundations](foundations.md): 1 to 7 · 5 done, 2 planned
 - [Workspaces](workspaces.md): running tasks, environments, recovery, history, prompts (8, 9, 10, 13, 14, 23, 30, 31) · 8 planned
 - [Control](control.md): sandbox, approvals, limits, cost (11, 12, 26, 27) · 4 planned
 - [Agents](agents.md): adapters, onboarding, extensions (15 to 19, 32, 33) · 7 planned, 1 deferred

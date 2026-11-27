@@ -1,7 +1,7 @@
 # 0002. Local data model: relational state, an event journal and per run output logs
 
 **Date**: 2026-11-22
-**Status**: In Progress
+**Status**: Accepted
 
 ## Summary
 

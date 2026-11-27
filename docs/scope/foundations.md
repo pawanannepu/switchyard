@@ -15,7 +15,7 @@ Capture conventions from the real scaffolded project, then install lint, format,
 - [x] Capture conventions + tooling choices: `/audit`
 - [x] Install the tooling: `/develop tooling`
 
-### 3. Data model · in-progress
+### 3. Data model
 The local records everything builds on: projects, workspaces, tasks, runs, agents, output and events, approvals, comparisons, usage.
 **Done when:** the entities support every planned slice (compare, approvals, cost, history, resume) without a breaking migration, everything is stored locally, and work is saved continuously so a hard kill of the app loses nothing already shown. (basis: the data model is the costliest thing to redo)
 spec [0002](../specs/0002-data-model/index.md) · code in `crates/sy-core/`, `crates/sy-infra/`, `crates/sy-daemon/`
@@ -30,7 +30,7 @@ spec [0002](../specs/0002-data-model/index.md) · code in `crates/sy-core/`, `cr
 - [x] Review it (fresh model): `/check review data model`
 - [x] Document it: `/document data model`
 
-### 4. Agent adapter contract & fake agent · in-progress
+### 4. Agent adapter contract & fake agent
 The one interface every agent plugs into: detect, launch through its official CLI, stream output, report status, relay approvals, stop. Plus a fake agent that tests drive.
 **Done when:** an adapter covers detection, launch, streaming, the four statuses (running, waiting for input, finished, failed), approval requests and stopping; adding an adapter needs no core change; no adapter ever reads, stores or reuses login tokens; a scriptable fake agent runs orchestration tests fast and deterministically. (basis: your modularity requirement; decide the interface before its first implementation)
 spec [0003](../specs/0003-agent-adapter-contract-fake-agent/index.md) · code in `crates/sy-adapter-api/`, `crates/sy-core/src/agents/`, `crates/sy-infra/src/agents/`, `crates/sy-adapters/`, `crates/sy-fake-agent/`, `crates/sy-signal/`, `crates/sy-daemon/`
@@ -45,7 +45,7 @@ spec [0003](../specs/0003-agent-adapter-contract-fake-agent/index.md) · code in
 - [x] Review it (fresh model): `/check review agent adapter contract & fake agent`
 - [x] Document it: `/document agent adapter contract & fake agent`
 
-### 5. Agent process supervisor · in-progress
+### 5. Agent process supervisor
 Runs each agent in its own process with its own terminal, outside the UI, and keeps a crashed, hung or runaway agent from affecting anything else.
 **Done when:** each agent runs in its own process with a terminal; a crash, hang or runaway (time or output limits) is detected and that agent is stopped cleanly; the app and other agents keep running; tests prove it with the fake agent.
 spec [0004](../specs/0004-agent-process-supervisor/index.md) · code in `crates/sy-core/src/agents/`, `crates/sy-infra/`, `crates/sy-daemon/`, `crates/sy-fake-agent/`, `crates/sy-adapters/fake/`

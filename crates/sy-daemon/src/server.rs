@@ -12,13 +12,15 @@ use sy_client::transport::{self, Stream};
 use sy_core::adapters::AdapterRegistry;
 use sy_core::agents::detect::{Detector, DetectorDeps};
 use sy_core::agents::ports::LoginEnv;
+use sy_core::agents::ports::ProcessTable;
 use sy_core::agents::ports::RuntimeDir;
 use sy_core::agents::{AgentRuns, AgentRunsDeps, Timings};
 use sy_core::ports::Clock;
 use sy_core::recovery;
 use sy_core::runs::RunHub;
 use sy_infra::agents::{
-    FsRuntimeDir, InheritedEnv, PortablePty, RandomTokens, ShellLoginEnv, SystemProcessRunner,
+    FsRuntimeDir, InheritedEnv, PortablePty, RandomTokens, ShellLoginEnv, SysProcessTable,
+    SystemProcessRunner,
 };
 use sy_infra::clock::SystemClock;
 use sy_infra::storage::{FileRunLog, StoragePaths, sweep_backup_temps};
@@ -76,6 +78,7 @@ pub async fn run(
         committed_tx,
         notices_tx,
     );
+    let mut leftovers = None;
     if let Some(store) = storage.store() {
         // Before any client is served: no one can see a run as live that died with the last engine.
         let recovered =
@@ -96,6 +99,13 @@ pub async fn run(
             }
             Ok(_) => {}
             Err(err) => tracing::warn!(%err, "could not expire pending approvals"),
+        }
+        // Before any connection: no run of this engine is in it (spec 0004, AC-10).
+        match recovery::snapshot_leftovers(store.as_ref()).await {
+            Ok(snapshot) => leftovers = Some((Arc::clone(&store), snapshot)),
+            Err(err) => {
+                tracing::warn!(%err, "could not read leftover processes; they wait for the next start")
+            }
         }
     }
 
@@ -124,12 +134,24 @@ pub async fn run(
         clock: Arc::clone(&clock),
     });
     let hub = RunHub::new(Arc::clone(&run_log));
+    let processes: Arc<dyn ProcessTable> = Arc::new(SysProcessTable::new());
+    // What a crashed engine left running, stopped while clients are served.
+    if let Some((store, snapshot)) = leftovers {
+        let table = Arc::clone(&processes);
+        tokio::spawn(recovery::cleanup_leftovers(
+            store,
+            table,
+            snapshot,
+            Timings::default().sweep_term_wait,
+        ));
+    }
     let (approvals_tx, approvals_rx) = mpsc::unbounded_channel();
     let agents = AgentRuns::new(AgentRunsDeps {
         approvals: approvals_tx,
         adapters,
         hub: Arc::clone(&hub),
         pty: Arc::new(PortablePty),
+        processes: Arc::clone(&processes),
         runtime,
         login: Arc::clone(&login),
         tokens: Arc::new(RandomTokens::default()),
@@ -138,6 +160,8 @@ pub async fn run(
         socket: paths.socket.to_string_lossy().into_owned(),
         timings: Timings::default(),
     });
+    // One shared process tree scan for every live run (spec 0004, AC-7).
+    tokio::spawn(AgentRuns::scan_loop(Arc::downgrade(&agents)));
     // The first login capture, then the first detection pass, in the
     // background; a launch waits for the capture (spec 0003, AC-3, AC-16).
     {
@@ -212,7 +236,8 @@ pub async fn run(
     tracing::info!(?reason, "engine stopping");
     drop(listener);
     // Every live run at once: its graceful step (capped at 3 s), SIGHUP, 5 s,
-    // SIGKILL, then its end is recorded (spec 0003, AC-12).
+    // SIGKILL, then its end is recorded (spec 0003, AC-12), then its
+    // leftover sweep (spec 0004, AC-12): about 13 s at most.
     let stopped = engine.agents.live_count();
     engine.agents.stop_all().await;
     // Each connection sees the exit, finishes the request it is handling (a

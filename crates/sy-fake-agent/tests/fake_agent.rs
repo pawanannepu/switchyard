@@ -456,3 +456,135 @@ fn an_unreadable_or_malformed_script_should_exit_1_before_any_step() {
         stdout(&missing)
     );
 }
+
+// ---- spec 0004 steps ----
+
+/// The children of `pid`, through `pgrep -P`.
+fn children_of(pid: u32) -> Vec<i32> {
+    let out = Command::new("pgrep")
+        .args(["-P", &pid.to_string()])
+        .output()
+        .unwrap();
+    stdout(&out)
+        .split_whitespace()
+        .map(|p| p.parse().unwrap())
+        .collect()
+}
+
+fn pid(raw: i32) -> rustix::process::Pid {
+    rustix::process::Pid::from_raw(raw).unwrap()
+}
+
+/// Running, not a zombie (the fake never waits on its children).
+fn alive(raw: i32) -> bool {
+    let out = Command::new("ps")
+        .args(["-o", "stat=", "-p", &raw.to_string()])
+        .output()
+        .unwrap();
+    let stat = stdout(&out);
+    !stat.trim().is_empty() && !stat.trim_start().starts_with('Z')
+}
+
+/// Start the fake on `script` and wait for `n` children.
+fn start_with_children(
+    s: &Scratch,
+    script: &serde_json::Value,
+    n: usize,
+) -> (std::process::Child, Vec<i32>) {
+    let script_path = s.0.join("script.json");
+    std::fs::write(&script_path, script.to_string()).unwrap();
+    let helper = s.helper("");
+    let mut fake = Command::new(FAKE)
+        .arg("--script")
+        .arg(&script_path)
+        .arg("--signal")
+        .arg(&helper)
+        .args(["--socket", "/tmp/sy-x/engine.sock", "--token", "00ff"])
+        .current_dir(s.cwd())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    for _ in 0..200 {
+        let kids = children_of(fake.id());
+        if kids.len() >= n {
+            return (fake, kids);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    fake.kill().unwrap();
+    fake.wait().unwrap();
+    panic!("the fake never started {n} children");
+}
+
+#[test]
+fn spawn_should_start_a_blocking_child_in_the_group_or_detached_from_it() {
+    let s = Scratch::new();
+    let (mut fake, kids) = start_with_children(
+        &s,
+        &serde_json::json!([
+            { "spawn": {} },
+            { "spawn": { "detach": true, "ignore_sigterm": true } },
+            { "expect_input": "never-typed" },
+        ]),
+        2,
+    );
+    let fake_group = rustix::process::getpgid(Some(pid(fake.id().cast_signed()))).unwrap();
+    let groups: Vec<bool> = kids
+        .iter()
+        .map(|&k| rustix::process::getpgid(Some(pid(k))).unwrap() == fake_group)
+        .collect();
+    assert_eq!(groups.iter().filter(|g| **g).count(), 1, "{groups:?}");
+    // The detached one ignores SIGTERM; the other doesn't.
+    for &k in &kids {
+        rustix::process::kill_process(pid(k), rustix::process::Signal::TERM).unwrap();
+    }
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let survivors: Vec<i32> = kids.iter().copied().filter(|&k| alive(k)).collect();
+    assert_eq!(survivors.len(), 1, "{survivors:?}");
+    assert_ne!(
+        rustix::process::getpgid(Some(pid(survivors[0]))).unwrap(),
+        fake_group
+    );
+    rustix::process::kill_process(pid(survivors[0]), rustix::process::Signal::KILL).unwrap();
+    fake.kill().unwrap();
+    fake.wait().unwrap();
+}
+
+#[test]
+fn ignore_sigterm_should_keep_the_fake_running_through_sigterm() {
+    let s = Scratch::new();
+    let (mut fake, kids) = start_with_children(
+        &s,
+        &serde_json::json!([
+            { "ignore_sigterm": true },
+            { "spawn": {} },
+            { "expect_input": "never-typed" },
+        ]),
+        1,
+    );
+    let me = pid(fake.id().cast_signed());
+    rustix::process::kill_process(me, rustix::process::Signal::TERM).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(fake.try_wait().unwrap().is_none(), "SIGTERM ended it");
+    fake.kill().unwrap();
+    fake.wait().unwrap();
+    for k in kids {
+        let _ = rustix::process::kill_process(pid(k), rustix::process::Signal::KILL);
+    }
+}
+
+#[test]
+fn panic_decoder_should_call_the_panic_hook_and_go_on() {
+    let s = Scratch::new();
+    let out = s.run(
+        &serde_json::json!([{ "panic_decoder": true }, { "print": "after" }]),
+        b"",
+        "",
+    );
+    assert_eq!(
+        (stdout(&out), out.status.code()),
+        ("after".to_owned(), Some(0))
+    );
+    assert!(s.calls().contains("--hook|panic|"), "{}", s.calls());
+}

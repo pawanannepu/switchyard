@@ -43,7 +43,7 @@ use crate::model::{
 };
 use crate::ports::{
     ApprovalFilter, Clock, Committed, EventFilter, EventPage, ListQuery, LogReconcile, Page,
-    RunFilter, RunLogError, RunProcess, Store, StoreError, TrimCandidate,
+    RunFilter, RunLogError, RunProcess, Store, StoreError, TrackedProcess, TrimCandidate,
 };
 
 /// How often the engine retries the queue and probes while degraded.
@@ -111,6 +111,11 @@ enum Queued {
         run: RunId,
         session_ref: String,
     },
+    /// The main process row only (spec 0004, AC-1).
+    TrackMain {
+        run: RunId,
+        rows: Vec<TrackedProcess>,
+    },
     LogState {
         run: RunId,
         state: LogState,
@@ -143,6 +148,7 @@ impl Queued {
             Self::WorkspaceOutcome { .. } => "set_workspace_outcome",
             Self::RunProcess { .. } => "set_run_process",
             Self::SessionRef { .. } => "set_agent_session_ref",
+            Self::TrackMain { .. } => "track_processes",
             Self::LogState { .. } => "set_log_state",
             Self::Event { .. } => "append_event",
             Self::DecideApproval { .. } => "decide_approval",
@@ -344,6 +350,7 @@ impl QueuedStore {
                 .await
                 .map(drop),
             Queued::LogState { run, state } => inner.set_log_state(&run, state).await.map(drop),
+            Queued::TrackMain { run, rows } => inner.track_processes(&run, &rows, true).await,
             Queued::Event {
                 actor,
                 actor_ref,
@@ -905,6 +912,50 @@ impl Store for QueuedStore {
             },
         );
         Ok(next)
+    }
+
+    async fn track_processes(
+        &self,
+        run: &RunId,
+        rows: &[TrackedProcess],
+        main: bool,
+    ) -> Result<(), StoreError> {
+        if !main {
+            return self
+                .unqueued(
+                    "track_processes",
+                    self.inner.track_processes(run, rows, false),
+                )
+                .await;
+        }
+        let mut st = self.state.lock().await;
+        if let Some(result) = self
+            .direct(
+                &mut st,
+                "track_processes",
+                self.inner.track_processes(run, rows, true),
+            )
+            .await
+        {
+            return result;
+        }
+        self.enqueue(
+            &mut st,
+            Queued::TrackMain {
+                run: run.clone(),
+                rows: rows.to_vec(),
+            },
+        );
+        Ok(())
+    }
+
+    async fn untrack_processes(&self, run: &RunId, keys: &[(i64, i64)]) -> Result<(), StoreError> {
+        self.unqueued("untrack_processes", self.inner.untrack_processes(run, keys))
+            .await
+    }
+
+    async fn list_tracked_processes(&self) -> Result<Vec<(RunId, TrackedProcess)>, StoreError> {
+        self.inner.list_tracked_processes().await
     }
 
     async fn set_agent_session_ref(

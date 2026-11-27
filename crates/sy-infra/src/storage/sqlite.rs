@@ -28,7 +28,8 @@ use sy_core::model::{
 };
 use sy_core::ports::{
     ApprovalFilter, Clock, Committed, EventFilter, EventPage, Keyset, ListQuery, LogReconcile,
-    Page, RunFilter, RunProcess, Store, StoreError, TrimCandidate, approval_page_size, page_size,
+    Page, RunFilter, RunProcess, Store, StoreError, TrackedProcess, TrimCandidate,
+    approval_page_size, page_size,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -1855,6 +1856,86 @@ impl Store for SqliteStore {
                 "UPDATE run SET pid = ?2, pgid = ?3, pid_started_at = ?4 WHERE id = ?1",
                 &[&process.pid, &process.pgid, &process.pid_started_at],
             )
+        })
+        .await
+    }
+
+    async fn track_processes(
+        &self,
+        run: &RunId,
+        rows: &[TrackedProcess],
+        _main: bool,
+    ) -> Result<(), StoreError> {
+        let (run, rows) = (run.clone(), rows.to_vec());
+        self.call("track_processes", move |db| {
+            let tx = db.conn.transaction().map_err(map_err)?;
+            {
+                let mut insert = tx
+                    .prepare_cached(
+                        "INSERT OR IGNORE INTO run_process (run_id, pid, started_at, name, first_seen_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                    )
+                    .map_err(map_err)?;
+                for row in &rows {
+                    insert
+                        .execute(params![
+                            run.as_str(),
+                            row.pid,
+                            row.started_at,
+                            row.name,
+                            row.first_seen_at
+                        ])
+                        .map_err(map_err)?;
+                }
+            }
+            tx.commit().map_err(map_err)
+        })
+        .await
+    }
+
+    async fn untrack_processes(&self, run: &RunId, keys: &[(i64, i64)]) -> Result<(), StoreError> {
+        let (run, keys) = (run.clone(), keys.to_vec());
+        self.call("untrack_processes", move |db| {
+            let tx = db.conn.transaction().map_err(map_err)?;
+            {
+                let mut delete = tx
+                    .prepare_cached(
+                        "DELETE FROM run_process WHERE run_id = ?1 AND pid = ?2 AND started_at = ?3",
+                    )
+                    .map_err(map_err)?;
+                for (pid, started_at) in &keys {
+                    delete
+                        .execute(params![run.as_str(), pid, started_at])
+                        .map_err(map_err)?;
+                }
+            }
+            tx.commit().map_err(map_err)
+        })
+        .await
+    }
+
+    async fn list_tracked_processes(&self) -> Result<Vec<(RunId, TrackedProcess)>, StoreError> {
+        self.call("list_tracked_processes", |db| {
+            db.conn
+                .prepare_cached(
+                    "SELECT run_id, pid, started_at, name, first_seen_at FROM run_process
+                     ORDER BY run_id, first_seen_at, pid",
+                )
+                .and_then(|mut st| {
+                    st.query_map([], |r| {
+                        Ok((
+                            parse_id(r.get(0)?, RunId::parse)?,
+                            TrackedProcess {
+                                pid: r.get(1)?,
+                                started_at: r.get(2)?,
+                                name: r.get(3)?,
+                                first_seen_at: r.get(4)?,
+                            },
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .map_err(map_err)
         })
         .await
     }

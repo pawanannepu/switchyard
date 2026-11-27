@@ -1,6 +1,6 @@
 //! The start path and the driver against port doubles and a scripted decoder.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Read;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc as std_mpsc;
@@ -16,8 +16,9 @@ use sy_adapter_api::{
 use super::ports::*;
 use super::*;
 use crate::ids::{ApprovalId, ProjectId, TaskId, WorkspaceId};
-use crate::model::{LogState, MessageRole, WorkspaceState};
-use crate::ports::{RunLog, RunLogError};
+use crate::model::{LimitKind, LogState, MessageRole, WorkspaceState};
+use crate::ports::{RunLog, RunLogError, TrackedProcess};
+use supervise::LimitOverride;
 
 // ---- port doubles ----
 
@@ -60,6 +61,16 @@ struct MemWrites {
     trail: Mutex<Vec<String>>,
     /// Make `create_approval` fail as a full disk would.
     refuse_creates: AtomicBool,
+    /// Global settings.
+    settings: Mutex<BTreeMap<String, JsonValue>>,
+    /// Every project's settings; `None` makes the read fail.
+    project_settings: Mutex<Option<BTreeMap<String, JsonValue>>>,
+    /// `run_process` rows: (pid, started_at) to (name, was the main insert).
+    processes: Mutex<HashMap<(i64, i64), (String, bool)>>,
+    /// Make `track_processes` fail as a full disk would.
+    refuse_tracking: AtomicBool,
+    /// Panic right after a terminal transition lands.
+    panic_after_end: AtomicBool,
 }
 
 impl MemWrites {
@@ -126,7 +137,12 @@ impl RunWrites for MemWrites {
             lock(&self.moves).push((row.status, actor));
             lock(&self.trail).push(format!("run {}", row.status));
         }
-        Ok(row.clone())
+        let row = row.clone();
+        drop(runs);
+        if row.status.is_terminal() && self.panic_after_end.load(Ordering::SeqCst) {
+            panic!("the store panics after the end, on purpose");
+        }
+        Ok(row)
     }
     async fn set_run_process(&self, run: &RunId, p: RunProcess) -> Result<Run, StoreError> {
         let mut runs = lock(&self.runs);
@@ -223,6 +239,40 @@ impl RunWrites for MemWrites {
             events: Vec::new(),
         })
     }
+    async fn project_settings(
+        &self,
+        _: &ProjectId,
+    ) -> Result<BTreeMap<String, JsonValue>, StoreError> {
+        lock(&self.project_settings)
+            .clone()
+            .ok_or(StoreError::NotFound)
+    }
+    async fn get_setting(&self, key: &str) -> Result<Option<JsonValue>, StoreError> {
+        Ok(lock(&self.settings).get(key).cloned())
+    }
+    async fn track_processes(
+        &self,
+        _: &RunId,
+        rows: &[TrackedProcess],
+        main: bool,
+    ) -> Result<(), StoreError> {
+        if self.refuse_tracking.load(Ordering::SeqCst) {
+            return Err(StoreError::Full);
+        }
+        let mut all = lock(&self.processes);
+        for row in rows {
+            all.entry((row.pid, row.started_at))
+                .or_insert((row.name.clone(), main));
+        }
+        Ok(())
+    }
+    async fn untrack_processes(&self, _: &RunId, keys: &[(i64, i64)]) -> Result<(), StoreError> {
+        let mut all = lock(&self.processes);
+        for key in keys {
+            all.remove(key);
+        }
+        Ok(())
+    }
 }
 
 /// A terminal fed by the test: each chunk sent is one read; dropping the sender is EOF.
@@ -231,10 +281,14 @@ struct ChanReader {
     pending: Vec<u8>,
 }
 
+/// A chunk that makes the reader thread panic, as a supervision bug would.
+const READER_PANIC: &[u8] = b"<reader panics>";
+
 impl Read for ChanReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if self.pending.is_empty() {
             match self.chunks.recv() {
+                Ok(chunk) if chunk == READER_PANIC => panic!("the reader panics on purpose"),
                 Ok(chunk) => self.pending = chunk,
                 Err(_) => return Ok(0),
             }
@@ -264,6 +318,11 @@ struct MemProcess {
     die: std_mpsc::Sender<ExitInfo>,
     signals: Arc<Mutex<Vec<GroupSignal>>>,
     ignore_hangup: bool,
+    /// Set by `reap`; group signals are refused after it.
+    reaped: Arc<AtomicBool>,
+    /// The table it is in, so a group SIGKILL also kills its group's leftovers.
+    table: Option<Arc<MemTable>>,
+    pid: i64,
 }
 
 impl ChildProcess for MemProcess {
@@ -272,11 +331,24 @@ impl ChildProcess for MemProcess {
             .recv()
             .map_err(|_| std::io::Error::other("gone"))
     }
+    fn reap(&self) {
+        if let Some(table) = &self.table {
+            lock(&table.trail).push(format!("reap {}", self.pid));
+        }
+        self.reaped.store(true, Ordering::SeqCst);
+    }
     fn signal_group(&self, signal: GroupSignal) -> bool {
+        if self.reaped.load(Ordering::SeqCst) {
+            return false;
+        }
         lock(&self.signals).push(signal);
+        if let Some(table) = &self.table {
+            table.group_signal(self.pid, signal);
+        }
         let dies = match signal {
             GroupSignal::Hangup => (!self.ignore_hangup).then_some(1),
             GroupSignal::Kill => Some(9),
+            GroupSignal::Cont | GroupSignal::Term => None,
         };
         if let Some(n) = dies {
             let _ = self.die.send(ExitInfo {
@@ -285,6 +357,135 @@ impl ChildProcess for MemProcess {
             });
         }
         true
+    }
+}
+
+/// A process table the test fills. Each process may ignore SIGTERM; a
+/// group signal reaches every process whose `pgid` (kept here) matches.
+#[derive(Default)]
+struct MemTable {
+    procs: Mutex<Vec<(ProcInfo, i64)>>,
+    ignore_term: Mutex<HashSet<i64>>,
+    /// Never die, even on SIGKILL (stuck in the kernel).
+    unkillable: Mutex<HashSet<i64>>,
+    fail_scans: AtomicBool,
+    /// How many scans were asked for.
+    scans: std::sync::atomic::AtomicUsize,
+    /// Every signal and reap, in order: `term 101`, `kill 101`, `reap 4242`, ...
+    trail: Mutex<Vec<String>>,
+    /// When the main process (pid 4242) started; `None` reads it as absent.
+    main_started: Mutex<Option<i64>>,
+}
+
+const MAIN_PID: i64 = 4242;
+const MAIN_START: i64 = 5_000_000;
+
+impl MemTable {
+    fn with_main() -> Self {
+        let t = Self::default();
+        *lock(&t.main_started) = Some(MAIN_START);
+        t
+    }
+    /// A child of the main process, in its session and group.
+    fn add(&self, pid: i64, sid: i64, pgid: i64, started: i64) {
+        lock(&self.procs).push((
+            ProcInfo {
+                pid,
+                ppid: Some(MAIN_PID),
+                sid: Some(sid),
+                started_at_ms: started,
+                uid_is_self: true,
+                zombie: false,
+                name: format!("child{pid}"),
+            },
+            pgid,
+        ));
+    }
+    fn alive(&self, pid: i64) -> bool {
+        lock(&self.procs).iter().any(|(p, _)| p.pid == pid)
+    }
+    fn hit(&self, pid: i64, what: &str, term: bool) {
+        lock(&self.trail).push(format!("{what} {pid}"));
+        if lock(&self.unkillable).contains(&pid) {
+            return;
+        }
+        if !term || !lock(&self.ignore_term).contains(&pid) {
+            lock(&self.procs).retain(|(p, _)| p.pid != pid);
+        }
+    }
+    fn group_signal(&self, pgid: i64, signal: GroupSignal) {
+        let members: Vec<i64> = lock(&self.procs)
+            .iter()
+            .filter(|(_, g)| *g == pgid)
+            .map(|(p, _)| p.pid)
+            .collect();
+        for pid in members {
+            match signal {
+                GroupSignal::Kill | GroupSignal::Hangup => self.hit(pid, "group-kill", false),
+                GroupSignal::Term => self.hit(pid, "group-term", true),
+                GroupSignal::Cont => {}
+            }
+        }
+    }
+}
+
+impl ProcessTable for MemTable {
+    fn scan(&self) -> Result<Vec<ProcInfo>, ProcError> {
+        self.scans.fetch_add(1, Ordering::SeqCst);
+        if self.fail_scans.load(Ordering::SeqCst) {
+            return Err(ProcError("scripted".into()));
+        }
+        let mut all: Vec<ProcInfo> = lock(&self.procs).iter().map(|(p, _)| p.clone()).collect();
+        if let Some(started) = *lock(&self.main_started) {
+            all.push(ProcInfo {
+                pid: MAIN_PID,
+                ppid: Some(1),
+                sid: Some(MAIN_PID),
+                started_at_ms: started,
+                uid_is_self: true,
+                zombie: false,
+                name: "agent".into(),
+            });
+        }
+        Ok(all)
+    }
+    fn started_at(&self, pid: i64) -> Option<ProcState> {
+        if pid == MAIN_PID {
+            return lock(&self.main_started).map(|started_at_ms| ProcState {
+                started_at_ms,
+                zombie: false,
+            });
+        }
+        lock(&self.procs)
+            .iter()
+            .find(|(p, _)| p.pid == pid)
+            .map(|(p, _)| ProcState {
+                started_at_ms: p.started_at_ms,
+                zombie: p.zombie,
+            })
+    }
+    fn signal(&self, pid: i64, started_at_ms: i64, signal: ProcSignal) -> SignalOutcome {
+        let matches = pid > 1
+            && pid != MAIN_PID
+            && lock(&self.procs)
+                .iter()
+                .any(|(p, _)| p.pid == pid && p.started_at_ms == started_at_ms && p.uid_is_self);
+        if !matches {
+            return SignalOutcome::Gone;
+        }
+        match signal {
+            ProcSignal::Cont => lock(&self.trail).push(format!("cont {pid}")),
+            ProcSignal::Term => self.hit(pid, "term", true),
+            ProcSignal::Kill => self.hit(pid, "kill", false),
+        }
+        SignalOutcome::Sent
+    }
+    fn signal_group(&self, pgid: i64, _: ProcSignal) -> bool {
+        lock(&self.trail).push(format!("killpg {pgid}"));
+        true
+    }
+    fn engine_pid(&self) -> i64 {
+        1
     }
 }
 
@@ -320,6 +521,7 @@ struct FakePty {
     spawned: Mutex<Vec<SpawnRequest>>,
     children: Mutex<Vec<ChildHandle>>,
     ignore_hangup: bool,
+    table: Option<Arc<MemTable>>,
 }
 
 impl Pty for FakePty {
@@ -336,8 +538,8 @@ impl Pty for FakePty {
             signals: Arc::clone(&signals),
         });
         Ok(PtyChild {
-            pid: 4242,
-            pgid: 4242,
+            pid: MAIN_PID,
+            pgid: MAIN_PID,
             reader: Box::new(ChanReader {
                 chunks: out_rx,
                 pending: Vec::new(),
@@ -348,6 +550,9 @@ impl Pty for FakePty {
                 die: exit_tx,
                 signals,
                 ignore_hangup: self.ignore_hangup,
+                reaped: Arc::new(AtomicBool::new(false)),
+                table: self.table.clone(),
+                pid: MAIN_PID,
             }),
         })
     }
@@ -555,6 +760,7 @@ impl RunDecoder for Words {
                 text,
             })]),
             "session" => reply(vec![Report::SessionRef(text)]),
+            "panic" => panic!("the decoder panics on purpose"),
             "hold" => HookOutcome {
                 reports: Vec::new(),
                 response: HookResponse::Hold(ask(&text)),
@@ -619,6 +825,7 @@ fn ask(key: &str) -> sy_adapter_api::ApprovalRequest {
 
 struct Harness {
     runs: Arc<AgentRuns>,
+    table: Arc<MemTable>,
     notices: tokio::sync::Mutex<mpsc::UnboundedReceiver<ApprovalNotice>>,
     store: Arc<MemWrites>,
     pty: Arc<FakePty>,
@@ -628,8 +835,14 @@ struct Harness {
 }
 
 fn harness_with(adapter: Scripted, pty: FakePty) -> Harness {
+    harness_on(adapter, pty, MemTable::with_main())
+}
+
+fn harness_on(adapter: Scripted, mut pty: FakePty, table: MemTable) -> Harness {
     let log = Arc::new(MemLog::default());
     let hub = RunHub::new(log.clone());
+    let table = Arc::new(table);
+    pty.table = Some(Arc::clone(&table));
     let pty = Arc::new(pty);
     let runtime = Arc::new(MemRuntime::default());
     let mut adapters = AdapterRegistry::default();
@@ -640,6 +853,7 @@ fn harness_with(adapter: Scripted, pty: FakePty) -> Harness {
         adapters,
         hub: Arc::clone(&hub),
         pty: pty.clone(),
+        processes: table.clone(),
         runtime: runtime.clone(),
         login: Arc::new(MemLogin),
         tokens: Arc::new(Counter(Mutex::new(0))),
@@ -652,10 +866,16 @@ fn harness_with(adapter: Scripted, pty: FakePty) -> Harness {
             drain: Duration::from_millis(500),
             shutdown_grace: Duration::from_millis(100),
             tick: Duration::from_millis(20),
+            scan_every: Duration::from_millis(30),
+            sweep_term_wait: Duration::from_millis(300),
+            sweep_kill_wait: Duration::from_millis(100),
+            sweep_poll: Duration::from_millis(10),
         },
     });
+    tokio::spawn(AgentRuns::scan_loop(Arc::downgrade(&runs)));
     Harness {
         runs,
+        table,
         notices: tokio::sync::Mutex::new(notices),
         store: Arc::new(MemWrites::default()),
         pty,
@@ -693,6 +913,14 @@ impl Harness {
     }
 
     async fn start_with(&self, options: &str) -> RunId {
+        self.start_full(options, LimitOverride::default()).await
+    }
+
+    async fn start_limited(&self, limits: LimitOverride) -> RunId {
+        self.start_full("{}", limits).await
+    }
+
+    async fn start_full(&self, options: &str, limits: LimitOverride) -> RunId {
         self.runs
             .start(
                 self.store.clone(),
@@ -703,6 +931,7 @@ impl Harness {
                         cols: 120,
                         rows: 40,
                     },
+                    limits,
                 },
             )
             .await
@@ -802,10 +1031,40 @@ impl Harness {
             .await
     }
 
+    /// Every `run_limit_exceeded` journaled, as (limit, threshold, observed).
+    fn limit_events(&self) -> Vec<(LimitKind, u64, u64)> {
+        lock(&self.store.events)
+            .iter()
+            .filter_map(|(actor, _, e)| match e {
+                AdapterEvent::RunLimitExceeded {
+                    limit,
+                    threshold,
+                    observed,
+                    ..
+                } => {
+                    assert_eq!(*actor, Actor::Engine);
+                    Some((*limit, *threshold, *observed))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     fn logged(&self, run: &RunId) -> String {
         String::from_utf8_lossy(&lock(&self.log.0).get(run).cloned().unwrap_or_default())
             .into_owned()
     }
+}
+
+/// The group signals before the sweep, after checking the sweep's own
+/// SIGCONT, SIGTERM, SIGKILL closed them (spec 0004, AC-8).
+fn before_sweep(signals: &[GroupSignal]) -> Vec<GroupSignal> {
+    let sweep = [GroupSignal::Cont, GroupSignal::Term, GroupSignal::Kill];
+    assert!(
+        signals.ends_with(&sweep),
+        "no sweep at the end of {signals:?}"
+    );
+    signals[..signals.len() - sweep.len()].to_vec()
 }
 
 // ---- tests ----
@@ -839,7 +1098,7 @@ async fn a_run_should_go_starting_running_finished_and_clean_up_after_itself() {
             2,
             Some(4242),
             Some(4242),
-            None
+            Some(MAIN_START)
         )
     );
     assert_eq!(h.logged(&run), "hi");
@@ -1025,7 +1284,7 @@ async fn stop_should_type_the_stop_input_then_hang_up_and_end_stopped() {
     h.runs.stop(h.store.as_ref(), &run).await.unwrap();
     h.until_ended().await;
     let row = h.store.run(&run);
-    let (input, signals) = h.child(|c| (lock(&c.input).clone(), lock(&c.signals).clone()));
+    let (input, signals) = h.child(|c| (lock(&c.input).clone(), before_sweep(&lock(&c.signals))));
     assert_eq!(
         (row.status, row.end_reason, row.exit_code, signals),
         (
@@ -1049,7 +1308,7 @@ async fn an_agent_that_ignores_sighup_should_get_sigkill_after_the_wait() {
     let run = h.start().await;
     h.runs.stop(h.store.as_ref(), &run).await.unwrap();
     h.until_ended().await;
-    let signals = h.child(|c| lock(&c.signals).clone());
+    let signals = h.child(|c| before_sweep(&lock(&c.signals)));
     assert_eq!(
         (h.store.run(&run).status, signals),
         (
@@ -1071,7 +1330,7 @@ async fn an_exit_during_the_grace_should_still_end_stopped_with_its_code() {
     h.child(|c| c.exit(130));
     h.until_ended().await;
     let row = h.store.run(&run);
-    let signals = h.child(|c| lock(&c.signals).clone());
+    let signals = h.child(|c| before_sweep(&lock(&c.signals)));
     assert_eq!(
         (row.status, row.end_reason, row.exit_code, signals),
         (
@@ -1173,6 +1432,7 @@ async fn an_unknown_agent_should_create_no_run() {
                 workspace: ws,
                 prompt: String::new(),
                 size: PtySize { cols: 1, rows: 1 },
+                limits: supervise::LimitOverride::default(),
             },
         )
         .await
@@ -1921,4 +2181,555 @@ async fn path_should_be_empty_when_the_first_probe_does_not_resolve() {
         (None, 1),
         "the second probe still ran, but its path is not the agent's"
     );
+}
+
+// ---- run limits (spec 0004) ----
+
+fn only(limits: LimitOverride) -> LimitOverride {
+    // Everything not named is off, so only the limit under test can fire.
+    LimitOverride {
+        idle_ms: limits.idle_ms.or(Some(0)),
+        active_ms: limits.active_ms.or(Some(0)),
+        output_bytes: limits.output_bytes.or(Some(0)),
+    }
+}
+
+fn assert_limit_end(h: &Harness, run: &RunId, kind: LimitKind) {
+    let row = h.store.run(run);
+    assert_eq!(
+        (row.status, row.end_reason),
+        (RunStatus::Failed, Some(EndReason::LimitExceeded))
+    );
+    let events = h.limit_events();
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0].0, kind);
+    assert!(events[0].2 >= events[0].1, "{events:?}");
+    assert_eq!(lock(&h.store.moves).last().unwrap().1, Actor::Engine);
+}
+
+#[tokio::test]
+async fn output_over_its_limit_should_stop_the_run_and_end_it_limit_exceeded() {
+    let h = harness();
+    let run = h
+        .start_limited(only(LimitOverride {
+            output_bytes: Some(64),
+            ..LimitOverride::default()
+        }))
+        .await;
+    h.child(|c| c.print(&"x".repeat(100)));
+    h.until_ended().await;
+    assert_limit_end(&h, &run, LimitKind::Output);
+    assert_eq!(h.limit_events()[0].1, 64);
+    let (input, signals) = h.child(|c| (lock(&c.input).clone(), before_sweep(&lock(&c.signals))));
+    assert!(input.ends_with(b"\x03"), "{input:?}");
+    assert_eq!(signals, vec![GroupSignal::Hangup]);
+    // The whole output still went through the hub and the log.
+    assert_eq!(h.logged(&run).len(), 100);
+}
+
+#[tokio::test]
+async fn a_silent_run_should_be_stopped_as_idle() {
+    let h = harness();
+    let started = std::time::Instant::now();
+    let run = h
+        .start_limited(only(LimitOverride {
+            idle_ms: Some(150),
+            ..LimitOverride::default()
+        }))
+        .await;
+    h.child(|c| c.print("GO"));
+    h.until_ended().await;
+    assert_limit_end(&h, &run, LimitKind::Idle);
+    assert!(started.elapsed() >= Duration::from_millis(150));
+}
+
+#[tokio::test]
+async fn output_and_hook_calls_should_keep_a_run_from_going_idle() {
+    let h = harness();
+    let run = h
+        .start_limited(only(LimitOverride {
+            idle_ms: Some(150),
+            ..LimitOverride::default()
+        }))
+        .await;
+    for i in 0..8 {
+        if i % 2 == 0 {
+            h.child(|c| c.print("GO"));
+        } else {
+            h.hook(1, "event", "still here").await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(60)).await;
+    }
+    assert_eq!(h.runs.live_count(), 1);
+    assert!(h.store.run(&run).status.is_live());
+    h.child(|c| c.exit(0));
+    h.until_ended().await;
+    assert_eq!(h.store.run(&run).status, RunStatus::Finished);
+    assert!(h.limit_events().is_empty());
+}
+
+#[tokio::test]
+async fn waiting_input_should_pause_the_idle_and_active_clocks() {
+    let h = harness();
+    let run = h
+        .start_limited(only(LimitOverride {
+            idle_ms: Some(150),
+            active_ms: Some(400),
+            ..LimitOverride::default()
+        }))
+        .await;
+    h.child(|c| c.print("WAIT"));
+    h.until_status(&run, RunStatus::WaitingInput).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(h.store.run(&run).status.is_live(), "stopped while waiting");
+    // Leaving `waiting_input` restarts the idle clock, which then fires.
+    let left = std::time::Instant::now();
+    h.child(|c| c.print("GO"));
+    h.until_ended().await;
+    assert!(left.elapsed() >= Duration::from_millis(150));
+    assert_limit_end(&h, &run, LimitKind::Idle);
+}
+
+#[tokio::test]
+async fn a_busy_run_should_be_stopped_after_its_active_time() {
+    let h = harness();
+    let run = h
+        .start_limited(only(LimitOverride {
+            active_ms: Some(300),
+            ..LimitOverride::default()
+        }))
+        .await;
+    for _ in 0..200 {
+        if h.runs.live_count() == 0 {
+            break;
+        }
+        if let Some(out) = lock(&h.pty.children).last().and_then(|c| c.output.clone()) {
+            let _ = out.send(b"GO ".to_vec());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    h.until_ended().await;
+    assert_limit_end(&h, &run, LimitKind::Time);
+}
+
+#[tokio::test]
+async fn a_limit_stop_should_deny_a_held_hook_with_the_limit_and_cancel_it() {
+    let h = harness();
+    let run = h
+        .start_limited(only(LimitOverride {
+            output_bytes: Some(64),
+            ..LimitOverride::default()
+        }))
+        .await;
+    let held = h.hold("k");
+    h.until_status(&run, RunStatus::WaitingInput).await;
+    h.child(|c| c.print(&"x".repeat(100)));
+    assert_eq!(
+        held.await.unwrap(),
+        held_reply("deny:run stopped: output limit")
+    );
+    h.until_ended().await;
+    assert_eq!(h.store.only_approval().status, ApprovalStatus::Cancelled);
+    assert_limit_end(&h, &run, LimitKind::Output);
+}
+
+#[tokio::test]
+async fn a_stop_during_a_limit_stop_should_change_nothing() {
+    let adapter = Scripted {
+        grace_ms: 5_000,
+        ..Scripted::default()
+    };
+    let h = harness_with(adapter, FakePty::default());
+    let run = h
+        .start_limited(only(LimitOverride {
+            output_bytes: Some(8),
+            ..LimitOverride::default()
+        }))
+        .await;
+    h.child(|c| c.print("0123456789"));
+    h.until("the limit event", |h| !h.limit_events().is_empty())
+        .await;
+    h.runs.stop(h.store.as_ref(), &run).await.unwrap();
+    h.child(|c| c.exit(3));
+    h.until_ended().await;
+    assert_limit_end(&h, &run, LimitKind::Output);
+    assert_eq!(h.store.run(&run).exit_code, Some(3));
+}
+
+#[tokio::test]
+async fn a_run_stopping_for_run_stop_should_never_be_limit_checked() {
+    let adapter = Scripted {
+        grace_ms: 5_000,
+        ..Scripted::default()
+    };
+    let h = harness_with(adapter, FakePty::default());
+    let run = h
+        .start_limited(only(LimitOverride {
+            output_bytes: Some(8),
+            ..LimitOverride::default()
+        }))
+        .await;
+    h.child(|c| c.print("GO"));
+    h.until_status(&run, RunStatus::Running).await;
+    h.runs.stop(h.store.as_ref(), &run).await.unwrap();
+    h.child(|c| c.print(&"x".repeat(100)));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    h.child(|c| c.exit(0));
+    h.until_ended().await;
+    let row = h.store.run(&run);
+    assert_eq!(
+        (row.status, row.end_reason),
+        (RunStatus::Stopped, Some(EndReason::UserStop))
+    );
+    assert!(h.limit_events().is_empty());
+}
+
+#[tokio::test]
+async fn limits_should_come_from_settings_and_warn_once_for_a_bad_value() {
+    let h = harness();
+    lock(&h.store.settings).insert(supervise::KEY_OUTPUT_BYTES.into(), JsonValue::Int(32));
+    *lock(&h.store.project_settings) = Some(BTreeMap::from([(
+        supervise::KEY_IDLE_MS.to_owned(),
+        JsonValue::String("x".into()),
+    )]));
+    for _ in 0..10 {
+        let run = h.start().await;
+        h.child(|c| c.exit(0));
+        h.until_ended().await;
+        assert_eq!(h.store.run(&run).status, RunStatus::Finished);
+    }
+    // One entry for the bad project value, however many launches read it.
+    assert_eq!(lock(&h.runs.bad_settings).len(), 1);
+    // The global output limit applies (the bad project idle value was skipped).
+    let run = h.start().await;
+    h.child(|c| c.print(&"x".repeat(40)));
+    h.until_ended().await;
+    assert_limit_end(&h, &run, LimitKind::Output);
+    assert_eq!(h.limit_events()[0].1, 32);
+}
+
+// ---- process facts, the sweep and tracking (spec 0004) ----
+
+impl Harness {
+    /// The `run_process` rows, sorted.
+    fn rows(&self) -> Vec<(i64, i64, String, bool)> {
+        let mut rows: Vec<_> = lock(&self.store.processes)
+            .iter()
+            .map(|((pid, at), (name, main))| (*pid, *at, name.clone(), *main))
+            .collect();
+        rows.sort();
+        rows
+    }
+    fn trail(&self) -> Vec<String> {
+        lock(&self.table.trail).clone()
+    }
+    fn at(&self, entry: &str) -> usize {
+        let trail = self.trail();
+        trail
+            .iter()
+            .position(|e| e == entry)
+            .unwrap_or_else(|| panic!("no {entry:?} in {trail:?}"))
+    }
+}
+
+const CHILD_START: i64 = MAIN_START + 1000;
+
+#[tokio::test]
+async fn the_spawn_should_record_the_start_time_and_the_main_row() {
+    let h = harness();
+    let run = h.start().await;
+    assert_eq!(h.store.run(&run).pid_started_at, Some(MAIN_START));
+    assert_eq!(h.rows(), vec![(MAIN_PID, MAIN_START, "agent".into(), true)]);
+    h.child(|c| c.exit(0));
+    h.until_ended().await;
+    // Reaped, so confirmed gone: its row goes too.
+    assert!(h.rows().is_empty());
+    assert!(h.trail().contains(&format!("reap {MAIN_PID}")));
+}
+
+#[tokio::test]
+async fn no_start_time_should_leave_it_null_with_no_row_and_the_run_going() {
+    let h = harness_on(Scripted::default(), FakePty::default(), MemTable::default());
+    let run = h.start().await;
+    assert_eq!(h.store.run(&run).pid_started_at, None);
+    assert!(h.rows().is_empty());
+    h.child(|c| c.print("hi"));
+    h.until_status(&run, RunStatus::Running).await;
+    h.child(|c| c.exit(0));
+    h.until_ended().await;
+    assert_eq!(h.store.run(&run).status, RunStatus::Finished);
+}
+
+#[tokio::test]
+async fn the_scanner_should_track_children_seen_twice_and_drop_confirmed_gone_ones() {
+    let h = harness();
+    let _run = h.start().await;
+    h.table.add(101, MAIN_PID, MAIN_PID, CHILD_START);
+    h.until("child 101 tracked", |h| h.rows().iter().any(|r| r.0 == 101))
+        .await;
+    assert_eq!(
+        h.rows()[0],
+        (101, CHILD_START, "child101".into(), false),
+        "{:?}",
+        h.rows()
+    );
+    lock(&h.table.procs).retain(|(p, _)| p.pid != 101);
+    h.until("child 101 untracked", |h| {
+        !h.rows().iter().any(|r| r.0 == 101)
+    })
+    .await;
+    h.child(|c| c.exit(0));
+    h.until_ended().await;
+}
+
+#[tokio::test]
+async fn a_failed_scan_should_never_delete_a_row() {
+    let h = harness();
+    let _run = h.start().await;
+    h.table.add(101, MAIN_PID, MAIN_PID, CHILD_START);
+    h.until("child 101 tracked", |h| h.rows().iter().any(|r| r.0 == 101))
+        .await;
+    h.table.fail_scans.store(true, Ordering::SeqCst);
+    // Missing from the (failing) table, but no scan says so.
+    let gone = lock(&h.table.procs).remove(0);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(h.rows().iter().any(|r| r.0 == 101));
+    lock(&h.table.procs).push(gone);
+    h.child(|c| c.exit(0));
+    h.until_ended().await;
+    // The sweep still stops it from the tracked set alone.
+    assert!(!h.table.alive(101));
+    assert!(h.rows().is_empty());
+}
+
+#[tokio::test]
+async fn leftovers_should_get_sigterm_then_sigkill_and_the_main_reaped_last() {
+    let h = harness();
+    let run = h.start().await;
+    // In the group; detached into its own group; detached and ignoring SIGTERM.
+    h.table.add(101, MAIN_PID, MAIN_PID, CHILD_START);
+    h.table.add(102, MAIN_PID, 102, CHILD_START);
+    h.table.add(103, MAIN_PID, 103, CHILD_START);
+    lock(&h.table.ignore_term).insert(103);
+    h.until("children tracked", |h| h.rows().len() == 4).await;
+    h.child(|c| c.exit(0));
+    h.until_ended().await;
+    assert_eq!(h.store.run(&run).status, RunStatus::Finished);
+    assert!(!h.table.alive(101) && !h.table.alive(102) && !h.table.alive(103));
+    assert!(h.at("group-term 101") < h.at("term 102"));
+    assert!(h.at("term 103") < h.at("kill 103"));
+    assert!(h.at("kill 103") < h.at(&format!("reap {MAIN_PID}")));
+    assert!(!h.trail().contains(&"kill 102".to_owned()));
+    assert!(h.rows().is_empty(), "{:?}", h.rows());
+}
+
+#[tokio::test]
+async fn an_orphan_should_be_found_by_its_session_at_the_sweep() {
+    let h = harness();
+    let _run = h.start().await;
+    // Started, then reparented to launchd, as the main exits at once:
+    // no two scans in a row saw it, so only its session id finds it.
+    h.table.add(101, MAIN_PID, 101, CHILD_START);
+    lock(&h.table.procs)[0].0.ppid = Some(1);
+    h.child(|c| c.exit(0));
+    h.until_ended().await;
+    assert!(!h.table.alive(101));
+    assert!(h.at("term 101") < h.at(&format!("reap {MAIN_PID}")));
+}
+
+#[tokio::test]
+async fn a_process_that_survives_sigkill_should_keep_its_row() {
+    let h = harness();
+    let _run = h.start().await;
+    h.table.add(101, MAIN_PID, 101, CHILD_START);
+    lock(&h.table.unkillable).insert(101);
+    h.until("child tracked", |h| h.rows().iter().any(|r| r.0 == 101))
+        .await;
+    h.child(|c| c.exit(0));
+    h.until_ended().await;
+    assert_eq!(h.rows(), vec![(101, CHILD_START, "child101".into(), false)]);
+}
+
+#[tokio::test]
+async fn a_run_with_no_children_should_sweep_without_waiting() {
+    let h = harness();
+    let _run = h.start().await;
+    h.child(|c| c.exit(0));
+    let started = std::time::Instant::now();
+    h.until_ended().await;
+    // The term wait is 300 ms here; it is skipped.
+    assert!(
+        started.elapsed() < Duration::from_millis(250),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn a_closed_run_should_get_no_scanner_writes() {
+    let h = harness();
+    let _run = h.start().await;
+    h.child(|c| c.exit(0));
+    h.until_ended().await;
+    h.table.add(101, MAIN_PID, MAIN_PID, CHILD_START);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(h.rows().is_empty());
+}
+
+// covers: AC-2
+#[tokio::test]
+async fn a_setting_changed_while_a_run_is_live_should_not_change_its_limits() {
+    let h = harness();
+    lock(&h.store.settings).insert(supervise::KEY_OUTPUT_BYTES.into(), JsonValue::Int(1000));
+    let run = h.start().await;
+    h.child(|c| c.print("GO"));
+    h.until_status(&run, RunStatus::Running).await;
+    // Lowered under what the run is about to print.
+    lock(&h.store.settings).insert(supervise::KEY_OUTPUT_BYTES.into(), JsonValue::Int(32));
+    h.child(|c| c.print(&"x".repeat(100)));
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(h.store.run(&run).status.is_live());
+    assert!(h.limit_events().is_empty());
+    h.child(|c| c.exit(0));
+    h.until_ended().await;
+    assert_eq!(h.store.run(&run).status, RunStatus::Finished);
+    // The next run picks the new value up.
+    let next = h.start().await;
+    h.child(|c| c.print(&"x".repeat(40)));
+    h.until_ended().await;
+    assert_limit_end(&h, &next, LimitKind::Output);
+    assert_eq!(h.limit_events()[0].1, 32);
+}
+
+// covers: AC-7
+#[tokio::test]
+async fn the_scanner_should_scan_only_while_a_run_is_live_or_sweeping() {
+    let h = harness();
+    let scans = |h: &Harness| h.table.scans.load(Ordering::SeqCst);
+    // scan_every is 30 ms here: several ticks pass with nothing live.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(scans(&h), 0);
+    let _run = h.start().await;
+    h.until("a scan", |h| scans(h) > 0).await;
+    h.child(|c| c.exit(0));
+    h.until_ended().await;
+    // Let a scan already under way finish counting.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let after = scans(&h);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(scans(&h), after);
+}
+
+// covers: AC-8
+#[tokio::test]
+async fn the_end_should_be_recorded_before_the_sweep_while_the_run_still_counts_as_live() {
+    let h = harness();
+    let run = h.start().await;
+    // Its own group, ignoring SIGTERM: the sweep has to wait out its term wait.
+    h.table.add(101, MAIN_PID, 101, CHILD_START);
+    lock(&h.table.ignore_term).insert(101);
+    h.until("child tracked", |h| h.rows().iter().any(|r| r.0 == 101))
+        .await;
+    h.child(|c| c.exit(0));
+    h.until_status(&run, RunStatus::Finished).await;
+    // The sweep is still running: the child is alive and the run still live.
+    assert!(h.table.alive(101));
+    assert_eq!(h.runs.live_count(), 1);
+    h.until_ended().await;
+    assert!(!h.table.alive(101));
+    assert!(h.at("term 101") < h.at("kill 101"));
+}
+
+// ---- fault isolation (spec 0004, AC-11) ----
+
+fn assert_supervisor_error(h: &Harness, run: &RunId) {
+    let row = h.store.run(run);
+    assert_eq!(
+        (row.status, row.end_reason, row.exit_code),
+        (RunStatus::Failed, Some(EndReason::SupervisorError), None)
+    );
+    assert!(!h.runs.token_is_live(&format!("{:032x}", 1)));
+    assert!(lock(&h.runtime.removed).contains(run));
+}
+
+#[tokio::test]
+async fn a_reader_thread_panic_should_end_only_its_run_as_supervisor_error() {
+    let h = harness();
+    let run = h.start().await;
+    let held = h.hold("k");
+    h.until_status(&run, RunStatus::WaitingInput).await;
+    h.child(|c| {
+        c.output
+            .as_ref()
+            .unwrap()
+            .send(READER_PANIC.to_vec())
+            .unwrap()
+    });
+    h.until_ended().await;
+    assert_supervisor_error(&h, &run);
+    // No reply: the helper falls back on its own.
+    assert_eq!(held.await.unwrap(), Err(HookError::TokenUnknown));
+    assert_eq!(h.store.only_approval().status, ApprovalStatus::Cancelled);
+    let (input, signals) = h.child(|c| (lock(&c.input).clone(), lock(&c.signals).clone()));
+    // No adapter stop input: SIGHUP straight away, then the sweep.
+    assert!(!input.ends_with(b"\x03"), "{input:?}");
+    assert_eq!(before_sweep(&signals), vec![GroupSignal::Hangup]);
+    assert!(h.trail().contains(&format!("reap {MAIN_PID}")));
+}
+
+#[tokio::test]
+async fn a_decoder_panic_should_be_ended_by_the_monitor_and_spare_other_runs() {
+    let h = harness();
+    let broken = h.start().await;
+    let other = h.start().await;
+    h.child(|c| c.print("GO"));
+    h.until_status(&other, RunStatus::Running).await;
+    let held = h.hold("k");
+    h.until_status(&broken, RunStatus::WaitingInput).await;
+    // The first run's decoder panics inside its driver task.
+    assert_eq!(h.hook(1, "panic", "").await, Err(HookError::TokenUnknown));
+    assert_eq!(held.await.unwrap(), Err(HookError::TokenUnknown));
+    h.until("the broken run's end", |h| {
+        h.store.run(&broken).status.is_terminal()
+    })
+    .await;
+    assert_supervisor_error(&h, &broken);
+    assert_eq!(h.store.only_approval().status, ApprovalStatus::Cancelled);
+    // The other run still works and ends on its own.
+    assert_eq!(h.hook(2, "event", "still here").await, ok_reply());
+    assert!(h.store.run(&other).status.is_live());
+    h.child(|c| c.exit(0));
+    h.until_ended().await;
+    assert_eq!(h.store.run(&other).status, RunStatus::Finished);
+}
+
+#[tokio::test]
+async fn a_panic_after_the_end_should_skip_the_end_steps_but_still_sweep() {
+    let h = harness();
+    let run = h.start().await;
+    h.table.add(101, MAIN_PID, MAIN_PID, CHILD_START);
+    h.store.panic_after_end.store(true, Ordering::SeqCst);
+    h.child(|c| c.exit(0));
+    h.until_ended().await;
+    let row = h.store.run(&run);
+    assert_eq!(
+        (row.status, row.end_reason),
+        (RunStatus::Finished, Some(EndReason::Exited))
+    );
+    assert!(!h.table.alive(101));
+    assert!(lock(&h.runtime.removed).contains(&run));
+}
+
+#[test]
+fn the_run_id_should_be_readable_from_the_task_and_thread_locals() {
+    assert_eq!(current_run_id(), None);
+    fault::set_thread_run(Some("run_x".into()));
+    assert_eq!(current_run_id().as_deref(), Some("run_x"));
+    fault::set_thread_run(None);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let id = RunId::new();
+    let seen = rt.block_on(fault::with_run_id(&id, async { current_run_id() }));
+    assert_eq!(seen, Some(id.to_string()));
 }

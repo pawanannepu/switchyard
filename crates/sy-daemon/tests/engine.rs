@@ -3322,4 +3322,619 @@ mod devtools {
         assert!(log.contains(&run), "the run's span fields are missing");
         assert!(leaks.is_empty(), "engine.log leaks: {leaks:#?}");
     }
+
+    // ---- run limits (spec 0004, milestone 1) ----
+
+    /// `dev.agent_run` with the fake agent, `steps` and `limits`; returns the run id.
+    async fn limited_run(raw: &mut Raw, steps: Value, limits: Value) -> String {
+        let reply = raw
+            .call(
+                methods::DEV_AGENT_RUN,
+                json!({ "agent_id": "fake", "options": { "script": steps }, "limits": limits }),
+            )
+            .await;
+        reply["result"]["run_ids"][0]
+            .as_str()
+            .unwrap_or_else(|| panic!("{reply}"))
+            .to_owned()
+    }
+
+    /// The run's last `run.status`, read until it ended.
+    async fn ended_status(raw: &mut Raw, run: &str) -> Value {
+        let statuses = until_ended(raw, &[run.to_owned()]).await;
+        statuses[run].last().unwrap().clone()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_flood_over_its_output_limit_should_end_failed_with_one_limit_event_first() {
+        let engine = Engine::start().await;
+        let mut raw = engine.raw().await;
+        raw.hello(PROTOCOL.major).await;
+        let run = limited_run(
+            &mut raw,
+            script(1_000_000, false),
+            json!({ "output_bytes": 65536, "idle_ms": 0, "active_ms": 0 }),
+        )
+        .await;
+        let last = ended_status(&mut raw, &run).await;
+        assert_eq!(
+            (&last["status"], &last["end_reason"]),
+            (&json!("failed"), &json!("limit_exceeded"))
+        );
+        let events = all_events(&mut raw, json!({ "run_id": run })).await;
+        let kinds: Vec<&str> = events.iter().map(|e| e["kind"].as_str().unwrap()).collect();
+        let limits: Vec<&Value> = events
+            .iter()
+            .filter(|e| e["kind"] == json!("run_limit_exceeded"))
+            .collect();
+        assert_eq!(limits.len(), 1, "{kinds:?}");
+        let limit = &limits[0];
+        assert_eq!(limit["actor"], json!("engine"));
+        assert_eq!(limit["payload"]["limit"], json!("output"));
+        assert_eq!(limit["payload"]["threshold"], json!(65536));
+        assert!(limit["payload"]["observed"].as_u64().unwrap() >= 65536);
+        let at = |kind: &str| kinds.iter().rposition(|k| *k == kind).unwrap();
+        assert!(
+            at("run_limit_exceeded") < at("run_status_changed"),
+            "{kinds:?}"
+        );
+        let (status, reason, _, log_bytes) = row(&engine, &run);
+        assert_eq!(
+            (status.as_str(), reason.as_str()),
+            ("failed", "limit_exceeded")
+        );
+        assert!(log_bytes >= 65536);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hung_run_should_be_stopped_as_idle_but_not_while_waiting_input() {
+        let engine = Engine::start().await;
+        let mut raw = engine.raw().await;
+        raw.hello(PROTOCOL.major).await;
+        let limits = json!({ "idle_ms": 1000, "active_ms": 0, "output_bytes": 0 });
+        let started = Instant::now();
+        let hung = limited_run(
+            &mut raw,
+            json!([{ "print": "ready\r\n" }, { "hang": true }]),
+            limits.clone(),
+        )
+        .await;
+        let waiting = limited_run(
+            &mut raw,
+            json!([{ "print": "ready\r\n" }, { "status": "waiting_input" }, { "hang": true }]),
+            limits,
+        )
+        .await;
+        let last = ended_status(&mut raw, &hung).await;
+        assert_eq!(last["end_reason"], json!("limit_exceeded"));
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_millis(1000), "{elapsed:?}");
+        let events = all_events(&mut raw, json!({ "run_id": hung })).await;
+        assert!(
+            events
+                .iter()
+                .any(|e| e["kind"] == json!("run_limit_exceeded")
+                    && e["payload"]["limit"] == json!("idle"))
+        );
+        tokio::time::sleep(Duration::from_secs(3).saturating_sub(started.elapsed())).await;
+        assert_eq!(row(&engine, &waiting).0, "waiting_input");
+        stop_runs(&mut raw, &[waiting]).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_busy_run_should_be_stopped_after_its_active_time() {
+        let engine = Engine::start().await;
+        let mut raw = engine.raw().await;
+        raw.hello(PROTOCOL.major).await;
+        let started = Instant::now();
+        let run = limited_run(
+            &mut raw,
+            script(2_000, false),
+            json!({ "active_ms": 1500, "idle_ms": 0, "output_bytes": 0 }),
+        )
+        .await;
+        let last = ended_status(&mut raw, &run).await;
+        assert_eq!(last["end_reason"], json!("limit_exceeded"));
+        assert!(started.elapsed() >= Duration::from_millis(1500));
+        let events = all_events(&mut raw, json!({ "run_id": run })).await;
+        let limit = events
+            .iter()
+            .find(|e| e["kind"] == json!("run_limit_exceeded"))
+            .unwrap();
+        assert_eq!(limit["payload"]["limit"], json!("time"));
+        assert_eq!(limit["payload"]["threshold"], json!(1500));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dev_agent_run_should_refuse_limits_that_are_not_integers() {
+        let engine = Engine::start().await;
+        let mut raw = engine.raw().await;
+        raw.hello(PROTOCOL.major).await;
+        for limits in [
+            json!({ "idle_ms": 1.5 }),
+            json!({ "output_bytes": -1 }),
+            json!({ "active_ms": 9_007_199_254_740_993_u64 }),
+        ] {
+            let reply = raw
+                .call(
+                    methods::DEV_AGENT_RUN,
+                    json!({ "agent_id": "fake", "limits": limits }),
+                )
+                .await;
+            assert_eq!(
+                reply["error"]["code"],
+                json!(ErrorCode::InvalidParams.code()),
+                "{reply}"
+            );
+        }
+    }
+
+    // ---- process facts and the leftover sweep (spec 0004, milestone 2) ----
+
+    use sy_core::agents::ports::ProcessTable as _;
+
+    /// The run's `run_process` rows: (pid, started_at, name).
+    fn process_rows(engine: &Engine, run: &str) -> Vec<(i64, i64, String)> {
+        let db = db(engine);
+        let mut st = db
+            .prepare("SELECT pid, started_at, name FROM run_process WHERE run_id = ?1 ORDER BY pid")
+            .unwrap();
+        st.query_map([run], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    fn main_pid(engine: &Engine, run: &str) -> (i64, Option<i64>) {
+        db(engine)
+            .query_row(
+                "SELECT pid, pid_started_at FROM run WHERE id = ?1",
+                [run],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    /// Is the process (pid, start) still there?
+    fn alive(table: &sy_infra::agents::SysProcessTable, (pid, started): (i64, i64)) -> bool {
+        table
+            .started_at(pid)
+            .is_some_and(|s| s.started_at_ms == started)
+    }
+
+    /// Fake runs with `steps`, the default limits.
+    async fn one_run(raw: &mut Raw, steps: Value) -> String {
+        fake_runs(raw, 1, steps).await.run_ids.remove(0).0
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_spawn_should_record_the_start_time_and_the_main_process_row() {
+        let engine = Engine::start().await;
+        let mut raw = engine.raw().await;
+        raw.hello(PROTOCOL.major).await;
+        let run = one_run(&mut raw, script(0, false)).await;
+        let (pid, started) = main_pid(&engine, &run);
+        let started = started.expect("pid_started_at is NULL");
+        assert_eq!(started % 1000, 0);
+        assert_eq!(
+            process_rows(&engine, &run),
+            vec![(pid, started, "sy-fake-agent".to_owned())]
+        );
+        stop_runs(&mut raw, std::slice::from_ref(&run)).await;
+        wait_no_live_runs(&mut raw).await;
+        assert!(process_rows(&engine, &run).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_leftover_should_be_gone_after_the_run_and_its_rows_deleted() {
+        let engine = Engine::start().await;
+        let mut raw = engine.raw().await;
+        raw.hello(PROTOCOL.major).await;
+        let steps = json!([
+            { "spawn": {} },
+            { "spawn": { "detach": true } },
+            { "spawn": { "detach": true, "ignore_sighup": true, "ignore_sigterm": true } },
+            { "print": "spawned\r\n" },
+            { "expect_input": "go" },
+            { "exit": 0 },
+        ]);
+        let run = one_run(&mut raw, steps).await;
+        // Two scans, 2 s apart, track the three children.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while process_rows(&engine, &run).len() < 4 {
+            assert!(
+                Instant::now() < deadline,
+                "children never tracked: {:?}",
+                process_rows(&engine, &run)
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let (main, _) = main_pid(&engine, &run);
+        let children: Vec<(i64, i64)> = process_rows(&engine, &run)
+            .into_iter()
+            .filter(|r| r.0 != main)
+            .map(|r| (r.0, r.1))
+            .collect();
+        let table = sy_infra::agents::SysProcessTable::new();
+        assert!(children.iter().all(|&c| alive(&table, c)));
+        raw.call(
+            methods::RUN_INPUT,
+            json!({ "run_id": run, "data_b64": b64(b"go\r") }),
+        )
+        .await;
+        let last = ended_status(&mut raw, &run).await;
+        assert_eq!(last["status"], json!("finished"));
+        let ended = Instant::now();
+        // SIGTERM, up to 3 s, SIGKILL for the one ignoring it.
+        while children.iter().any(|&c| alive(&table, c)) {
+            assert!(
+                ended.elapsed() < Duration::from_secs(5),
+                "leftovers still running: {children:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            ended.elapsed() < Duration::from_millis(4500),
+            "{:?}",
+            ended.elapsed()
+        );
+        wait_no_live_runs(&mut raw).await;
+        assert!(process_rows(&engine, &run).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_detached_orphan_should_be_found_by_its_session_and_stopped() {
+        let engine = Engine::start().await;
+        let mut raw = engine.raw().await;
+        raw.hello(PROTOCOL.major).await;
+        let run = one_run(
+            &mut raw,
+            json!([{ "spawn": { "detach": true } }, { "exit": 0 }]),
+        )
+        .await;
+        let (main, _) = main_pid(&engine, &run);
+        ended_status(&mut raw, &run).await;
+        wait_no_live_runs(&mut raw).await;
+        let table = sy_infra::agents::SysProcessTable::new();
+        let left: Vec<_> = table
+            .scan()
+            .unwrap()
+            .into_iter()
+            .filter(|p| p.sid == Some(main))
+            .collect();
+        assert!(left.is_empty(), "left in the run's session: {left:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_run_with_no_children_should_sweep_in_under_a_second() {
+        let engine = Engine::start().await;
+        let mut raw = engine.raw().await;
+        raw.hello(PROTOCOL.major).await;
+        let run = one_run(&mut raw, json!([{ "exit": 0 }])).await;
+        ended_status(&mut raw, &run).await;
+        // The sweep's last step deletes the main process's row.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !process_rows(&engine, &run).is_empty() {
+            assert!(Instant::now() < deadline, "the sweep took over 1 s");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    // ---- restart cleanup (spec 0004, milestone 3) ----
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restart_should_stop_what_a_killed_engine_left_and_spare_a_reused_pid() {
+        let mut engine = Engine::start().await;
+        let mut raw = engine.raw().await;
+        raw.hello(PROTOCOL.major).await;
+        let steps = json!([
+            { "spawn": { "detach": true, "ignore_sighup": true, "ignore_sigterm": true } },
+            { "print": "spawned\r\n" },
+            { "hang": true },
+        ]);
+        let run = one_run(&mut raw, steps).await;
+        let (main, _) = main_pid(&engine, &run);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let child = loop {
+            if let Some(row) = process_rows(&engine, &run)
+                .into_iter()
+                .find(|r| r.0 != main)
+            {
+                break (row.0, row.1);
+            }
+            assert!(Instant::now() < deadline, "the child was never tracked");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        // A row whose pid is now someone else's: same pid, another start time.
+        let mut bystander = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let bystander_pid = i64::from(bystander.id());
+        drop(raw);
+        engine.child.kill().unwrap();
+        engine.child.wait().unwrap();
+        rusqlite::Connection::open(engine.paths.data_dir.join("switchyard.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO run_process (run_id, pid, started_at, name, first_seen_at)
+                 VALUES (?1, ?2, 1000, 'reused', 1)",
+                rusqlite::params![run, bystander_pid],
+            )
+            .unwrap();
+        let table = sy_infra::agents::SysProcessTable::new();
+        assert!(
+            alive(&table, child),
+            "the child should outlive the killed engine"
+        );
+
+        engine.child = spawn_in(&engine.paths.data_dir, &[]);
+        engine.wait_for_socket().await;
+        let restarted = Instant::now();
+        let mut raw = engine.raw().await;
+        raw.hello(PROTOCOL.major).await;
+        // Served while the cleanup still waits out its 3 s.
+        let info = raw.call(methods::ENGINE_INFO, json!({})).await;
+        assert!(info.get("result").is_some(), "{info}");
+        assert!(restarted.elapsed() < Duration::from_secs(3));
+        while alive(&table, child) {
+            assert!(
+                restarted.elapsed() < Duration::from_secs(6),
+                "the leftover survived the restart"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !process_rows(&engine, &run).is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "rows left: {:?}",
+                process_rows(&engine, &run)
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(row(&engine, &run).0, "lost");
+        assert!(
+            bystander.try_wait().unwrap().is_none(),
+            "the reused pid was signalled"
+        );
+        bystander.kill().unwrap();
+        bystander.wait().unwrap();
+    }
+
+    // ---- fault isolation, shutdown and logging (spec 0004, milestone 4) ----
+
+    /// Run `sy-signal` as a second hook caller with the run's token.
+    fn call_hook(engine: &Engine, run: &str, hook: &str) -> std::process::Output {
+        let helper = Path::new(env!("CARGO_BIN_EXE_switchyardd")).with_file_name("sy-signal");
+        Command::new(helper)
+            .args([
+                "--socket",
+                &engine.paths.socket.to_string_lossy(),
+                "--token",
+                &fake_token(engine, run),
+                "--hook",
+                hook,
+                "--fallback-exit",
+                "7",
+                "--fallback-stdout-b64",
+                "",
+            ])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_panic_decoder_step_should_end_its_run_as_supervisor_error() {
+        let engine = Engine::start().await;
+        let mut raw = engine.raw().await;
+        raw.hello(PROTOCOL.major).await;
+        let run = one_run(
+            &mut raw,
+            json!([{ "panic_decoder": true }, { "print": "after\r\n" }, { "hang": true }]),
+        )
+        .await;
+        let last = ended_status(&mut raw, &run).await;
+        assert_eq!(
+            (&last["status"], &last["end_reason"]),
+            (&json!("failed"), &json!("supervisor_error"))
+        );
+        let log = engine.log();
+        let panic_line = log
+            .lines()
+            .find(|l| l.contains("panic") && l.contains(&run) && l.contains("lib.rs"))
+            .unwrap_or_else(|| panic!("no panic location with the run id in:\n{log}"));
+        assert!(panic_line.contains("ERROR"), "{panic_line}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_runs_limit_and_another_runs_panic_should_leave_a_third_run_working() {
+        let engine = Engine::start().await;
+        let mut raw = engine.raw().await;
+        raw.hello(PROTOCOL.major).await;
+        let echo = agent_runs(&mut raw, 1, 0, true).await.remove(0);
+        raw.call(methods::RUN_ATTACH, json!({ "run_id": echo }))
+            .await;
+        let panicked = one_run(
+            &mut raw,
+            json!([
+                // So it lives through the fault end's SIGHUP long enough to
+                // show its own fallback prompt.
+                { "ignore_sighup": true },
+                { "approval": {
+                    "kind": "command",
+                    "summary": "held while it panics",
+                    "detail": { "command": "ls" },
+                } },
+                { "expect_input": NEVER },
+            ]),
+        )
+        .await;
+        until_note(&mut raw, methods::APPROVAL_REQUESTED, Some(&panicked)).await;
+        let flooded = limited_run(
+            &mut raw,
+            script(4_000_000, false),
+            json!({ "output_bytes": 4_000_000, "idle_ms": 0, "active_ms": 0 }),
+        )
+        .await;
+        // The panic comes through a second hook caller while the approval is held.
+        let hook = call_hook(&engine, &panicked, "panic");
+        assert_eq!(hook.status.code(), Some(7), "the helper should fall back");
+
+        let mut latencies = Vec::new();
+        let started = Instant::now();
+        let mut ended = std::collections::HashSet::new();
+        let mut info_ok = 0;
+        let mut n = 0_u32;
+        while ended.len() < 2 || started.elapsed() < Duration::from_secs(3) {
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "the other runs never ended"
+            );
+            n += 1;
+            let marker = format!("ping-{n}");
+            let sent = Instant::now();
+            raw.send(
+                methods::RUN_INPUT,
+                json!({ "run_id": echo, "data_b64": b64(marker.as_bytes()) }),
+            )
+            .await;
+            let info = raw.send(methods::ENGINE_INFO, json!({})).await;
+            loop {
+                let msg = raw.next().await.unwrap();
+                if msg["id"] == json!(info) {
+                    assert!(msg.get("result").is_some(), "{msg}");
+                    info_ok += 1;
+                } else if msg["method"] == json!(methods::RUN_OUTPUT)
+                    && msg["params"]["run_id"] == json!(echo)
+                    && String::from_utf8_lossy(&unb64(&msg["params"]["data_b64"])).contains(&marker)
+                {
+                    latencies.push(sent.elapsed());
+                    break;
+                } else if msg["method"] == json!(methods::RUN_STATUS) {
+                    let p = &msg["params"];
+                    if ["failed", "stopped", "finished"]
+                        .contains(&p["status"].as_str().unwrap_or(""))
+                    {
+                        let id = p["run_id"].as_str().unwrap().to_owned();
+                        assert_ne!(id, echo, "the echo run ended");
+                        ended.insert(id);
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        latencies.sort();
+        let p95 = latencies[latencies.len() * 95 / 100];
+        assert!(
+            p95 < Duration::from_millis(100),
+            "p95 input to echo {p95:?}"
+        );
+        assert!(info_ok > 0);
+        assert_eq!(row(&engine, &panicked).1, "supervisor_error");
+        assert_eq!(row(&engine, &flooded).1, "limit_exceeded");
+        assert_eq!(row(&engine, &echo).0, "running");
+        let approvals = raw
+            .call(methods::APPROVAL_LIST, json!({ "status": "cancelled" }))
+            .await;
+        assert!(
+            approvals.to_string().contains("held while it panics"),
+            "{approvals}"
+        );
+        // Its own `sy-signal` got no reply and fell back: the fake asked in its terminal.
+        assert!(
+            String::from_utf8_lossy(&log_file(&engine, &panicked)).contains("Allow"),
+            "the held hook did not fall back"
+        );
+        stop_runs(&mut raw, &[echo]).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_should_stop_a_stubborn_run_and_its_leftovers_within_about_13_s() {
+        let mut engine = Engine::start().await;
+        let mut raw = engine.raw().await;
+        raw.hello(PROTOCOL.major).await;
+        let run = one_run(
+            &mut raw,
+            json!([
+                { "ignore_sighup": true },
+                { "ignore_sigterm": true },
+                { "spawn": { "detach": true, "ignore_sighup": true, "ignore_sigterm": true } },
+                { "print": "ready\r\n" },
+                { "hang": true },
+            ]),
+        )
+        .await;
+        let (main, _) = main_pid(&engine, &run);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let child = loop {
+            if let Some(r) = process_rows(&engine, &run)
+                .into_iter()
+                .find(|r| r.0 != main)
+            {
+                break (r.0, r.1);
+            }
+            assert!(Instant::now() < deadline, "the child was never tracked");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        let started = Instant::now();
+        raw.call(methods::ENGINE_SHUTDOWN, json!({})).await;
+        assert!(
+            engine.wait_exit(Duration::from_secs(16)).is_some(),
+            "engine did not exit"
+        );
+        let took = started.elapsed();
+        assert!(took < Duration::from_secs(15), "shutdown took {took:?}");
+        let table = sy_infra::agents::SysProcessTable::new();
+        assert!(!alive(&table, child), "the leftover outlived shutdown");
+        assert!(
+            table.started_at(main).is_none(),
+            "the agent outlived shutdown"
+        );
+        assert!(process_rows(&engine, &run).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn limit_and_sweep_logs_should_name_the_limit_and_processes_but_no_run_data() {
+        const MARK: &str = "secret-mark-61f2";
+        let mut engine = Engine::start().await;
+        let mut raw = engine.raw().await;
+        raw.hello(PROTOCOL.major).await;
+        let reply = raw
+            .call(
+                methods::DEV_AGENT_RUN,
+                json!({
+                    "agent_id": "fake",
+                    "prompt": format!("{MARK}-prompt"),
+                    "options": { "script": [
+                        { "spawn": { "detach": true } },
+                        { "print": format!("{MARK}-output\r\n") },
+                        { "flood": { "bytes_per_sec": 1_000_000 } },
+                    ] },
+                    "limits": { "output_bytes": 100_000 },
+                }),
+            )
+            .await;
+        let run = reply["result"]["run_ids"][0].as_str().unwrap().to_owned();
+        ended_status(&mut raw, &run).await;
+        wait_no_live_runs(&mut raw).await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !process_rows(&engine, &run).is_empty() {
+            assert!(Instant::now() < deadline, "the sweep never finished");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        drop(raw);
+        stop(&mut engine).await;
+        let log = engine.log();
+        assert!(log.contains("run limit reached"), "no limit line");
+        assert!(log.contains("threshold=100000"), "no threshold");
+        let sweep = log
+            .lines()
+            .find(|l| l.contains("swept the run's leftover processes"))
+            .expect("no sweep summary");
+        assert!(sweep.contains("sy-fake-agent"), "{sweep}");
+        let leaks: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains(MARK) || l.contains("--child"))
+            .collect();
+        assert!(leaks.is_empty(), "engine.log leaks: {leaks:#?}");
+    }
 }

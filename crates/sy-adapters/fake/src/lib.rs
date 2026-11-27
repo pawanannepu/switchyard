@@ -219,6 +219,11 @@ impl RunDecoder for FakeDecoder {
     }
 
     fn on_hook(&mut self, call: &HookCall, _now_ms: i64) -> HookOutcome {
+        // Spec 0004, AC-14: the fault isolation tests' panic. This adapter
+        // exists only in devtools builds, so no release build can reach it.
+        if call.hook == "panic" {
+            panic!("the fake decoder panics on purpose (a `panic_decoder` step)");
+        }
         if call.hook == "approval" {
             let Some(ask) = payload::<ApprovalAsk>(call) else {
                 return ask_in_terminal();

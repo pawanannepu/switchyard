@@ -43,10 +43,39 @@ fn main() -> ExitCode {
     }
 }
 
+/// Log every panic's location at error, with the run whose supervision it
+/// happened in (spec 0004, AC-11): a `JoinError` carries no location. The
+/// payload is left out, since it may hold data the logs never keep.
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()));
+        let run_id = sy_core::agents::current_run_id();
+        tracing::error!(
+            run_id = run_id.as_deref(),
+            location = location.as_deref(),
+            thread = std::thread::current().name(),
+            "panic"
+        );
+    }));
+}
+
 fn run() -> anyhow::Result<ExitCode> {
     let paths = EnginePaths::resolve()?;
     paths.ensure_dirs()?;
     let _log_guard = logging::init(&paths.logs_dir)?;
+    install_panic_hook();
+    if cfg!(panic = "abort") {
+        tracing::error!(
+            "built with panic = \"abort\": a panic in one run's supervision stops the whole engine"
+        );
+    }
+    // Many runs and held hooks need more than the macOS default of 256 (spec 0004, AC-13).
+    match sy_infra::limits::raise_nofile_limit(4096) {
+        Ok(limit) => tracing::debug!(limit, "open file limit"),
+        Err(err) => tracing::warn!(%err, "could not raise the open file limit"),
+    }
 
     let lock = match lock::acquire(&paths.lock)
         .with_context(|| format!("opening {}", paths.lock.display()))?

@@ -4,7 +4,7 @@
 use sy_core::ids::{ApprovalId, ProjectId, RunId, TaskId, WorkspaceId};
 use sy_core::model::{
     Actor, Approval, ApprovalKind, ApprovalStatus, DecidedBy, Event, EventKind, FileChange,
-    JsonValue, MessageRole, RunKind, RunStatus, WorkspaceOutcome, WorkspaceState,
+    JsonValue, LimitKind, MessageRole, RunKind, RunStatus, WorkspaceOutcome, WorkspaceState,
 };
 use sy_core::ports::EventFilter;
 use sy_protocol::{ErrorCode, EventPayload, EventSinceParams, RpcError};
@@ -325,6 +325,21 @@ fn payload(kind: &EventKind) -> EventPayload {
             decided_by: by.map(decided_by),
             decided_by_ref: decided_by_ref.clone(),
             message: message.clone(),
+        },
+        EventKind::RunLimitExceeded {
+            run_id: run,
+            limit,
+            threshold,
+            observed,
+        } => EventPayload::RunLimitExceeded {
+            run_id: run_id(run),
+            limit: match limit {
+                LimitKind::Idle => sy_protocol::RunLimit::Idle,
+                LimitKind::Time => sy_protocol::RunLimit::Time,
+                LimitKind::Output => sy_protocol::RunLimit::Output,
+            },
+            threshold: *threshold,
+            observed: *observed,
         },
     }
 }

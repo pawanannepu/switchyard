@@ -38,6 +38,11 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../../migrations/0002_approval.sql"),
         rebuild: false,
     },
+    Migration {
+        name: "0003_run_process.sql",
+        sql: include_str!("../../migrations/0003_run_process.sql"),
+        rebuild: false,
+    },
 ];
 
 /// The newest schema version a list of migrations reaches.

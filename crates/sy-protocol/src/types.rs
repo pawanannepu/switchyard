@@ -349,7 +349,7 @@ pub enum EventPayload {
         from: RunStatus,
         /// The new status.
         status: RunStatus,
-        /// Why it ended, on a terminal status (`exited`, `user_stop`, `engine_restart`, ...).
+        /// Why it ended, on a terminal status (`exited`, `user_stop`, `engine_restart`, `spawn_failed`, `limit_exceeded`, `supervisor_error`, ...).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         end_reason: Option<String>,
         /// The exit code, when the process exited.
@@ -413,6 +413,29 @@ pub enum EventPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
     },
+    /// A run reached a limit and is being stopped; it ends `failed` with `limit_exceeded`.
+    RunLimitExceeded {
+        /// The run.
+        run_id: RunId,
+        /// Which limit.
+        limit: RunLimit,
+        /// The limit's value (ms for `idle` and `time`, bytes for `output`).
+        threshold: u64,
+        /// What was observed when it was hit.
+        observed: u64,
+    },
+}
+
+/// A run limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RunLimit {
+    /// No output and no hook call for too long while `starting` or `running`.
+    Idle,
+    /// Too much active time (`waiting_input` does not count).
+    Time,
+    /// Too many terminal output bytes.
+    Output,
 }
 
 /// One journal event, as `event.since` returns it.
@@ -536,7 +559,7 @@ pub struct RunStatusChanged {
     pub from: RunStatus,
     /// The new status.
     pub status: RunStatus,
-    /// Why it ended, on a terminal status (`exited`, `user_stop`, `engine_restart`, ...).
+    /// Why it ended, on a terminal status (`exited`, `user_stop`, `engine_restart`, `spawn_failed`, `limit_exceeded`, `supervisor_error`, ...).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_reason: Option<String>,
     /// The exit code, when the process exited.
@@ -951,6 +974,23 @@ pub struct AgentRunParams {
     /// Terminal height. Default 40.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rows: Option<u16>,
+    /// Run limits for these runs, above every setting. `0` turns one off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<AgentRunLimits>,
+}
+
+/// `dev.agent_run` limits: each an integer from 0 to 2^53, `0` meaning off.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AgentRunLimits {
+    /// The idle limit, ms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_ms: Option<u64>,
+    /// The active time limit, ms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_ms: Option<u64>,
+    /// The output limit, bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_bytes: Option<u64>,
 }
 
 /// `dev.agent_run` result.

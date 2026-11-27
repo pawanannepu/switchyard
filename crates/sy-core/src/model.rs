@@ -227,8 +227,22 @@ text_enum!(
         EngineRestart = "engine_restart",
         /// The process could not be started.
         SpawnFailed = "spawn_failed",
-        /// A time or output limit stopped it.
+        /// An idle, time or output limit stopped it (spec 0004).
         LimitExceeded = "limit_exceeded",
+        /// A bug in the engine's supervision of the run ended it (spec 0004, AC-11).
+        SupervisorError = "supervisor_error",
+    }
+);
+
+text_enum!(
+    /// Which run limit a run reached (spec 0004).
+    LimitKind {
+        /// Silent too long while `starting` or `running`.
+        Idle = "idle",
+        /// Too much active time.
+        Time = "time",
+        /// Too many terminal output bytes.
+        Output = "output",
     }
 );
 
@@ -908,6 +922,17 @@ pub enum EventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
     },
+    /// A run reached a limit and is being stopped (spec 0004, AC-6).
+    RunLimitExceeded {
+        /// The run.
+        run_id: RunId,
+        /// Which limit.
+        limit: LimitKind,
+        /// The resolved limit (ms or bytes).
+        threshold: u64,
+        /// What was observed when it was hit.
+        observed: u64,
+    },
 }
 
 impl EventKind {
@@ -922,7 +947,8 @@ impl EventKind {
     }
 }
 
-/// The journal kinds an adapter reports, the only ones `Store::append_event` takes.
+/// The run scoped journal kinds `Store::append_event` takes: the ones an
+/// adapter reports, plus the engine's own `run_limit_exceeded`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdapterEvent {
     /// A message in the conversation.
@@ -948,6 +974,17 @@ pub enum AdapterEvent {
         /// The old path, for a rename.
         from_path: Option<String>,
     },
+    /// A run reached a limit (journaled by the engine, spec 0004).
+    RunLimitExceeded {
+        /// The run.
+        run_id: RunId,
+        /// Which limit.
+        limit: LimitKind,
+        /// The resolved limit.
+        threshold: u64,
+        /// What was observed.
+        observed: u64,
+    },
 }
 
 impl From<AdapterEvent> for EventKind {
@@ -963,6 +1000,17 @@ impl From<AdapterEvent> for EventKind {
                 path,
                 change,
                 from_path,
+            },
+            AdapterEvent::RunLimitExceeded {
+                run_id,
+                limit,
+                threshold,
+                observed,
+            } => Self::RunLimitExceeded {
+                run_id,
+                limit,
+                threshold,
+                observed,
             },
         }
     }

@@ -29,14 +29,18 @@
 mod approvals;
 pub mod detect;
 mod driver;
+mod fault;
 pub mod launch;
 mod limit;
 pub mod ports;
+mod scanner;
+pub mod supervise;
+mod sweep;
 
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -50,20 +54,25 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tracing::Instrument;
 
 use crate::adapters::AdapterRegistry;
-use crate::ids::{ApprovalId, RunId};
+use crate::ids::{ApprovalId, ProjectId, RunId};
 use crate::model::{
-    Actor, AdapterEvent, Approval, ApprovalDecision, ApprovalStatus, EndReason, NewApproval,
-    NewRun, Run, RunEnd, RunKind, RunStatus, RunTransition, Workspace,
+    Actor, AdapterEvent, Approval, ApprovalDecision, ApprovalStatus, EndReason, JsonValue,
+    NewApproval, NewRun, Run, RunEnd, RunKind, RunStatus, RunTransition, Workspace,
 };
-use crate::ports::{Clock, Committed, RunProcess, Store, StoreError};
+use crate::ports::{Clock, Committed, RunProcess, Store, StoreError, TrackedProcess};
 use crate::runs::{RunControl, RunError, RunHub, RunWriter};
 pub use approvals::{ApprovalNotice, RespondError, new_approval};
-use driver::{Control, Driver};
+use driver::{Control, Driver, StopCause};
+pub use fault::current_run_id;
+use fault::{RunKit, set_thread_run, with_run_id};
 use launch::{AllowedProgram, agent_env, allowed_program, valid_rel_path};
 pub use limit::{SIGNAL_BURST, SIGNAL_RATE_PER_SEC};
 use ports::{
-    ChildProcess, GroupSignal, LoginEnv, Pty, PtyChild, PtyIo, RuntimeDir, SpawnRequest,
-    TokenSource,
+    ChildProcess, GroupSignal, LoginEnv, ProcessTable, Pty, PtyChild, PtyIo, RuntimeDir,
+    SpawnRequest, TokenSource,
+};
+use supervise::{
+    LIMIT_KEYS, LimitOverride, Limits, OutputMeter, ProcKey, SettingScope, Tracker, resolve_limits,
 };
 
 /// The PTY reader's largest read.
@@ -128,6 +137,22 @@ pub trait RunWrites: Send + Sync {
         run: &RunId,
         message: Option<String>,
     ) -> Result<Committed<Vec<Approval>>, StoreError>;
+    /// `Store::track_processes`.
+    async fn track_processes(
+        &self,
+        run: &RunId,
+        rows: &[TrackedProcess],
+        main: bool,
+    ) -> Result<(), StoreError>;
+    /// `Store::untrack_processes`.
+    async fn untrack_processes(&self, run: &RunId, keys: &[ProcKey]) -> Result<(), StoreError>;
+    /// `Store::project_settings`, its values only.
+    async fn project_settings(
+        &self,
+        project: &ProjectId,
+    ) -> Result<BTreeMap<String, JsonValue>, StoreError>;
+    /// `Store::get_setting`.
+    async fn get_setting(&self, key: &str) -> Result<Option<JsonValue>, StoreError>;
 }
 
 /// [`RunWrites`] through the real [`Store`] (whose committed events the
@@ -202,6 +227,26 @@ impl RunWrites for StoreWrites {
     ) -> Result<Committed<Vec<Approval>>, StoreError> {
         self.0.cancel_pending_approvals(actor, run, message).await
     }
+    async fn track_processes(
+        &self,
+        run: &RunId,
+        rows: &[TrackedProcess],
+        main: bool,
+    ) -> Result<(), StoreError> {
+        self.0.track_processes(run, rows, main).await
+    }
+    async fn untrack_processes(&self, run: &RunId, keys: &[ProcKey]) -> Result<(), StoreError> {
+        self.0.untrack_processes(run, keys).await
+    }
+    async fn project_settings(
+        &self,
+        project: &ProjectId,
+    ) -> Result<BTreeMap<String, JsonValue>, StoreError> {
+        Ok(self.0.project_settings(project).await?.values)
+    }
+    async fn get_setting(&self, key: &str) -> Result<Option<JsonValue>, StoreError> {
+        self.0.get_setting(key).await
+    }
 }
 
 /// How the stop sequence and the run end are timed (spec 0003, AC-6 and AC-12).
@@ -217,6 +262,14 @@ pub struct Timings {
     pub shutdown_grace: Duration,
     /// How often `on_tick` runs.
     pub tick: Duration,
+    /// How often the process tree scanner runs (spec 0004, AC-7).
+    pub scan_every: Duration,
+    /// After the sweep's SIGTERM, how long leftovers get to go (AC-8).
+    pub sweep_term_wait: Duration,
+    /// After the sweep's SIGKILL, how long to wait for confirmation.
+    pub sweep_kill_wait: Duration,
+    /// How often the sweep checks whether leftovers are gone.
+    pub sweep_poll: Duration,
 }
 
 impl Default for Timings {
@@ -227,6 +280,10 @@ impl Default for Timings {
             drain: Duration::from_secs(1),
             shutdown_grace: Duration::from_millis(3000),
             tick: Duration::from_millis(250),
+            scan_every: Duration::from_secs(2),
+            sweep_term_wait: Duration::from_secs(3),
+            sweep_kill_wait: Duration::from_millis(500),
+            sweep_poll: Duration::from_millis(100),
         }
     }
 }
@@ -239,6 +296,8 @@ pub struct AgentRunsDeps {
     pub hub: Arc<RunHub>,
     /// Spawns agents.
     pub pty: Arc<dyn Pty>,
+    /// Process facts and per process signals (spec 0004).
+    pub processes: Arc<dyn ProcessTable>,
     /// The launch dirs.
     pub runtime: Arc<dyn RuntimeDir>,
     /// The login environment.
@@ -266,6 +325,8 @@ pub struct StartRun {
     pub prompt: String,
     /// The terminal size.
     pub size: PtySize,
+    /// The highest limit source (`dev.agent_run.limits`); empty otherwise.
+    pub limits: LimitOverride,
 }
 
 /// Why [`AgentRuns::start`] made no run (a run that fails to launch is a
@@ -333,6 +394,31 @@ struct LiveRun {
     control: mpsc::UnboundedSender<Control>,
 }
 
+/// A launched run's process tracking, from its spawn until its sweep ends.
+#[derive(Clone)]
+struct Tracking {
+    tracker: Arc<Mutex<Tracker>>,
+    store: Arc<dyn RunWrites>,
+}
+
+/// An engine wide "at most once a minute" warning gate.
+#[derive(Default)]
+struct WarnEvery(Mutex<Option<Instant>>);
+
+impl WarnEvery {
+    const EVERY: Duration = Duration::from_secs(60);
+
+    fn ready(&self) -> bool {
+        let mut at = lock(&self.0);
+        if at.is_none_or(|t| t.elapsed() >= Self::EVERY) {
+            *at = Some(Instant::now());
+            true
+        } else {
+            false
+        }
+    }
+}
+
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -342,6 +428,7 @@ pub struct AgentRuns {
     adapters: AdapterRegistry,
     hub: Arc<RunHub>,
     pty: Arc<dyn Pty>,
+    processes: Arc<dyn ProcessTable>,
     runtime: Arc<dyn RuntimeDir>,
     login: Arc<dyn LoginEnv>,
     tokens: Arc<dyn TokenSource>,
@@ -357,6 +444,14 @@ pub struct AgentRuns {
     signals: Mutex<HashMap<String, mpsc::UnboundedSender<Control>>>,
     /// Runs still between their start and the end of their end sequence.
     drivers: watch::Sender<usize>,
+    /// Invalid limit settings already warned about, once per (key, scope, value).
+    bad_settings: Mutex<HashSet<(&'static str, SettingScope, String)>>,
+    /// Every launched run's tracking, until its sweep ends.
+    tracking: Mutex<HashMap<RunId, Tracking>>,
+    /// Failed `run_process` writes, warned at most once a minute.
+    write_warn: WarnEvery,
+    /// Failed scans, warned at most once a minute.
+    scan_warn: WarnEvery,
 }
 
 /// What a successful launch hands the driver.
@@ -364,6 +459,10 @@ struct Launched {
     child: PtyChild,
     decoder: Box<dyn RunDecoder>,
     initial_input: Option<Vec<u8>>,
+    /// Right after the spawn: where the supervision clocks start.
+    spawned: Instant,
+    /// The run's process tracking, its main process already recorded.
+    tracker: Tracker,
 }
 
 impl AgentRuns {
@@ -373,6 +472,7 @@ impl AgentRuns {
             adapters: deps.adapters,
             hub: deps.hub,
             pty: deps.pty,
+            processes: deps.processes,
             runtime: deps.runtime,
             login: deps.login,
             tokens: deps.tokens,
@@ -385,6 +485,10 @@ impl AgentRuns {
             live: Mutex::new(HashMap::new()),
             signals: Mutex::new(HashMap::new()),
             drivers: watch::Sender::new(0),
+            bad_settings: Mutex::new(HashSet::new()),
+            tracking: Mutex::new(HashMap::new()),
+            write_warn: WarnEvery::default(),
+            scan_warn: WarnEvery::default(),
         })
     }
 
@@ -393,7 +497,8 @@ impl AgentRuns {
         &self.adapters
     }
 
-    /// How many runs are between their start and the end of their end sequence.
+    /// How many runs are between their start and the end of their leftover
+    /// sweep (spec 0004: a sweeping run still counts as live).
     pub fn live_count(&self) -> usize {
         *self.drivers.borrow()
     }
@@ -539,18 +644,31 @@ impl AgentRuns {
         self.drivers.send_modify(|n| *n += 1);
 
         let span = tracing::info_span!("run", run_id = %id, agent_id = %adapter.id());
+        let limits = self
+            .resolve_limits(store.as_ref(), &req)
+            .instrument(span.clone())
+            .await;
         match self
             .launch(adapter.as_ref(), &req, &id, &token, store.as_ref())
             .instrument(span.clone())
             .await
         {
-            Ok(launched) => {
+            Ok(mut launched) => {
+                let tracker = std::mem::replace(&mut launched.tracker, Tracker::new(0, None, ""));
+                lock(&self.tracking).insert(
+                    id.clone(),
+                    Tracking {
+                        tracker: Arc::new(Mutex::new(tracker)),
+                        store: Arc::clone(&store),
+                    },
+                );
                 if let Err(reason) = self.drive(
                     store.clone(),
                     &id,
                     req.workspace.id.to_string(),
                     token.clone(),
                     launched,
+                    limits,
                     writer,
                     hub_control,
                     control_tx,
@@ -569,6 +687,59 @@ impl AgentRuns {
             }
         }
         Ok(id)
+    }
+
+    /// The run's limits (spec 0004, AC-2), read once before `launch`. A
+    /// failed read skips that source; it never fails the launch.
+    async fn resolve_limits(&self, store: &dyn RunWrites, req: &StartRun) -> Limits {
+        let project = match store.project_settings(&req.workspace.project_id).await {
+            Ok(values) => Some(values),
+            Err(err) => {
+                self.warn_setting_once("*", SettingScope::Project, &err.to_string(), || {
+                    tracing::warn!(%err, "could not read the project's limit settings; skipped them");
+                });
+                None
+            }
+        };
+        let mut global = BTreeMap::new();
+        for key in LIMIT_KEYS {
+            match store.get_setting(key).await {
+                Ok(Some(value)) => {
+                    global.insert(key.to_owned(), value);
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    self.warn_setting_once(key, SettingScope::Global, &err.to_string(), || {
+                        tracing::warn!(key, %err, "could not read a global limit setting; skipped it");
+                    });
+                }
+            }
+        }
+        let (limits, bad) = resolve_limits(&req.limits, project.as_ref(), &global);
+        for b in bad {
+            self.warn_setting_once(b.key, b.scope, &b.value, || {
+                tracing::warn!(
+                    key = b.key,
+                    scope = b.scope.as_str(),
+                    value = %b.value,
+                    "ignored an invalid limit setting (want an integer from 0 to 2^53)"
+                );
+            });
+        }
+        limits
+    }
+
+    /// Run `warn` the first time this (key, scope, value) is seen.
+    fn warn_setting_once(
+        &self,
+        key: &'static str,
+        scope: SettingScope,
+        value: &str,
+        warn: impl FnOnce(),
+    ) {
+        if lock(&self.bad_settings).insert((key, scope, value.to_owned())) {
+            warn();
+        }
     }
 
     /// Everything from the launch dir to the spawn. The `Err` text is the
@@ -648,6 +819,7 @@ impl AgentRuns {
             args = plan.args.len(),
             "launching"
         );
+        let spawn_name = program.rsplit('/').next().unwrap_or_default().to_owned();
         let spawn = SpawnRequest {
             program,
             args: plan.args.clone(),
@@ -658,24 +830,64 @@ impl AgentRuns {
         let child = blocking(move || pty.spawn(spawn).map_err(|e| std::io::Error::other(e.0)))
             .await
             .map_err(|e| format!("could not start the agent: {e}"))?;
-        if let Err(err) = store
-            .set_run_process(
-                id,
-                RunProcess {
-                    pid: child.pid,
-                    pgid: child.pgid,
-                    pid_started_at: None,
-                },
-            )
-            .await
-        {
-            tracing::warn!(%err, "could not record the run's process");
-        }
+        let spawned = Instant::now();
+        let tracker = self
+            .record_main(store, id, (child.pid, child.pgid), &spawn_name)
+            .await;
         Ok(Launched {
             child,
             decoder: launch.decoder,
             initial_input: plan.initial_input,
+            spawned,
+            tracker,
         })
+    }
+
+    /// Right after the spawn (spec 0004, AC-1): read the main process's
+    /// start time, record `pid`, `pgid` and `pid_started_at`, and insert the
+    /// main `run_process` row (queued when storage is degraded). With no
+    /// start time, `pid_started_at` stays NULL with no row.
+    async fn record_main(
+        &self,
+        store: &dyn RunWrites,
+        id: &RunId,
+        (pid, pgid): (i64, i64),
+        name: &str,
+    ) -> Tracker {
+        let table = Arc::clone(&self.processes);
+        let started = blocking(move || Ok(table.started_at(pid)))
+            .await
+            .ok()
+            .flatten()
+            .map(|s| s.started_at_ms);
+        if started.is_none() {
+            tracing::warn!("could not read the agent's start time; its pid is recorded without it");
+        }
+        let process = RunProcess {
+            pid,
+            pgid,
+            pid_started_at: started,
+        };
+        if let Err(err) = store.set_run_process(id, process).await {
+            tracing::warn!(%err, "could not record the run's process");
+        }
+        if let Some(started_at) = started {
+            let row = TrackedProcess {
+                pid,
+                started_at,
+                name: name.to_owned(),
+                first_seen_at: self.clock.now_ms(),
+            };
+            if let Err(err) = store.track_processes(id, &[row], true).await {
+                tracing::warn!(%err, "could not record the run's main process");
+            }
+        }
+        Tracker::new(pid, started, name)
+    }
+
+    /// The run's tracking, while it is launched and not yet swept.
+    fn tracking(&self, id: &RunId) -> Option<Tracking> {
+        lock(&self.tracking).get(id).cloned()
     }
 
     /// Start the threads and the driver task for a launched run.
@@ -687,6 +899,7 @@ impl AgentRuns {
         workspace: String,
         token: String,
         launched: Launched,
+        limits: Limits,
         writer: RunWriter,
         hub_control: mpsc::Receiver<RunControl>,
         control_tx: mpsc::UnboundedSender<Control>,
@@ -697,6 +910,8 @@ impl AgentRuns {
             child,
             decoder,
             initial_input,
+            spawned,
+            tracker: _,
         } = launched;
         let PtyChild {
             reader,
@@ -709,19 +924,38 @@ impl AgentRuns {
         let (write_tx, write_rx) = mpsc::channel(WRITER_QUEUE);
         let (input_tx, input_rx) = mpsc::unbounded_channel();
         let cut = Arc::new(AtomicBool::new(false));
+        let meter = Arc::new(OutputMeter::new(spawned));
+        let kit = Arc::new(RunKit {
+            token: token.clone(),
+            process: Arc::clone(&process),
+            cut: Arc::clone(&cut),
+            reader_finished: Arc::new(AtomicBool::new(false)),
+            exited: Arc::new(AtomicBool::new(false)),
+        });
+        let guard = |name: &'static str, finished: Option<Arc<AtomicBool>>| Guard {
+            name,
+            run: id.to_string(),
+            span: span.clone(),
+            control: control_tx.clone(),
+            finished,
+        };
 
         let threads = (|| {
             spawn_reader(
+                guard("pty-reader", Some(Arc::clone(&kit.reader_finished))),
                 reader,
                 writer,
                 output_tx,
-                control_tx.clone(),
                 done_tx,
                 Arc::clone(&cut),
-                span.clone(),
+                Arc::clone(&meter),
             )?;
-            spawn_writer(io, write_rx, span.clone())?;
-            spawn_waiter(Arc::clone(&process), control_tx, span.clone())
+            spawn_writer(guard("pty-writer", None), io, write_rx)?;
+            spawn_waiter(
+                guard("pty-waiter", None),
+                Arc::clone(&process),
+                Arc::clone(&kit.exited),
+            )
         })();
         if let Err(err) = threads {
             process.signal_group(GroupSignal::Kill);
@@ -730,21 +964,50 @@ impl AgentRuns {
         tokio::spawn(pump(hub_control, input_rx, write_tx));
         let driver = Driver::new(
             Arc::clone(self),
-            store,
+            Arc::clone(&store),
             id.clone(),
             workspace,
             token,
             decoder,
-            process,
+            Arc::clone(&process),
             control_rx,
             output_rx,
             done_rx,
             cut,
             input_tx,
             initial_input,
+            limits,
+            meter,
+            spawned,
+            Arc::clone(&kit),
         );
-        tokio::spawn(driver.run().instrument(span));
+        let handle = tokio::spawn(with_run_id(id, driver.run()).instrument(span.clone()));
+        tokio::spawn(with_run_id(
+            id,
+            Arc::clone(self)
+                .monitor(id.clone(), handle, store, kit)
+                .instrument(span),
+        ));
         Ok(())
+    }
+
+    /// The run's monitor (spec 0004, *Runtime shape*): waits for the driver
+    /// to end, then runs the leftover sweep whatever ended the run. The run
+    /// counts as live until this returns.
+    async fn monitor(
+        self: Arc<Self>,
+        id: RunId,
+        driver: tokio::task::JoinHandle<()>,
+        store: Arc<dyn RunWrites>,
+        kit: Arc<RunKit>,
+    ) {
+        if let Err(err) = driver.await {
+            // The panic hook already logged where; the driver can't end the run now.
+            tracing::error!(panicked = err.is_panic(), "the run's driver task failed");
+            self.fault_end(store.as_ref(), &id, &kit).await;
+        }
+        self.sweep(&id, &kit.process).await;
+        self.finish(&id);
     }
 
     /// End a run that never launched, in AC-17's order: revoke the token,
@@ -803,9 +1066,19 @@ impl AgentRuns {
         lock(&self.signals).remove(token);
     }
 
-    /// The run's end sequence is over.
-    fn finish(&self, id: &RunId) {
+    /// The run reached its terminal transition: its control lane goes, and
+    /// the scanner never writes for it again (AC-8).
+    fn ended(&self, id: &RunId) {
         lock(&self.live).remove(id);
+        if let Some(t) = self.tracking(id) {
+            lock(&t.tracker).close();
+        }
+    }
+
+    /// The run's end sequence, and its sweep, are over.
+    fn finish(&self, id: &RunId) {
+        self.ended(id);
+        lock(&self.tracking).remove(id);
         self.drivers.send_modify(|n| *n = n.saturating_sub(1));
     }
 
@@ -819,7 +1092,7 @@ impl AgentRuns {
             // A closed lane means the run's end sequence already started.
             if control
                 .send(Control::Stop {
-                    shutdown: false,
+                    cause: StopCause::User,
                     ack,
                 })
                 .is_ok()
@@ -867,7 +1140,7 @@ impl AgentRuns {
         for control in controls {
             let (ack, _done) = oneshot::channel();
             let _ = control.send(Control::Stop {
-                shutdown: true,
+                cause: StopCause::Shutdown,
                 ack,
             });
         }
@@ -918,95 +1191,120 @@ async fn pump(
     }
 }
 
+/// A PTY thread's boundary (spec 0004, AC-11): its span and run id, and a
+/// caught panic becomes `Control::SupervisorFault` for its run only.
+struct Guard {
+    name: &'static str,
+    run: String,
+    span: tracing::Span,
+    control: mpsc::UnboundedSender<Control>,
+    /// Set when the body ends, however it ends.
+    finished: Option<Arc<AtomicBool>>,
+}
+
+impl Guard {
+    fn spawn(self, body: impl FnOnce() + Send + 'static) -> std::io::Result<()> {
+        std::thread::Builder::new()
+            .name(self.name.into())
+            .spawn(move || {
+                let _span = self.span.enter();
+                set_thread_run(Some(self.run.clone()));
+                let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+                if let Some(finished) = &self.finished {
+                    finished.store(true, Ordering::SeqCst);
+                }
+                if caught.is_err() {
+                    tracing::error!(thread = self.name, "a run's supervision thread panicked");
+                    let _ = self.control.send(Control::SupervisorFault);
+                }
+                set_thread_run(None);
+            })
+            .map(drop)
+    }
+}
+
 fn spawn_writer(
+    guard: Guard,
     mut io: Box<dyn PtyIo>,
     mut queue: mpsc::Receiver<PtyCommand>,
-    span: tracing::Span,
 ) -> std::io::Result<()> {
-    std::thread::Builder::new()
-        .name("pty-writer".into())
-        .spawn(move || {
-            let _span = span.enter();
-            while let Some(command) = queue.blocking_recv() {
-                let result = match command {
-                    PtyCommand::Write(data) => io.write_all(&data),
-                    PtyCommand::Resize(size) => io.resize(size),
-                };
-                if let Err(err) = result {
-                    tracing::debug!(%err, "terminal write failed");
-                }
+    guard.spawn(move || {
+        while let Some(command) = queue.blocking_recv() {
+            let result = match command {
+                PtyCommand::Write(data) => io.write_all(&data),
+                PtyCommand::Resize(size) => io.resize(size),
+            };
+            if let Err(err) = result {
+                tracing::debug!(%err, "terminal write failed");
             }
-            // Dropping `io` closes the PTY master's write side.
-        })
-        .map(|_| ())
+        }
+        // Dropping `io` closes the PTY master's write side.
+    })
 }
 
 fn spawn_reader(
+    guard: Guard,
     mut reader: Box<dyn Read + Send>,
     writer: RunWriter,
     decoder: mpsc::Sender<Vec<u8>>,
-    control: mpsc::UnboundedSender<Control>,
     done: oneshot::Sender<()>,
     cut: Arc<AtomicBool>,
-    span: tracing::Span,
+    meter: Arc<OutputMeter>,
 ) -> std::io::Result<()> {
-    std::thread::Builder::new()
-        .name("pty-reader".into())
-        .spawn(move || {
-            let _span = span.enter();
-            let mut buf = vec![0_u8; READ_CHUNK];
-            let mut first = true;
-            let mut dropped: u64 = 0;
-            let mut warned: Option<Instant> = None;
-            loop {
-                let n = match reader.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => n,
-                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(_) => break,
-                };
-                if cut.load(Ordering::SeqCst) {
-                    break;
-                }
-                let chunk = &buf[..n];
-                writer.write(chunk);
-                if first {
-                    first = false;
-                    let _ = control.send(Control::FirstOutput);
-                }
-                if let Err(mpsc::error::TrySendError::Full(_)) = decoder.try_send(chunk.to_vec()) {
-                    dropped += 1;
-                    if warned.is_none_or(|at| at.elapsed() >= DROP_WARN_EVERY) {
-                        warned = Some(Instant::now());
-                        tracing::warn!(
-                            dropped,
-                            "the decoder fell behind; dropped output copies for it"
-                        );
-                    }
+    let control = guard.control.clone();
+    guard.spawn(move || {
+        let mut buf = vec![0_u8; READ_CHUNK];
+        let mut first = true;
+        let mut dropped: u64 = 0;
+        let mut warned: Option<Instant> = None;
+        loop {
+            let n = match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            };
+            // Counted whether or not the log append succeeds (AC-5).
+            meter.read(n);
+            if cut.load(Ordering::SeqCst) {
+                break;
+            }
+            let chunk = &buf[..n];
+            writer.write(chunk);
+            if first {
+                first = false;
+                let _ = control.send(Control::FirstOutput);
+            }
+            if let Err(mpsc::error::TrySendError::Full(_)) = decoder.try_send(chunk.to_vec()) {
+                dropped += 1;
+                if warned.is_none_or(|at| at.elapsed() >= DROP_WARN_EVERY) {
+                    warned = Some(Instant::now());
+                    tracing::warn!(
+                        dropped,
+                        "the decoder fell behind; dropped output copies for it"
+                    );
                 }
             }
-            let _ = done.send(());
-        })
-        .map(|_| ())
+        }
+        let _ = done.send(());
+    })
 }
 
 fn spawn_waiter(
+    guard: Guard,
     process: Arc<dyn ChildProcess>,
-    control: mpsc::UnboundedSender<Control>,
-    span: tracing::Span,
+    exited: Arc<AtomicBool>,
 ) -> std::io::Result<()> {
-    std::thread::Builder::new()
-        .name("pty-waiter".into())
-        .spawn(move || {
-            let _span = span.enter();
-            let exit = process.wait().unwrap_or_else(|err| {
-                tracing::warn!(%err, "could not wait for the agent");
-                sy_adapter_api::ExitInfo {
-                    code: None,
-                    signal: None,
-                }
-            });
-            let _ = control.send(Control::Exit(exit));
-        })
-        .map(|_| ())
+    let control = guard.control.clone();
+    guard.spawn(move || {
+        let exit = process.wait().unwrap_or_else(|err| {
+            tracing::warn!(%err, "could not wait for the agent");
+            sy_adapter_api::ExitInfo {
+                code: None,
+                signal: None,
+            }
+        });
+        exited.store(true, Ordering::SeqCst);
+        let _ = control.send(Control::Exit(exit));
+    })
 }

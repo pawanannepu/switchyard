@@ -36,6 +36,10 @@ pub enum GroupSignal {
     Hangup,
     /// SIGKILL.
     Kill,
+    /// SIGCONT (the sweep sends it first, so a stopped process acts on SIGTERM).
+    Cont,
+    /// SIGTERM.
+    Term,
 }
 
 /// Writing to the PTY and resizing it. Blocking: used from one thread.
@@ -49,14 +53,95 @@ pub trait PtyIo: Send {
 
 /// The spawned process.
 pub trait ChildProcess: Send + Sync {
-    /// Block until the process exits, then reap it and say how it ended.
-    /// Called once, from its own thread.
+    /// Block until the process exits and say how it ended, without reaping
+    /// it: the unreaped zombie keeps its pid, group id and session id
+    /// reserved until [`ChildProcess::reap`] (spec 0004, AC-8). Called once,
+    /// from its own thread.
     fn wait(&self) -> io::Result<ExitInfo>;
+
+    /// Reap the exited process. Only the first call does anything; group
+    /// signals are refused from then on. Blocking.
+    fn reap(&self);
 
     /// Signal the process group, but only while the main process has not
     /// been reaped (so a reused group id is never hit). Returns whether it
     /// was sent.
     fn signal_group(&self, signal: GroupSignal) -> bool;
+}
+
+/// A signal for one process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcSignal {
+    /// SIGCONT.
+    Cont,
+    /// SIGTERM.
+    Term,
+    /// SIGKILL.
+    Kill,
+}
+
+/// One process, as a scan of the process table sees it (spec 0004).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcInfo {
+    /// Process id.
+    pub pid: i64,
+    /// Parent process id.
+    pub ppid: Option<i64>,
+    /// Session id.
+    pub sid: Option<i64>,
+    /// Start time, Unix ms from whole seconds.
+    pub started_at_ms: i64,
+    /// Owned by the engine's real uid.
+    pub uid_is_self: bool,
+    /// Exited but not reaped.
+    pub zombie: bool,
+    /// The short executable name, never arguments.
+    pub name: String,
+}
+
+/// A single process, checked directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcState {
+    /// Start time, Unix ms from whole seconds.
+    pub started_at_ms: i64,
+    /// Exited but not reaped.
+    pub zombie: bool,
+}
+
+/// What a per pid signal did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalOutcome {
+    /// Sent to the recorded process.
+    Sent,
+    /// The recorded process is gone (or failed the safety check), so nothing was sent.
+    Gone,
+}
+
+/// Why a scan of the process table failed.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("could not scan the process table: {0}")]
+pub struct ProcError(pub String);
+
+/// Process facts and per process signals (spec 0004). Blocking: called from
+/// blocking threads. Never reads command lines or environments.
+pub trait ProcessTable: Send + Sync {
+    /// Every process.
+    fn scan(&self) -> Result<Vec<ProcInfo>, ProcError>;
+
+    /// One process, checked directly. `None` when it is absent.
+    fn started_at(&self, pid: i64) -> Option<ProcState>;
+
+    /// Send `signal` to `pid` only if, checked right before sending, it
+    /// exists, started at `started_at_ms`, belongs to the engine's real uid,
+    /// is greater than 1, and is not the engine itself (AC-9).
+    fn signal(&self, pid: i64, started_at_ms: i64, signal: ProcSignal) -> SignalOutcome;
+
+    /// Signal the process group `pgid` (restart cleanup, only while its
+    /// recorded main process still matches). Returns whether it was sent.
+    fn signal_group(&self, pgid: i64, signal: ProcSignal) -> bool;
+
+    /// The engine's own pid.
+    fn engine_pid(&self) -> i64;
 }
 
 /// A process running in its own PTY session.

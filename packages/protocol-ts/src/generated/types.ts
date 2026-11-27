@@ -258,7 +258,7 @@ export type Event1 =
          */
         at: number;
         /**
-         * Why it ended, on a terminal status (`exited`, `user_stop`, `engine_restart`, ...).
+         * Why it ended, on a terminal status (`exited`, `user_stop`, `engine_restart`, `spawn_failed`, `limit_exceeded`, `supervisor_error`, ...).
          */
         end_reason?: string | null;
         /**
@@ -375,6 +375,27 @@ export type Event1 =
          * An approval's state. Every state but `pending` is final.
          */
         status: "pending" | "approved" | "denied" | "expired" | "cancelled";
+      };
+    }
+  | {
+      kind: "run_limit_exceeded";
+      payload: {
+        /**
+         * Which limit.
+         */
+        limit: "idle" | "time" | "output";
+        /**
+         * What was observed when it was hit.
+         */
+        observed: number;
+        /**
+         * Identifies one run (one agent process and its terminal).
+         */
+        run_id: string;
+        /**
+         * The limit's value (ms for `idle` and `time`, bytes for `output`).
+         */
+        threshold: number;
       };
     };
 /**
@@ -525,7 +546,7 @@ export type EventPayload =
          */
         at: number;
         /**
-         * Why it ended, on a terminal status (`exited`, `user_stop`, `engine_restart`, ...).
+         * Why it ended, on a terminal status (`exited`, `user_stop`, `engine_restart`, `spawn_failed`, `limit_exceeded`, `supervisor_error`, ...).
          */
         end_reason?: string | null;
         /**
@@ -643,6 +664,27 @@ export type EventPayload =
          */
         status: "pending" | "approved" | "denied" | "expired" | "cancelled";
       };
+    }
+  | {
+      kind: "run_limit_exceeded";
+      payload: {
+        /**
+         * Which limit.
+         */
+        limit: "idle" | "time" | "output";
+        /**
+         * What was observed when it was hit.
+         */
+        observed: number;
+        /**
+         * Identifies one run (one agent process and its terminal).
+         */
+        run_id: string;
+        /**
+         * The limit's value (ms for `idle` and `time`, bytes for `output`).
+         */
+        threshold: number;
+      };
     };
 /**
  * How a file changed in a `file_changed` event.
@@ -686,6 +728,13 @@ export type RecoverAction = "restore_backup" | "start_fresh";
  * via the `definition` "RunKind".
  */
 export type RunKind = "agent" | "setup" | "run_script";
+/**
+ * A run limit.
+ *
+ * This interface was referenced by `ProtocolCatalog`'s JSON-Schema
+ * via the `definition` "RunLimit".
+ */
+export type RunLimit = "idle" | "time" | "output";
 /**
  * A run's status.
  *
@@ -862,6 +911,26 @@ export interface AgentListResult {
   agents: AgentInfo[];
 }
 /**
+ * `dev.agent_run` limits: each an integer from 0 to 2^53, `0` meaning off.
+ *
+ * This interface was referenced by `ProtocolCatalog`'s JSON-Schema
+ * via the `definition` "AgentRunLimits".
+ */
+export interface AgentRunLimits {
+  /**
+   * The active time limit, ms.
+   */
+  active_ms?: number | null;
+  /**
+   * The idle limit, ms.
+   */
+  idle_ms?: number | null;
+  /**
+   * The output limit, bytes.
+   */
+  output_bytes?: number | null;
+}
+/**
  * `dev.agent_run` params: fixture rows plus runs of an agent, usually the
  * fake agent (`agent_id: "fake"` with `options: { script: [...] }`).
  *
@@ -881,6 +950,10 @@ export interface AgentRunParams {
    * How many runs to start, one workspace each: 1 to 32, default 1.
    */
   count?: number | null;
+  /**
+   * Run limits for these runs, above every setting. `0` turns one off.
+   */
+  limits?: AgentRunLimits | null;
   /**
    * The workspace's `agent_options`. Default `{}`.
    */
@@ -1643,7 +1716,7 @@ export interface RunStatusChanged {
    */
   at: number;
   /**
-   * Why it ended, on a terminal status (`exited`, `user_stop`, `engine_restart`, ...).
+   * Why it ended, on a terminal status (`exited`, `user_stop`, `engine_restart`, `spawn_failed`, `limit_exceeded`, `supervisor_error`, ...).
    */
   end_reason?: string | null;
   /**

@@ -1037,6 +1037,36 @@ async fn queued_run_process_and_session_ref_should_read_back_then_land() {
 }
 
 #[tokio::test]
+async fn only_the_main_process_row_should_queue_while_degraded() {
+    // covers: spec 0004 AC-1 (the main row joins the queue) and AC-7 (other
+    // run_process writes are best effort)
+    let d = Degradable::new();
+    let (run, _ws) = d.running().await;
+    d.fill_disk(true);
+    let row = |pid, name: &str| sy_core::ports::TrackedProcess {
+        pid,
+        started_at: 1_000,
+        name: name.to_owned(),
+        first_seen_at: 5_000,
+    };
+    d.store
+        .track_processes(&run, &[row(10, "agent")], true)
+        .await
+        .unwrap();
+    let child = d
+        .store
+        .track_processes(&run, &[row(11, "node")], false)
+        .await;
+    let untrack = d.store.untrack_processes(&run, &[(10, 1_000)]).await;
+    d.fill_disk(false);
+    assert!(d.store.retry().await);
+    let landed = d.real.list_tracked_processes().await.unwrap();
+    assert_eq!(child.unwrap_err(), StoreError::Full);
+    assert_eq!(untrack.unwrap_err(), StoreError::Full);
+    assert_eq!(landed, vec![(run, row(10, "agent"))]);
+}
+
+#[tokio::test]
 async fn a_replayed_change_the_store_now_refuses_should_be_dropped_and_the_rest_still_land() {
     // covers: AC-13 (a refused replay would fail forever, so it is dropped, not retried)
     let d = Degradable::new();

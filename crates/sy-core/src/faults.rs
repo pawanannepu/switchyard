@@ -18,7 +18,7 @@ use crate::model::{
 };
 use crate::ports::{
     ApprovalFilter, Committed, EventFilter, EventPage, ListQuery, LogReconcile, Page, RunFilter,
-    RunLog, RunLogError, RunProcess, Store, StoreError, TrimCandidate,
+    RunLog, RunLogError, RunProcess, Store, StoreError, TrackedProcess, TrimCandidate,
 };
 
 /// Whether a fault is on now. Checked on every call.
@@ -282,6 +282,22 @@ impl Store for FaultyStore {
     async fn set_run_process(&self, run: &RunId, process: RunProcess) -> Result<Run, StoreError> {
         self.check()?;
         self.inner.set_run_process(run, process).await
+    }
+    async fn track_processes(
+        &self,
+        run: &RunId,
+        rows: &[TrackedProcess],
+        main: bool,
+    ) -> Result<(), StoreError> {
+        self.check()?;
+        self.inner.track_processes(run, rows, main).await
+    }
+    async fn untrack_processes(&self, run: &RunId, keys: &[(i64, i64)]) -> Result<(), StoreError> {
+        self.check()?;
+        self.inner.untrack_processes(run, keys).await
+    }
+    async fn list_tracked_processes(&self) -> Result<Vec<(RunId, TrackedProcess)>, StoreError> {
+        self.inner.list_tracked_processes().await
     }
     async fn set_agent_session_ref(
         &self,

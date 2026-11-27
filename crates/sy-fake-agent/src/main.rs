@@ -8,7 +8,9 @@
 //! the step's value as JSON on its stdin, and wait for it to exit. An
 //! `approval` step blocks on its reply; if the engine can't answer (the
 //! fallback `{"decision":"ask"}`, or no reply at all) it asks in its own
-//! terminal, `Allow <summary>? [y/n] `, and never goes ahead unasked. Like a real TUI it puts its terminal in raw mode, so Ctrl C arrives
+//! terminal, `Allow <summary>? [y/n] `, and never goes ahead unasked. A
+//! `spawn` step starts `sy-fake-agent --child`, which blocks forever (spec
+//! 0004 drives its leftover sweep with it). Like a real TUI it puts its terminal in raw mode, so Ctrl C arrives
 //! as a byte: it exits with code 130 on Ctrl C unless a `hang` step is
 //! ignoring input. Dev and test only; release bundles never contain it.
 //!
@@ -48,8 +50,23 @@ enum Step {
     DeleteFile(DeleteFile),
     Hang(bool),
     IgnoreSighup(bool),
+    IgnoreSigterm(bool),
+    Spawn(SpawnChild),
+    PanicDecoder(bool),
     DieBySignal(Signal),
     Exit(i32),
+}
+
+/// A `spawn` step (spec 0004): a `--child` that blocks forever.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpawnChild {
+    #[serde(default)]
+    detach: bool,
+    #[serde(default)]
+    ignore_sighup: bool,
+    #[serde(default)]
+    ignore_sigterm: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -437,8 +454,17 @@ fn run_step(input: &Input, hooks: &Hooks, step: &Step) -> Result<Option<i32>, St
             inside_cwd(&d.path)?;
             std::fs::remove_file(&d.path).map_err(|e| format!("delete_file: {e}"))?;
         }
-        Step::Hang(false) | Step::IgnoreSighup(false) => {
-            return Err("hang and ignore_sighup take only true".to_owned());
+        Step::Hang(false)
+        | Step::IgnoreSighup(false)
+        | Step::IgnoreSigterm(false)
+        | Step::PanicDecoder(false) => {
+            return Err(
+                "hang, ignore_sighup, ignore_sigterm and panic_decoder take only true".to_owned(),
+            );
+        }
+        // The engine never answers it; `sy-signal` falls back and we go on.
+        Step::PanicDecoder(true) => {
+            hooks.call("panic", &serde_json::Value::Null)?;
         }
         Step::Hang(true) => {
             input.ignore.store(true, Ordering::SeqCst);
@@ -446,20 +472,66 @@ fn run_step(input: &Input, hooks: &Hooks, step: &Step) -> Result<Option<i32>, St
                 std::thread::park();
             }
         }
-        Step::IgnoreSighup(true) => {
-            signal_hook::flag::register(
-                signal_hook::consts::SIGHUP,
-                Arc::new(AtomicBool::new(false)),
-            )
-            .map_err(|e| format!("ignore_sighup: {e}"))?;
-        }
+        Step::IgnoreSighup(true) => ignore(signal_hook::consts::SIGHUP)?,
+        Step::IgnoreSigterm(true) => ignore(signal_hook::consts::SIGTERM)?,
+        Step::Spawn(child) => spawn_child(child)?,
         Step::DieBySignal(signal) => die_by(*signal)?,
         Step::Exit(code) => return Ok(Some(*code)),
     }
     Ok(None)
 }
 
+/// The signal no longer ends this process (a handler that only sets a flag).
+fn ignore(signal: i32) -> Result<(), String> {
+    signal_hook::flag::register(signal, Arc::new(AtomicBool::new(false)))
+        .map(drop)
+        .map_err(|e| format!("ignoring signal {signal}: {e}"))
+}
+
+/// Start `sy-fake-agent --child [flags]` and go on at once. Its stdio is
+/// null, so it never holds the terminal; it is still in the agent's
+/// session, and, unless `detach`, in its process group.
+fn spawn_child(child: &SpawnChild) -> Result<(), String> {
+    use std::os::unix::process::CommandExt;
+    let exe = std::env::current_exe().map_err(|e| format!("spawn: {e}"))?;
+    let mut cmd = Command::new(exe);
+    cmd.arg("--child")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if child.ignore_sighup {
+        cmd.arg("--ignore-sighup");
+    }
+    if child.ignore_sigterm {
+        cmd.arg("--ignore-sigterm");
+    }
+    if child.detach {
+        cmd.process_group(0);
+    }
+    // Never waited on: it outlives this process on purpose.
+    cmd.spawn().map(drop).map_err(|e| format!("spawn: {e}"))
+}
+
+/// `--child [--ignore-sighup] [--ignore-sigterm]`: block forever.
+fn run_child(flags: impl Iterator<Item = String>) -> Result<i32, String> {
+    for flag in flags {
+        match flag.as_str() {
+            "--ignore-sighup" => ignore(signal_hook::consts::SIGHUP)?,
+            "--ignore-sigterm" => ignore(signal_hook::consts::SIGTERM)?,
+            other => return Err(format!("unknown child argument {other}")),
+        }
+    }
+    loop {
+        std::thread::park();
+    }
+}
+
 fn run() -> Result<i32, String> {
+    let mut argv = std::env::args().skip(1).peekable();
+    if argv.peek().is_some_and(|a| a == "--child") {
+        argv.next();
+        return run_child(argv);
+    }
     let args = parse_args()?;
     let text = std::fs::read(&args.script).map_err(|e| format!("reading the script: {e}"))?;
     let steps: Vec<Step> =

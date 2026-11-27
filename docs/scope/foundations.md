@@ -45,10 +45,20 @@ spec [0003](../specs/0003-agent-adapter-contract-fake-agent/index.md) · code in
 - [x] Review it (fresh model): `/check review agent adapter contract & fake agent`
 - [x] Document it: `/document agent adapter contract & fake agent`
 
-### 5. Agent process supervisor · needs a decision
+### 5. Agent process supervisor · in-progress
 Runs each agent in its own process with its own terminal, outside the UI, and keeps a crashed, hung or runaway agent from affecting anything else.
 **Done when:** each agent runs in its own process with a terminal; a crash, hang or runaway (time or output limits) is detected and that agent is stopped cleanly; the app and other agents keep running; tests prove it with the fake agent.
-- [ ] Design it (spec): `/architect agent process supervisor`
+spec [0004](../specs/0004-agent-process-supervisor/index.md) · code in `crates/sy-core/src/agents/`, `crates/sy-infra/`, `crates/sy-daemon/`, `crates/sy-fake-agent/`, `crates/sy-adapters/fake/`
+- [x] Design it (spec): `/architect agent process supervisor`
+- [x] Build it: `/develop agent process supervisor`
+  - [x] The limit thread end to end: settings, output, idle and active clocks, `run_limit_exceeded`, the limit stop (AC-2, AC-3, AC-4, AC-5, AC-6)
+  - [x] Process facts and cleanup: `sysinfo` port, migration 3, `pid_started_at`, held zombie, monitor and sweep, the 2 s scanner and tracking (AC-1, AC-7, AC-8, AC-9, AC-14)
+  - [x] Restart cleanup after an engine crash (AC-10)
+  - [x] Fault isolation, shutdown and logging: `panic = "unwind"`, per run monitor, `supervisor_error`, the 13 s shutdown, the fd limit (AC-11, AC-12, AC-13, AC-15)
+- [x] Verify it: `/check verify agent process supervisor`
+- [x] Test it: `/test agent process supervisor`
+- [x] Review it (fresh model): `/check review agent process supervisor`
+- [x] Document it: `/document agent process supervisor`
 
 ### 6. Logging & diagnostics · needs a decision
 One logging convention for the whole app, with secrets redacted, and a diagnostics bundle you can export and share by hand.

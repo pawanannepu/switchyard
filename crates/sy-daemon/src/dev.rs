@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use serde_json::json;
 use sy_adapter_api::PtySize;
+use sy_core::agents::supervise::{LimitOverride, MAX_LIMIT};
 use sy_core::agents::{StartError, StartRun, StoreWrites};
 use sy_core::ids::WorkspaceId;
 use sy_core::model::{Actor, InitialWorkspaceState, NewProject, NewTask, NewWorkspace, Project};
@@ -90,6 +91,27 @@ fn internal(message: impl std::fmt::Display) -> RpcError {
     RpcError::new(ErrorCode::InternalError, message.to_string())
 }
 
+/// `dev.agent_run.limits` as the highest limit source (spec 0004, AC-2 and
+/// AC-14). Non integers were already refused by the params' types.
+fn limit_override(l: sy_protocol::AgentRunLimits) -> Result<LimitOverride, RpcError> {
+    for value in [l.idle_ms, l.active_ms, l.output_bytes]
+        .into_iter()
+        .flatten()
+    {
+        if value > MAX_LIMIT {
+            return Err(RpcError::new(
+                ErrorCode::InvalidParams,
+                "limits must be integers from 0 to 2^53",
+            ));
+        }
+    }
+    Ok(LimitOverride {
+        idle_ms: l.idle_ms,
+        active_ms: l.active_ms,
+        output_bytes: l.output_bytes,
+    })
+}
+
 pub async fn agent_run(
     engine: &Arc<Engine>,
     p: AgentRunParams,
@@ -114,6 +136,7 @@ pub async fn agent_run(
             format!("{} can't launch runs yet", adapter.display_name()),
         ));
     }
+    let limits = limit_override(p.limits.unwrap_or_default())?;
     let options = p.options.unwrap_or_else(|| json!({})).to_string();
     let size = PtySize {
         cols: p.cols.unwrap_or(DEFAULT_SIZE.cols),
@@ -155,6 +178,7 @@ pub async fn agent_run(
                     workspace: workspace.clone(),
                     prompt: p.prompt.clone().unwrap_or_default(),
                     size,
+                    limits,
                 },
             )
             .await

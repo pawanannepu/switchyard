@@ -201,9 +201,23 @@ pub struct RunProcess {
     pub pid: i64,
     /// Process group id.
     pub pgid: i64,
-    /// The process start time, to tell a live orphan from a reused pid.
-    /// `None` until feature 5 records it.
+    /// The process start time (Unix ms from whole seconds), to tell a live
+    /// orphan from a reused pid. `None` when it could not be read.
     pub pid_started_at: Option<i64>,
+}
+
+/// One process a run started, as `run_process` holds it (spec 0004). The
+/// pair (`pid`, `started_at`) names one process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackedProcess {
+    /// Process id.
+    pub pid: i64,
+    /// Its start time, Unix ms from whole seconds.
+    pub started_at: i64,
+    /// The short executable name from its first sighting, never arguments.
+    pub name: String,
+    /// When the engine first recorded it (the engine clock, ms).
+    pub first_seen_at: i64,
 }
 
 /// The relational state and the event journal.
@@ -416,6 +430,24 @@ pub trait Store: Send + Sync {
 
     /// Record the process a run launched. Writes no event.
     async fn set_run_process(&self, run: &RunId, process: RunProcess) -> Result<Run, StoreError>;
+
+    /// Record processes a run started (`INSERT OR IGNORE`). Writes no
+    /// event. With `main` (the run's own process, spec 0004 AC-1) the write
+    /// joins the degraded write queue; any other is best effort and fails
+    /// while storage is degraded.
+    async fn track_processes(
+        &self,
+        run: &RunId,
+        rows: &[TrackedProcess],
+        main: bool,
+    ) -> Result<(), StoreError>;
+
+    /// Delete tracked processes by their exact (`pid`, `started_at`). Writes
+    /// no event; best effort while degraded.
+    async fn untrack_processes(&self, run: &RunId, keys: &[(i64, i64)]) -> Result<(), StoreError>;
+
+    /// Every tracked process of every run, for the restart snapshot.
+    async fn list_tracked_processes(&self) -> Result<Vec<(RunId, TrackedProcess)>, StoreError>;
 
     /// Record the agent's own session handle, for resume. Writes no event.
     async fn set_agent_session_ref(

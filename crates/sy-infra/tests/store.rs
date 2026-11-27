@@ -24,7 +24,7 @@ use sy_core::model::{
 };
 use sy_core::ports::{
     ApprovalFilter, Clock, EventFilter, Keyset, ListQuery, RunFilter, RunLog, RunLogError,
-    RunProcess, Store, StoreError,
+    RunProcess, Store, StoreError, TrackedProcess,
 };
 use sy_core::recovery::{Recovered, recover_at_startup};
 use sy_core::retention::{
@@ -227,6 +227,7 @@ async fn spine_tables_should_exist_and_be_strict() {
             "project",
             "project_setting",
             "run",
+            "run_process",
             "setting",
             "task",
             "workspace"
@@ -1337,6 +1338,10 @@ async fn delete_project_should_cascade_everything_and_allow_its_unarchived_tasks
     let task_ok = f.store.delete_task(&t).await.unwrap();
     let (_, w2) = f.task(&p, vec![ws("b", "/w/b")]).await.unwrap();
     let run2 = ended_run(&f, &log, &w2[0].id, 8).await;
+    f.store
+        .track_processes(&run2, &[tracked(9, 1000, "left")], false)
+        .await
+        .unwrap();
     let removed = retention::delete_project(&f.store, log.clone(), &p)
         .await
         .unwrap();
@@ -1345,7 +1350,7 @@ async fn delete_project_should_cascade_everything_and_allow_its_unarchived_tasks
     assert_eq!(not_yet.unwrap_err(), StoreError::NotArchived);
     assert_eq!(task_ok, vec![run]);
     assert_eq!(removed, vec![run2.clone()]);
-    for table in ["project_setting", "task", "workspace", "run"] {
+    for table in ["project_setting", "task", "workspace", "run", "run_process"] {
         assert_eq!(rows(&raw, table), 0, "{table}");
     }
     let left: i64 = raw
@@ -2258,4 +2263,54 @@ async fn deleting_a_task_should_take_its_runs_approvals_with_it() {
     f.store.archive_task(Actor::User, &t).await.unwrap();
     f.store.delete_task(&t).await.unwrap();
     assert_eq!(rows(&f.raw(), "approval"), 0);
+}
+
+// ---- run_process (spec 0004) ----
+
+fn tracked(pid: i64, started_at: i64, name: &str) -> TrackedProcess {
+    TrackedProcess {
+        pid,
+        started_at,
+        name: name.to_owned(),
+        first_seen_at: 77,
+    }
+}
+
+#[tokio::test]
+async fn tracked_processes_should_insert_once_delete_by_exact_key_and_write_no_event() {
+    let f = Fixture::new();
+    let (_, _, run) = live_run(&f, "a").await;
+    let (_, _, other) = live_run(&f, "b").await;
+    let before = event_count(&f.raw());
+    f.store
+        .track_processes(&run, &[tracked(10, 1000, "agent")], true)
+        .await
+        .unwrap();
+    // The same (pid, start) again keeps the first name.
+    f.store
+        .track_processes(
+            &run,
+            &[tracked(10, 1000, "renamed"), tracked(11, 2000, "node")],
+            false,
+        )
+        .await
+        .unwrap();
+    f.store
+        .track_processes(&other, &[tracked(10, 3000, "reused")], false)
+        .await
+        .unwrap();
+    // A different start time is a different process: not deleted.
+    f.store
+        .untrack_processes(&run, &[(11, 2000), (10, 9999)])
+        .await
+        .unwrap();
+    let mut all = f.store.list_tracked_processes().await.unwrap();
+    all.sort_by(|a, b| (a.0.as_str(), a.1.pid).cmp(&(b.0.as_str(), b.1.pid)));
+    let mut want = vec![
+        (run.clone(), tracked(10, 1000, "agent")),
+        (other.clone(), tracked(10, 3000, "reused")),
+    ];
+    want.sort_by(|a, b| (a.0.as_str(), a.1.pid).cmp(&(b.0.as_str(), b.1.pid)));
+    assert_eq!(all, want);
+    assert_eq!(event_count(&f.raw()), before);
 }

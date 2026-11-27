@@ -4,9 +4,12 @@
 //! PTY as its controlling terminal (so `pgid = pid`). It reports a death by
 //! signal only as a name, so the engine waits for the child itself: a
 //! `waitid` with `WNOWAIT` sees the exit (and the real signal number) while
-//! the child is still a zombie, then, under the same lock group signals take,
-//! the child is reaped. A group signal is therefore never sent after the
-//! reap, so a reused process group id is never hit.
+//! the child is still a zombie. The zombie is held until the run's leftover
+//! sweep ends (spec 0004, AC-8), which keeps its group and session id
+//! reserved; then `reap` reaps it under the same lock group signals take. A
+//! group signal is therefore never sent after the reap, so a reused process
+//! group id is never hit. A process dropped without `reap` has its group
+//! killed and is reaped in `Drop`, so the engine never gathers zombies.
 
 use std::io::Write;
 use std::path::Path;
@@ -14,6 +17,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use portable_pty::{CommandBuilder, MasterPty, PtySize as PortableSize, native_pty_system};
 use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, WaitOptions};
+use std::sync::Arc;
 use sy_adapter_api::{ExitInfo, PtySize};
 use sy_core::agents::ports::{
     ChildProcess, GroupSignal, Pty, PtyChild, PtyError, PtyIo, SpawnRequest,
@@ -63,7 +67,7 @@ impl Pty for PortablePty {
             .and_then(|p| i32::try_from(p).ok())
             .ok_or_else(|| PtyError("the child has no process id".into()))?;
         let pid = Pid::from_raw(raw).ok_or_else(|| PtyError("bad process id".into()))?;
-        let process = std::sync::Arc::new(UnixProcess {
+        let process = Arc::new(UnixProcess {
             pid,
             reaped: Mutex::new(false),
             _child: Mutex::new(child),
@@ -121,6 +125,44 @@ struct UnixProcess {
     _child: Mutex<Box<dyn portable_pty::Child + Send + Sync>>,
 }
 
+impl UnixProcess {
+    /// Reap under the lock already held. A process that has not exited yet
+    /// (it never answered SIGKILL) is left to a short lived reaper thread,
+    /// and counts as reaped from now on, so no group signal can follow.
+    fn reap_locked(&self, reaped: &mut bool) {
+        if *reaped {
+            return;
+        }
+        *reaped = true;
+        match rustix::process::waitpid(Some(self.pid), WaitOptions::NOHANG) {
+            Ok(Some(_)) | Err(_) => {}
+            Ok(None) => {
+                let pid = self.pid;
+                let spawned =
+                    std::thread::Builder::new()
+                        .name("pty-reaper".into())
+                        .spawn(move || {
+                            let _ = rustix::process::waitpid(Some(pid), WaitOptions::empty());
+                        });
+                if spawned.is_err() {
+                    tracing::warn!("could not start a reaper thread; one zombie may stay");
+                }
+            }
+        }
+    }
+}
+
+impl Drop for UnixProcess {
+    fn drop(&mut self) {
+        let mut reaped = lock(&self.reaped);
+        if !*reaped {
+            let _ = rustix::process::kill_process_group(self.pid, Signal::KILL);
+            // A `WNOHANG` reap, with the reaper thread for one not dead yet.
+            self.reap_locked(&mut reaped);
+        }
+    }
+}
+
 impl ChildProcess for UnixProcess {
     fn wait(&self) -> std::io::Result<ExitInfo> {
         let status = loop {
@@ -133,14 +175,15 @@ impl ChildProcess for UnixProcess {
                 Err(err) => return Err(err.into()),
             }
         };
-        let info = ExitInfo {
+        Ok(ExitInfo {
             code: status.exit_status(),
             signal: status.terminating_signal(),
-        };
+        })
+    }
+
+    fn reap(&self) {
         let mut reaped = lock(&self.reaped);
-        let _ = rustix::process::waitpid(Some(self.pid), WaitOptions::empty());
-        *reaped = true;
-        Ok(info)
+        self.reap_locked(&mut reaped);
     }
 
     fn signal_group(&self, signal: GroupSignal) -> bool {
@@ -151,6 +194,8 @@ impl ChildProcess for UnixProcess {
         let signal = match signal {
             GroupSignal::Hangup => Signal::HUP,
             GroupSignal::Kill => Signal::KILL,
+            GroupSignal::Cont => Signal::CONT,
+            GroupSignal::Term => Signal::TERM,
         };
         rustix::process::kill_process_group(self.pid, signal).is_ok()
     }

@@ -167,6 +167,39 @@
       ],
       "type": "object"
     },
+    "AgentRunLimits": {
+      "description": "`dev.agent_run` limits: each an integer from 0 to 2^53, `0` meaning off.",
+      "properties": {
+        "active_ms": {
+          "description": "The active time limit, ms.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "idle_ms": {
+          "description": "The idle limit, ms.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "output_bytes": {
+          "description": "The output limit, bytes.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "AgentRunParams": {
       "description": "`dev.agent_run` params: fixture rows plus runs of an agent, usually the\nfake agent (`agent_id: \"fake\"` with `options: { script: [...] }`).",
       "properties": {
@@ -192,6 +225,17 @@
             "integer",
             "null"
           ]
+        },
+        "limits": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentRunLimits"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Run limits for these runs, above every setting. `0` turns one off."
         },
         "options": {
           "description": "The workspace's `agent_options`. Default `{}`."
@@ -1024,7 +1068,7 @@
                   "type": "integer"
                 },
                 "end_reason": {
-                  "description": "Why it ended, on a terminal status (`exited`, `user_stop`, `engine_restart`, ...).",
+                  "description": "Why it ended, on a terminal status (`exited`, `user_stop`, `engine_restart`, `spawn_failed`, `limit_exceeded`, `supervisor_error`, ...).",
                   "type": [
                     "string",
                     "null"
@@ -1287,6 +1331,51 @@
               "required": [
                 "approval_id",
                 "status"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "kind",
+            "payload"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A run reached a limit and is being stopped; it ends `failed` with `limit_exceeded`.",
+          "properties": {
+            "kind": {
+              "const": "run_limit_exceeded",
+              "type": "string"
+            },
+            "payload": {
+              "properties": {
+                "limit": {
+                  "$ref": "#/$defs/RunLimit",
+                  "description": "Which limit."
+                },
+                "observed": {
+                  "description": "What was observed when it was hit.",
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "run_id": {
+                  "$ref": "#/$defs/RunId",
+                  "description": "The run."
+                },
+                "threshold": {
+                  "description": "The limit's value (ms for `idle` and `time`, bytes for `output`).",
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "run_id",
+                "limit",
+                "threshold",
+                "observed"
               ],
               "type": "object"
             }
@@ -1710,7 +1799,7 @@
                   "type": "integer"
                 },
                 "end_reason": {
-                  "description": "Why it ended, on a terminal status (`exited`, `user_stop`, `engine_restart`, ...).",
+                  "description": "Why it ended, on a terminal status (`exited`, `user_stop`, `engine_restart`, `spawn_failed`, `limit_exceeded`, `supervisor_error`, ...).",
                   "type": [
                     "string",
                     "null"
@@ -1973,6 +2062,51 @@
               "required": [
                 "approval_id",
                 "status"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "kind",
+            "payload"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A run reached a limit and is being stopped; it ends `failed` with `limit_exceeded`.",
+          "properties": {
+            "kind": {
+              "const": "run_limit_exceeded",
+              "type": "string"
+            },
+            "payload": {
+              "properties": {
+                "limit": {
+                  "$ref": "#/$defs/RunLimit",
+                  "description": "Which limit."
+                },
+                "observed": {
+                  "description": "What was observed when it was hit.",
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "run_id": {
+                  "$ref": "#/$defs/RunId",
+                  "description": "The run."
+                },
+                "threshold": {
+                  "description": "The limit's value (ms for `idle` and `time`, bytes for `output`).",
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "run_id",
+                "limit",
+                "threshold",
+                "observed"
               ],
               "type": "object"
             }
@@ -2413,6 +2547,26 @@
         }
       ]
     },
+    "RunLimit": {
+      "description": "A run limit.",
+      "oneOf": [
+        {
+          "const": "idle",
+          "description": "No output and no hook call for too long while `starting` or `running`.",
+          "type": "string"
+        },
+        {
+          "const": "time",
+          "description": "Too much active time (`waiting_input` does not count).",
+          "type": "string"
+        },
+        {
+          "const": "output",
+          "description": "Too many terminal output bytes.",
+          "type": "string"
+        }
+      ]
+    },
     "RunLogReadParams": {
       "description": "`run.log_read` params: a page of a run's saved output.",
       "properties": {
@@ -2595,7 +2749,7 @@
           "type": "integer"
         },
         "end_reason": {
-          "description": "Why it ended, on a terminal status (`exited`, `user_stop`, `engine_restart`, ...).",
+          "description": "Why it ended, on a terminal status (`exited`, `user_stop`, `engine_restart`, `spawn_failed`, `limit_exceeded`, `supervisor_error`, ...).",
           "type": [
             "string",
             "null"

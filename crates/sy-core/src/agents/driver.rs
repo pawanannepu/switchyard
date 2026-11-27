@@ -21,8 +21,10 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, MissedTickBehavior};
 
 use super::approvals::{ApprovalNotice, RespondError, new_approval};
+use super::fault::RunKit;
 use super::limit::RateLimit;
 use super::ports::{ChildProcess, GroupSignal};
+use super::supervise::{LimitClocks, LimitHit, Limits, OutputMeter};
 use super::{AgentRuns, HookError, MAX_STOP_GRACE, RunWrites};
 use crate::ids::{ApprovalId, RunId};
 use crate::model::{
@@ -43,7 +45,7 @@ type HookAnswer = oneshot::Sender<Result<HookReply, HookError>>;
 pub(super) enum Control {
     /// The PTY produced its first byte.
     FirstOutput,
-    /// The process exited (and was reaped).
+    /// The process exited (observed, not reaped: the sweep reaps it).
     Exit(ExitInfo),
     /// A hook call through `sy-signal`. A dropped `reply` reads as a revoked token.
     Hook {
@@ -63,9 +65,32 @@ pub(super) enum Control {
     },
     /// `run.stop`, or engine shutdown (whose graceful step is capped).
     Stop {
-        shutdown: bool,
+        cause: StopCause,
         ack: oneshot::Sender<()>,
     },
+    /// A PTY thread panicked (spec 0004, AC-11): end the run as
+    /// `supervisor_error`.
+    SupervisorFault,
+}
+
+/// Why a run is being stopped. The first cause wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StopCause {
+    /// `run.stop`.
+    User,
+    /// Engine shutdown.
+    Shutdown,
+    /// A run limit (spec 0004, AC-6).
+    Limit(LimitHit),
+}
+
+impl StopCause {
+    const fn actor(self) -> Actor {
+        match self {
+            Self::User => Actor::User,
+            Self::Shutdown | Self::Limit(_) => Actor::Engine,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,11 +143,17 @@ pub(super) struct Driver {
     /// The decoder's last status report.
     reported: Option<LiveStatus>,
     first_output: bool,
-    /// A stop was seen before the exit, so the run ends `stopped`.
-    stop_requested: bool,
-    /// Who stopped it: you, or the engine shutting down.
-    stop_actor: Actor,
+    /// A stop seen before the exit, and why: it decides the run's end.
+    stop_cause: Option<StopCause>,
     stopping: Option<Stopping>,
+    /// The run's limits, fixed at its start (spec 0004, AC-2).
+    limits: Limits,
+    /// The idle and active clocks and the output count.
+    clocks: LimitClocks,
+    /// The reader's byte count and last read.
+    meter: Arc<OutputMeter>,
+    /// What the fault end needs.
+    kit: Arc<RunKit>,
     /// Hook calls answered at once (AC-7).
     limit: RateLimit,
     /// Hook calls refused by the rate limit.
@@ -150,6 +181,10 @@ impl Driver {
         cut: Arc<AtomicBool>,
         input: mpsc::UnboundedSender<Vec<u8>>,
         initial_input: Option<Vec<u8>>,
+        limits: Limits,
+        meter: Arc<OutputMeter>,
+        spawned: std::time::Instant,
+        kit: Arc<RunKit>,
     ) -> Self {
         Self {
             runs,
@@ -168,9 +203,12 @@ impl Driver {
             status: RunStatus::Starting,
             reported: None,
             first_output: false,
-            stop_requested: false,
-            stop_actor: Actor::User,
+            stop_cause: None,
             stopping: None,
+            limits,
+            clocks: LimitClocks::new(spawned),
+            meter,
+            kit,
             limit: RateLimit::new(),
             limited: 0,
             limit_warned_at: None,
@@ -186,7 +224,7 @@ impl Driver {
     pub(super) async fn run(mut self) {
         let mut tick = tokio::time::interval(self.runs.timings.tick);
         tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        let exit = loop {
+        let exit = 'run: loop {
             let deadline = self.stopping.as_ref().map(|s| s.deadline);
             let stop_timer = async move {
                 match deadline {
@@ -197,16 +235,33 @@ impl Driver {
             tokio::select! {
                 biased;
                 message = self.control.recv() => match message {
-                    Some(Control::Exit(info)) => break Some(info),
+                    Some(Control::Exit(info)) => break 'run Some(info),
+                    Some(Control::SupervisorFault) => {
+                        // No reply to any held hook: dropping them makes `sy-signal` fall back.
+                        self.pending.clear();
+                        let (runs, store, run, kit) = (
+                            Arc::clone(&self.runs),
+                            Arc::clone(&self.store),
+                            self.run.clone(),
+                            Arc::clone(&self.kit),
+                        );
+                        drop(self);
+                        runs.fault_end(store.as_ref(), &run, &kit).await;
+                        return;
+                    }
                     Some(Control::FirstOutput) => {
                         self.first_output = true;
                         self.update_status().await;
                     }
-                    Some(Control::Stop { shutdown, ack }) => {
-                        self.begin_stop(shutdown).await;
+                    Some(Control::Stop { cause, ack }) => {
+                        self.begin_stop(cause).await;
                         let _ = ack.send(());
                     }
-                    Some(Control::Hook { id, call, reply }) => self.on_hook(id, &call, reply).await,
+                    Some(Control::Hook { id, call, reply }) => {
+                        // Any hook call that reaches the driver is activity (AC-3).
+                        self.clocks.activity(std::time::Instant::now());
+                        self.on_hook(id, &call, reply).await;
+                    }
                     Some(Control::HookClosed { call }) => self.hook_closed(call).await,
                     Some(Control::Decide { approval, approve, message, answer }) => {
                         let result = self.respond(&approval, approve, message).await;
@@ -226,6 +281,7 @@ impl Driver {
                 _ = tick.tick() => {
                     let reports = self.decoder.on_tick(self.now_ms());
                     self.apply(reports).await;
+                    self.check_limits().await;
                 }
             }
         };
@@ -533,7 +589,13 @@ impl Driver {
             .transition_run(Actor::Engine, &self.run, RunTransition::to(want))
             .await
         {
-            Ok(run) => self.status = run.status,
+            Ok(run) => {
+                // Leaving `waiting_input` is activity (AC-3).
+                if self.status == RunStatus::WaitingInput && run.status != RunStatus::WaitingInput {
+                    self.clocks.activity(std::time::Instant::now());
+                }
+                self.status = run.status;
+            }
             Err(StoreError::InvalidTransition(err)) => {
                 tracing::debug!(%err, "status report refused by the state machine");
             }
@@ -557,10 +619,51 @@ impl Driver {
 
     // ---- stop and end ----
 
-    /// `run.stop` (AC-12): every held hook is denied with "run stopped" and
-    /// its approval cancelled, then the decoder's stop input is typed and
-    /// the grace starts.
-    async fn begin_stop(&mut self, shutdown: bool) {
+    /// The limit check on a tick (spec 0004, AC-6): only while the run is
+    /// live and not already stopping. A hit journals `run_limit_exceeded`,
+    /// then starts the stop sequence.
+    async fn check_limits(&mut self) {
+        if self.stopping.is_some() || self.ending || self.status.is_terminal() {
+            return;
+        }
+        let counting = matches!(self.status, RunStatus::Starting | RunStatus::Running);
+        if let Some(at) = self.meter.last_read() {
+            self.clocks.activity(at);
+        }
+        self.clocks
+            .tick(std::time::Instant::now(), counting, self.meter.bytes());
+        let Some(hit) = self.clocks.check(&self.limits) else {
+            return;
+        };
+        tracing::info!(
+            limit = hit.kind.as_str(),
+            threshold = hit.threshold,
+            observed = hit.observed,
+            "run limit reached; stopping the run"
+        );
+        let event = AdapterEvent::RunLimitExceeded {
+            run_id: self.run.clone(),
+            limit: hit.kind,
+            threshold: hit.threshold,
+            observed: hit.observed,
+        };
+        if let Err(err) = self
+            .store
+            .append_event(Actor::Engine, None, &self.run, event)
+            .await
+        {
+            tracing::warn!(%err, "could not journal the run limit");
+        }
+        self.begin_stop(StopCause::Limit(hit)).await;
+    }
+
+    /// A stop (AC-12, and spec 0004 AC-6 for a limit): every held hook is
+    /// denied with "run stopped" (or "run stopped: <limit> limit") and its
+    /// approval cancelled, then the decoder's stop input is typed and the
+    /// grace starts. A stop while already stopping changes nothing, except
+    /// that shutdown shortens a long grace.
+    async fn begin_stop(&mut self, cause: StopCause) {
+        let shutdown = cause == StopCause::Shutdown;
         let cap = self.runs.timings.shutdown_grace;
         if let Some(stopping) = &mut self.stopping {
             // Already stopping. Shutdown only shortens a long grace.
@@ -569,9 +672,12 @@ impl Driver {
             }
             return;
         }
-        self.stop_requested = true;
-        self.stop_actor = if shutdown { Actor::Engine } else { Actor::User };
-        self.deny_held(self.stop_actor, Some(STOP_MESSAGE)).await;
+        self.stop_cause = Some(cause);
+        let message = match cause {
+            StopCause::Limit(hit) => format!("{STOP_MESSAGE}: {} limit", hit.kind.as_str()),
+            StopCause::User | StopCause::Shutdown => STOP_MESSAGE.to_owned(),
+        };
+        self.deny_held(cause.actor(), Some(&message)).await;
         self.update_status().await;
         let plan = self.decoder.stop();
         let mut grace = std::time::Duration::from_millis(plan.grace_ms.into()).min(MAX_STOP_GRACE);
@@ -667,7 +773,7 @@ impl Driver {
                 Control::Decide { answer, .. } => {
                     let _ = answer.send(Err(RespondError::NotPending));
                 }
-                Control::HookClosed { .. } | Control::Exit(_) => {}
+                Control::HookClosed { .. } | Control::Exit(_) | Control::SupervisorFault => {}
             }
         }
         while let Ok(chunk) = self.output.try_recv() {
@@ -685,14 +791,20 @@ impl Driver {
         let log_bytes = self.runs.remove_from_hub(&self.run).await;
 
         // (6) The terminal transition, whose commit sends `run.status`.
-        let (status, reason, actor) = if self.stop_requested {
-            (RunStatus::Stopped, EndReason::UserStop, self.stop_actor)
-        } else {
-            let status = match outcome {
-                ExitOutcome::Finished => RunStatus::Finished,
-                ExitOutcome::Failed => RunStatus::Failed,
-            };
-            (status, EndReason::Exited, Actor::Engine)
+        let (status, reason, actor) = match self.stop_cause {
+            Some(cause @ (StopCause::User | StopCause::Shutdown)) => {
+                (RunStatus::Stopped, EndReason::UserStop, cause.actor())
+            }
+            Some(StopCause::Limit(_)) => {
+                (RunStatus::Failed, EndReason::LimitExceeded, Actor::Engine)
+            }
+            None => {
+                let status = match outcome {
+                    ExitOutcome::Finished => RunStatus::Finished,
+                    ExitOutcome::Failed => RunStatus::Failed,
+                };
+                (status, EndReason::Exited, Actor::Engine)
+            }
         };
         tracing::info!(
             code = exit.code,
@@ -711,9 +823,11 @@ impl Driver {
         if let Err(err) = self.store.transition_run(actor, &self.run, end).await {
             tracing::warn!(%err, "could not record the run's end");
         }
-        // (7) The launch dir goes, whatever step 6's outcome.
+        // The terminal transition: the scanner stops writing for this run.
+        self.runs.ended(&self.run);
+        // (7) The launch dir goes, whatever step 6's outcome. The monitor
+        // then sweeps the run's leftovers and reaps the main process.
         self.runs.remove_launch_dir(&self.run).await;
-        self.runs.finish(&self.run);
     }
 }
 

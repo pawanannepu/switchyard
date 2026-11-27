@@ -19,7 +19,7 @@ _These are recommendations to keep your build orderly, not requirements. Skip an
 | 2 | Coding standards & tooling | Foundation | done |
 | 3 | Data model | Foundation | in-progress |
 | 4 | Agent adapter contract & fake agent | Foundation | in-progress |
-| 5 | Agent process supervisor | Foundation | planned |
+| 5 | Agent process supervisor | Foundation | in-progress |
 | 6 | Logging & diagnostics | Foundation | planned |
 | 7 | Design system & UI foundation | Foundation | planned |
 | 8 | Core task loop | Slice 1 | planned |
@@ -53,7 +53,7 @@ _These are recommendations to keep your build orderly, not requirements. Skip an
 
 ## Epics
 
-- [Foundations](foundations.md): 1 to 7 · 2 done, 2 in progress, 3 planned
+- [Foundations](foundations.md): 1 to 7 · 2 done, 3 in progress, 2 planned
 - [Workspaces](workspaces.md): running tasks, environments, recovery, history, prompts (8, 9, 10, 13, 14, 23, 30, 31) · 8 planned
 - [Control](control.md): sandbox, approvals, limits, cost (11, 12, 26, 27) · 4 planned
 - [Agents](agents.md): adapters, onboarding, extensions (15 to 19, 32, 33) · 7 planned, 1 deferred
@@ -77,6 +77,7 @@ Out of scope for the current build pass, kept so the plan stays honest.
 - **Remote & mobile control**: check on and steer agents on your machine from another device · needs a decision ([platform](platform.md))
 - **pk & Cursor agent first class adapters**: both run through the generic adapter until then · needs a decision ([agents](agents.md))
 - **UI translations**: languages beyond English, using the string catalog from feature 7 ([platform](platform.md))
+- **Agent memory and CPU limits**: sample each agent's process tree and stop one over a memory cap, from spec 0004 · needs a decision ([foundations](foundations.md))
 
 ## References
 

@@ -13,10 +13,13 @@ use std::time::Duration;
 
 use sy_adapter_api::{ExitInfo, PtySize};
 use sy_core::agents::ports::{
-    GroupSignal, LoginEnv, Pty, PtyChild, RuntimeDir, SpawnRequest, TokenSource,
+    GroupSignal, LoginEnv, ProcSignal, ProcessTable, Pty, PtyChild, RuntimeDir, SignalOutcome,
+    SpawnRequest, TokenSource,
 };
 use sy_core::ids::RunId;
-use sy_infra::agents::{FsRuntimeDir, InheritedEnv, PortablePty, RandomTokens, resolve_on_path};
+use sy_infra::agents::{
+    FsRuntimeDir, InheritedEnv, PortablePty, RandomTokens, SysProcessTable, resolve_on_path,
+};
 
 fn spawn(program: &str, args: &[&str], env: &[(&str, &str)]) -> PtyChild {
     PortablePty
@@ -91,6 +94,7 @@ fn a_child_should_lead_its_own_process_group_and_group_signals_should_stop_after
     let pgid = rustix::process::getpgid(Some(pid)).unwrap();
     let sent = child.process.signal_group(GroupSignal::Kill);
     let exit = child.process.wait().unwrap();
+    child.process.reap();
     let after = child.process.signal_group(GroupSignal::Hangup);
     assert_eq!(
         (
@@ -102,6 +106,197 @@ fn a_child_should_lead_its_own_process_group_and_group_signals_should_stop_after
         ),
         (child.pid, child.pid, true, Some(9), false)
     );
+}
+
+#[test]
+fn a_held_zombie_should_keep_its_group_signallable_until_the_reap() {
+    let table = SysProcessTable::new();
+    // The shell leaves a `nohup` style job in its group, prints its pid, and exits.
+    let mut child = spawn(
+        "/bin/sh",
+        &[
+            "-c",
+            "trap '' HUP; sleep 30 </dev/null >/dev/null 2>&1 & echo $!",
+        ],
+        &[],
+    );
+    let out = read_all(&mut child);
+    child.process.wait().unwrap();
+    let job: i64 = text(&out).trim().parse().unwrap();
+    assert!(table.started_at(job).is_some(), "the job should be alive");
+    // `wait` only observed the exit: the group id is still reserved (spec 0004).
+    child.process.signal_group(GroupSignal::Kill);
+    for _ in 0..200 {
+        if table.started_at(job).is_none() {
+            child.process.reap();
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("the group signal never reached the job");
+}
+
+// ---- the process table (spec 0004) ----
+
+/// Is `pid` still a process (a zombie counts)?
+fn exists(pid: i64) -> bool {
+    let pid = rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap();
+    rustix::process::test_kill_process(pid).is_ok()
+}
+
+#[test]
+fn a_scan_should_see_a_pty_child_in_its_own_session_with_its_start_time() {
+    let table = SysProcessTable::new();
+    let child = spawn("/bin/sleep", &["30"], &[]);
+    let state = table.started_at(child.pid).expect("no start time");
+    // Right after the fork the child may not have run `exec` yet.
+    let mut scan = table.scan().unwrap();
+    for _ in 0..100 {
+        if scan.iter().any(|p| p.pid == child.pid && p.name == "sleep") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+        scan = table.scan().unwrap();
+    }
+    let seen = scan
+        .iter()
+        .find(|p| p.pid == child.pid)
+        .expect("not in the scan");
+    let me = scan.iter().find(|p| p.pid == table.engine_pid()).unwrap();
+    assert_eq!(seen.started_at_ms, state.started_at_ms);
+    assert_eq!(state.started_at_ms % 1000, 0);
+    assert_eq!(seen.sid, Some(child.pid));
+    assert_eq!(seen.ppid, Some(table.engine_pid()));
+    assert!(seen.uid_is_self && !seen.zombie && me.uid_is_self);
+    assert_eq!(seen.name, "sleep");
+    child.process.signal_group(GroupSignal::Kill);
+    child.process.wait().unwrap();
+    child.process.reap();
+}
+
+#[test]
+fn a_held_zombie_should_read_as_gone_and_never_be_signalled() {
+    let table = SysProcessTable::new();
+    let child = spawn("/bin/sh", &["-c", "exit 0"], &[]);
+    let started = table.started_at(child.pid);
+    child.process.wait().unwrap();
+    assert!(exists(child.pid), "the zombie should still be held");
+    assert_eq!(table.started_at(child.pid), None);
+    let at = started.map_or(0, |s| s.started_at_ms);
+    assert_eq!(
+        table.signal(child.pid, at, ProcSignal::Kill),
+        SignalOutcome::Gone
+    );
+    child.process.reap();
+    assert!(!exists(child.pid));
+}
+
+#[test]
+fn signals_should_need_the_recorded_start_time_and_skip_pid_1_and_the_engine() {
+    let table = SysProcessTable::new();
+    let child = spawn("/bin/sleep", &["30"], &[]);
+    let at = table.started_at(child.pid).unwrap().started_at_ms;
+    let me = table.engine_pid();
+    let my_start = table.started_at(me).unwrap().started_at_ms;
+    assert_eq!(
+        table.signal(child.pid, at - 1000, ProcSignal::Kill),
+        SignalOutcome::Gone
+    );
+    assert_eq!(table.signal(1, 0, ProcSignal::Cont), SignalOutcome::Gone);
+    assert_eq!(
+        table.signal(me, my_start, ProcSignal::Cont),
+        SignalOutcome::Gone
+    );
+    assert!(exists(child.pid));
+    assert_eq!(
+        table.signal(child.pid, at, ProcSignal::Kill),
+        SignalOutcome::Sent
+    );
+    let exit = child.process.wait().unwrap();
+    child.process.reap();
+    assert_eq!(exit.signal, Some(9));
+}
+
+// covers: AC-9
+#[test]
+fn a_group_signal_should_skip_pid_1_the_engine_and_bad_ids_but_reach_a_real_group() {
+    let table = SysProcessTable::new();
+    for pgid in [-5, 0, 1, table.engine_pid(), i64::from(i32::MAX) + 1] {
+        assert!(!table.signal_group(pgid, ProcSignal::Cont), "pgid {pgid}");
+    }
+    let child = spawn("/bin/sleep", &["30"], &[]);
+    // A PTY child leads its own session and group.
+    assert!(table.signal_group(child.pid, ProcSignal::Kill));
+    let exit = child.process.wait().unwrap();
+    child.process.reap();
+    assert_eq!(exit.signal, Some(9));
+}
+
+// covers: AC-9
+#[test]
+fn a_pid_outside_the_valid_range_or_not_running_should_read_as_gone() {
+    let table = SysProcessTable::new();
+    for pid in [-1, 0, i64::from(i32::MAX) + 1] {
+        assert_eq!(table.signal(pid, 0, ProcSignal::Cont), SignalOutcome::Gone);
+        assert!(table.started_at(pid).is_none(), "pid {pid}");
+    }
+    // Spawn, kill and reap a child, so its pid is known not to be running.
+    let child = spawn("/bin/sleep", &["30"], &[]);
+    let pid = child.pid;
+    let at = table.started_at(pid).unwrap().started_at_ms;
+    child.process.signal_group(GroupSignal::Kill);
+    child.process.wait().unwrap();
+    child.process.reap();
+    assert_eq!(table.signal(pid, at, ProcSignal::Cont), SignalOutcome::Gone);
+}
+
+// covers: AC-9
+#[test]
+fn another_users_process_should_never_be_signalled_even_with_its_start_time() {
+    let table = SysProcessTable::new();
+    let scan = table.scan().unwrap();
+    // macOS always runs some root daemons besides launchd.
+    let other = scan
+        .iter()
+        .find(|p| !p.uid_is_self && p.pid > 1 && !p.zombie)
+        .expect("no process owned by another user");
+    assert_eq!(
+        table.signal(other.pid, other.started_at_ms, ProcSignal::Cont),
+        SignalOutcome::Gone
+    );
+}
+
+// covers: AC-7, AC-15
+#[test]
+fn a_scan_should_include_the_engine_and_only_whole_second_start_times() {
+    let table = SysProcessTable::new();
+    let scan = table.scan().unwrap();
+    assert!(
+        scan.iter()
+            .any(|p| p.pid == table.engine_pid() && p.uid_is_self)
+    );
+    assert!(scan.iter().all(|p| p.started_at_ms % 1000 == 0));
+    // Only the short executable name is read, never a command line.
+    let me = scan.iter().find(|p| p.pid == table.engine_pid()).unwrap();
+    assert!(
+        !me.name.is_empty() && !me.name.contains(' ') && !me.name.contains('/'),
+        "{}",
+        me.name
+    );
+}
+
+#[test]
+fn a_process_dropped_without_reap_should_leave_no_zombie() {
+    let child = spawn("/bin/sleep", &["30"], &[]);
+    let pid = child.pid;
+    drop(child);
+    for _ in 0..200 {
+        if !exists(pid) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("pid {pid} is still there (a zombie)");
 }
 
 #[test]

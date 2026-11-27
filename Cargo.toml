@@ -46,6 +46,7 @@ schemars = "1.2.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 signal-hook = "0.4.6"
+sysinfo = { version = "0.40.4", default-features = false, features = ["system", "user"] }
 tempfile = "3.27.0"
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
@@ -67,10 +68,12 @@ missing_docs = "warn"
 unwrap_used = "deny"
 expect_used = "deny"
 
-# From the Tauri template: https://tauri.app/concept/size/#cargo-configuration
+# From the Tauri template (https://tauri.app/concept/size/#cargo-configuration),
+# except `panic`: unwinding lets a panic in one run's supervision fail only
+# that run (spec 0004, AC-11), at the cost of a somewhat bigger binary.
 [profile.release]
 codegen-units = 1
 lto = true
 opt-level = 3
-panic = "abort"
+panic = "unwind"
 strip = true

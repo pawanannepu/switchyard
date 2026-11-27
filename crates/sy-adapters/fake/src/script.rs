@@ -39,6 +39,14 @@ pub enum Step {
     Hang(bool),
     /// SIGHUP no longer ends the agent (`true` only).
     IgnoreSighup(bool),
+    /// SIGTERM no longer ends the agent (`true` only, spec 0004).
+    IgnoreSigterm(bool),
+    /// Start `sy-fake-agent --child`, which blocks forever, and go on at
+    /// once (spec 0004).
+    Spawn(Spawn),
+    /// Call `sy-signal --hook panic`, which makes the fake decoder panic
+    /// (`true` only, spec 0004).
+    PanicDecoder(bool),
     /// Send itself this signal.
     DieBySignal(Signal),
     /// Exit with this code.
@@ -219,6 +227,21 @@ pub struct DeleteFile {
     pub path: String,
 }
 
+/// A `spawn` step's child.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Spawn {
+    /// Put it in its own process group, out of the agent's.
+    #[serde(default)]
+    pub detach: bool,
+    /// It ignores SIGHUP.
+    #[serde(default)]
+    pub ignore_sighup: bool,
+    /// It ignores SIGTERM.
+    #[serde(default)]
+    pub ignore_sigterm: bool,
+}
+
 /// The signals `die_by_signal` may send.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Signal {
@@ -246,7 +269,10 @@ pub fn validate(steps: &[Step]) -> Result<(), String> {
             {
                 Some(format!("path {path:?} must be relative with no `..`"))
             }
-            Step::Hang(false) | Step::IgnoreSighup(false) => Some("must be true".to_owned()),
+            Step::Hang(false)
+            | Step::IgnoreSighup(false)
+            | Step::IgnoreSigterm(false)
+            | Step::PanicDecoder(false) => Some("must be true".to_owned()),
             Step::Flood(f) if f.bytes_per_sec == 0 || f.bytes_per_sec > MAX_FLOOD_BYTES_PER_SEC => {
                 Some(format!(
                     "bytes_per_sec must be 1 to {MAX_FLOOD_BYTES_PER_SEC}"
